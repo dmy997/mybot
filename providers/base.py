@@ -20,6 +20,9 @@ class ToolCallRequest:
     id: str
     name: str
     arguments: dict[str, Any]
+    extra_content: dict[str, Any] | None = None
+    provider_specific_fields: dict[str, Any] | None = None
+    function_provider_specific_fields: dict[str, Any] | None = None
 
 
 @dataclass
@@ -36,13 +39,16 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     
     # 调用耗时
-    latency_ms: int = 0
+    latency_s: int = 0
 
     # LLM推理内容，仅限thinking model
     reasoning_content: str | None = None
 
     # response的原因：{"tool_calls", "function_call", "stop", "error"}
     finish_reason: str = "stop"
+
+    # 调用出错时的异常信息
+    error: dict[str, Any] | None = None
 
 
 class LLMProvider(ABC):
@@ -55,7 +61,7 @@ class LLMProvider(ABC):
                  max_tokens: int = 4096,
                  ):
         self.api_key = api_key
-        self.api_base = api_base
+        self.base_url = api_base
         self.temperature = temperature
         self.max_tokens = max_tokens
 
