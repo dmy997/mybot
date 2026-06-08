@@ -11,6 +11,8 @@ from typing import Any
 
 from loguru import logger
 
+from observability.metrics import REGISTRY
+
 
 @dataclass
 class Session:
@@ -48,6 +50,7 @@ class SessionManager:
         session = self._load_from_path(key)
         if session is None:
             session = Session(key=key)
+            REGISTRY.active_sessions.inc()
         self.sessions[key] = session
         return session
 
@@ -128,11 +131,15 @@ class SessionManager:
 
     def remove_session(self, key: str) -> None:
         """Remove from memory only (keep on disk)."""
-        self.sessions.pop(key, None)
+        removed = self.sessions.pop(key, None)
+        if removed is not None:
+            REGISTRY.active_sessions.dec()
 
     def delete_session(self, key: str) -> bool:
         """Delete a session from memory and disk. Returns True if deleted."""
-        self.sessions.pop(key, None)
+        removed = self.sessions.pop(key, None)
+        if removed is not None:
+            REGISTRY.active_sessions.dec()
         path = self.sessions_dir / f"{key}.json"
         if path.exists():
             path.unlink()

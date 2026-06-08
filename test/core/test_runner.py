@@ -133,7 +133,7 @@ class TestAgentInput:
 class TestAgentCoreHappy:
     @pytest.mark.asyncio
     async def test_simple_response(self, core, provider):
-        provider.chat = AsyncMock(return_value=_make_response(content="Hello!"))
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(content="Hello!"))
 
         result = await core.run(AgentInput(init_messages=[{"role": "user", "content": "hi"}]))
 
@@ -145,7 +145,7 @@ class TestAgentCoreHappy:
 
     @pytest.mark.asyncio
     async def test_single_tool_call(self, core, provider, tools):
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("echo", {"message": "hello"})],
                 finish_reason="tool_calls",
@@ -164,7 +164,7 @@ class TestAgentCoreHappy:
 
     @pytest.mark.asyncio
     async def test_multiple_tool_calls_in_one_turn(self, core, provider, tools):
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[
                     _make_tc("echo", {"message": "a"}, tc_id="c1"),
@@ -185,7 +185,7 @@ class TestAgentCoreHappy:
 
     @pytest.mark.asyncio
     async def test_multi_turn_tool_calls(self, core, provider, tools):
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("echo", {"message": "first"}, tc_id="c1")],
                 finish_reason="tool_calls",
@@ -207,7 +207,7 @@ class TestAgentCoreHappy:
 
     @pytest.mark.asyncio
     async def test_tool_events_recorded(self, core, provider, tools):
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("echo", {"message": "x"})],
                 finish_reason="tool_calls",
@@ -233,7 +233,7 @@ class TestAgentCoreHappy:
 class TestAgentCoreErrors:
     @pytest.mark.asyncio
     async def test_llm_error(self, core, provider):
-        provider.chat = AsyncMock(return_value=_make_response(
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(
             content="API is down", finish_reason="error",
         ))
 
@@ -247,7 +247,7 @@ class TestAgentCoreErrors:
     async def test_failing_tool_reported(self, core, provider):
         reg = ToolRegistry()
         reg.register(FailingTool())
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("failer", {})],
                 finish_reason="tool_calls",
@@ -268,7 +268,7 @@ class TestAgentCoreErrors:
     async def test_exploding_tool_caught(self, core, provider):
         reg = ToolRegistry()
         reg.register(ExplodingTool())
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("exploder", {})],
                 finish_reason="tool_calls",
@@ -287,7 +287,7 @@ class TestAgentCoreErrors:
 
     @pytest.mark.asyncio
     async def test_unknown_tool(self, core, provider, tools):
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("nonexistent", {})],
                 finish_reason="tool_calls",
@@ -314,7 +314,7 @@ class TestAgentCoreMaxIterations:
     async def test_hits_max_iterations(self, provider, tools):
         core = AgentCore(provider, max_iterations=3)
         # Every response is a tool call → never stops naturally
-        provider.chat = AsyncMock(return_value=_make_response(
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(
             tool_calls=[_make_tc("echo", {"message": "loop"})],
             finish_reason="tool_calls",
         ))
@@ -330,7 +330,7 @@ class TestAgentCoreMaxIterations:
     @pytest.mark.asyncio
     async def test_stops_before_max_when_done(self, provider, tools):
         core = AgentCore(provider, max_iterations=10)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(tool_calls=[_make_tc("echo", {"message": "x"})], finish_reason="tool_calls"),
             _make_response(content="Done."),
         ])
@@ -350,7 +350,7 @@ class TestAgentCoreMaxIterations:
 class TestAgentCoreUsage:
     @pytest.mark.asyncio
     async def test_accumulates_usage(self, core, provider, tools):
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("echo", {"message": "x"})],
                 finish_reason="tool_calls",
@@ -381,7 +381,7 @@ class TestAgentCoreToolResultCapping:
     @pytest.mark.asyncio
     async def test_long_result_truncated(self, provider, tools):
         core = AgentCore(provider, max_tool_result_chars=50)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("echo", {"message": "x" * 200})],
                 finish_reason="tool_calls",
@@ -407,7 +407,7 @@ class TestAgentCoreToolResultCapping:
 class TestAgentCoreMessages:
     @pytest.mark.asyncio
     async def test_tool_call_message_structure(self, core, provider, tools):
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _make_response(
                 tool_calls=[_make_tc("echo", {"message": "hi"}, tc_id="abc123")],
                 finish_reason="tool_calls",
@@ -429,7 +429,7 @@ class TestAgentCoreMessages:
 
     @pytest.mark.asyncio
     async def test_no_tools_provided(self, core, provider):
-        provider.chat = AsyncMock(return_value=_make_response(content="No tools needed."))
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(content="No tools needed."))
 
         result = await core.run(AgentInput(
             init_messages=[{"role": "user", "content": "simple question"}],
@@ -440,7 +440,7 @@ class TestAgentCoreMessages:
 
     @pytest.mark.asyncio
     async def test_final_assistant_message_appended(self, core, provider):
-        provider.chat = AsyncMock(return_value=_make_response(content="Final answer."))
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(content="Final answer."))
 
         result = await core.run(AgentInput(
             init_messages=[{"role": "user", "content": "q"}],

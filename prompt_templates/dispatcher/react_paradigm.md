@@ -1,0 +1,1 @@
+Everyday conversation, casual chat, simple questions, explanations, translations, summaries of current conversation, fact lookup, code review, single-file edits, and any task that can be completed in 1-3 steps without a structured plan.  Use this for ANY query that does NOT explicitly require multi-step decomposition.

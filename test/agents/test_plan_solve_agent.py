@@ -66,7 +66,7 @@ class TestPlanSolveHappy:
     async def test_plan_then_execute_no_tools(self):
         """Both phases succeed without tool calls."""
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _response(content="## Plan\n1. Step one\n2. Step two"),
             _response(content="Executed all steps. Done."),
         ])
@@ -88,7 +88,7 @@ class TestPlanSolveHappy:
         tools.register(EchoTool())
 
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _response(content="## Plan\n1. Echo something"),
             _response(
                 tool_calls=[_tc("echo", {"text": "hello"})],
@@ -111,7 +111,7 @@ class TestPlanSolveHappy:
     async def test_planning_has_no_tools(self):
         """Verify the planning phase passes an empty tool list to the LLM."""
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _response(content="## Plan\n1. Step"),
             _response(content="Done."),
         ])
@@ -126,18 +126,18 @@ class TestPlanSolveHappy:
         ))
 
         # First call (planning): tools should be empty list
-        plan_call_args = provider.chat.call_args_list[0].kwargs
+        plan_call_args = provider.chat_with_retry.call_args_list[0].kwargs
         assert plan_call_args["tools"] == []
 
         # Second call (execution): tools should have the echo tool
-        exec_call_args = provider.chat.call_args_list[1].kwargs
+        exec_call_args = provider.chat_with_retry.call_args_list[1].kwargs
         assert len(exec_call_args["tools"]) == 1
 
     @pytest.mark.asyncio
     async def test_execution_sees_plan(self):
         """Execution phase messages include the plan output."""
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _response(content="## Plan\n1. Step alpha\n2. Step beta"),
             _response(content="Done."),
         ])
@@ -148,7 +148,7 @@ class TestPlanSolveHappy:
             init_messages=[{"role": "user", "content": "task"}],
         ))
 
-        exec_messages = provider.chat.call_args_list[1].kwargs["messages"]
+        exec_messages = provider.chat_with_retry.call_args_list[1].kwargs["messages"]
         # Find the plan content in execution messages
         plan_texts = [m["content"] for m in exec_messages if "Step alpha" in str(m.get("content", ""))]
         assert len(plan_texts) == 1
@@ -164,7 +164,7 @@ class TestPlanSolveErrors:
     async def test_planning_error_stops_early(self):
         """If planning fails, return immediately without execution."""
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=_response(
+        provider.chat_with_retry = AsyncMock(return_value=_response(
             content="Planning failed", finish_reason="error",
         ))
         core = AgentCore(provider)
@@ -177,7 +177,7 @@ class TestPlanSolveErrors:
         assert result.stop_reason == "error"
         assert "Planning failed" in (result.error or "")
         # Only one LLM call (planning), no execution call
-        assert provider.chat.call_count == 1
+        assert provider.chat_with_retry.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ class TestPlanSolveUsage:
     @pytest.mark.asyncio
     async def test_merges_usage_across_phases(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _response(
                 content="## Plan\n1. Step",
                 usage={"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
@@ -224,7 +224,7 @@ class TestPlanSolveOutput:
         tools.register(EchoTool())
 
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _response(content="## Plan\n1. Echo x"),
             _response(
                 tool_calls=[_tc("echo", {"text": "x"})],
@@ -246,7 +246,7 @@ class TestPlanSolveOutput:
     @pytest.mark.asyncio
     async def test_final_message_is_assistant(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=[
+        provider.chat_with_retry = AsyncMock(side_effect=[
             _response(content="## Plan\n1. Step"),
             _response(content="All done."),
         ])

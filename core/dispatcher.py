@@ -25,9 +25,10 @@ from typing import Any
 
 from loguru import logger
 
+from utils import render_template
+
 from .agent_base import BaseAgent
 from .runner import AgentInput, AgentOutput
-
 
 # ---------------------------------------------------------------------------
 # Regex layers (zero-cost, always on)
@@ -99,8 +100,8 @@ async def heuristic_classifier(user_input: str) -> str:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PARADIGM_DESCRIPTIONS: dict[str, str] = {
-    "react": "Simple Q&A, conversation, single-step tasks",
-    "plan_solve": "Complex multi-step tasks requiring planning",
+    "react": render_template("dispatcher/react_paradigm.md", strip=True),
+    "plan_solve": render_template("dispatcher/plan_solve_paradigm.md", strip=True),
 }
 
 
@@ -249,7 +250,7 @@ class LLMClassifier:
     async def __call__(self, user_input: str) -> str:
         """Classify *user_input* via a lightweight LLM call."""
         try:
-            response = await self.provider.chat(
+            response = await self.provider.chat_with_retry(
                 messages=[
                     {"role": "system", "content": self._build_system_prompt()},
                     {"role": "user", "content": user_input},
@@ -269,19 +270,14 @@ class LLMClassifier:
     # -- internal ------------------------------------------------------------
 
     def _build_system_prompt(self) -> str:
-        lines: list[str] = [
-            "You are a task router. Classify the user's message into exactly "
-            "one of these categories.",
-            "",
-        ]
-        for name, desc in self.paradigms.items():
-            lines.append(f"- {name}: {desc}")
-        lines.append("")
-        lines.append(
-            "Reply with ONLY the category name (one word, lowercase), "
-            "nothing else. Do not explain your choice."
+        paradigms_text = "\n".join(
+            f"- {name}: {desc}" for name, desc in self.paradigms.items()
         )
-        return "\n".join(lines)
+        return render_template(
+            "dispatcher/classifier_system.md",
+            paradigms_text=paradigms_text,
+            strip=True,
+        )
 
     def _parse(self, raw: str) -> str:
         name = raw.strip().lower()

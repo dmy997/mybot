@@ -173,7 +173,7 @@ class TestDispatcherResolveLLMFallback:
     async def test_llm_only_called_for_fuzzy_intents(self, react_agent, plan_solve_agent):
         """LLM is NOT called when regex already matches."""
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content="plan_solve"))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="plan_solve"))
 
         d = Dispatcher(
             {"react": react_agent, "plan_solve": plan_solve_agent},
@@ -183,18 +183,18 @@ class TestDispatcherResolveLLMFallback:
         # Explicit command → regex matches, LLM never called
         result = await d.resolve("/react explain")
         assert result == "react"
-        provider.chat.assert_not_called()
+        provider.chat_with_retry.assert_not_called()
 
         # Keyword match → regex matches, LLM never called
         result = await d.resolve("first do this then that")
         assert result == "plan_solve"
-        provider.chat.assert_not_called()
+        provider.chat_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_llm_called_when_no_regex_match(self, react_agent, plan_solve_agent):
         """Fuzzy intent → regex misses → LLM is called."""
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content="plan_solve"))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="plan_solve"))
 
         d = Dispatcher(
             {"react": react_agent, "plan_solve": plan_solve_agent},
@@ -203,12 +203,12 @@ class TestDispatcherResolveLLMFallback:
 
         result = await d.resolve("design a scalable architecture for my app")
         assert result == "plan_solve"
-        provider.chat.assert_called_once()
+        provider.chat_with_retry.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_llm_error_falls_back_to_default(self, react_agent, plan_solve_agent):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=RuntimeError("API down"))
+        provider.chat_with_retry = AsyncMock(side_effect=RuntimeError("API down"))
 
         d = Dispatcher(
             {"react": react_agent, "plan_solve": plan_solve_agent},
@@ -283,7 +283,7 @@ class TestLLMClassifierCall:
     @pytest.mark.asyncio
     async def test_returns_react_for_simple_query(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content="react"))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="react"))
         c = LLMClassifier(provider, _PARADIGMS)
 
         result = await c("what is the weather?")
@@ -292,7 +292,7 @@ class TestLLMClassifierCall:
     @pytest.mark.asyncio
     async def test_returns_plan_solve_for_complex_query(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content="plan_solve"))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="plan_solve"))
         c = LLMClassifier(provider, _PARADIGMS)
 
         result = await c("design a microservice architecture for my app")
@@ -301,7 +301,7 @@ class TestLLMClassifierCall:
     @pytest.mark.asyncio
     async def test_trims_whitespace_from_response(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content="  react\n"))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="  react\n"))
         c = LLMClassifier(provider, _PARADIGMS)
 
         assert await c("hi") == "react"
@@ -309,7 +309,7 @@ class TestLLMClassifierCall:
     @pytest.mark.asyncio
     async def test_unrecognised_paradigm_falls_back(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content="unknown_paradigm"))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="unknown_paradigm"))
         c = LLMClassifier(provider, _PARADIGMS, fallback="react")
 
         assert await c("some query") == "react"
@@ -317,7 +317,7 @@ class TestLLMClassifierCall:
     @pytest.mark.asyncio
     async def test_empty_content_falls_back(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content=""))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content=""))
         c = LLMClassifier(provider, _PARADIGMS, fallback="plan_solve")
 
         assert await c("query") == "plan_solve"
@@ -325,7 +325,7 @@ class TestLLMClassifierCall:
     @pytest.mark.asyncio
     async def test_llm_error_falls_back(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(side_effect=RuntimeError("API down"))
+        provider.chat_with_retry = AsyncMock(side_effect=RuntimeError("API down"))
         c = LLMClassifier(provider, _PARADIGMS, fallback="react")
 
         assert await c("query") == "react"
@@ -333,11 +333,11 @@ class TestLLMClassifierCall:
     @pytest.mark.asyncio
     async def test_passes_model_parameter(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content="react"))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="react"))
         c = LLMClassifier(provider, _PARADIGMS, model="gpt-4o-mini")
 
         await c("hi")
-        call_kwargs = provider.chat.call_args.kwargs
+        call_kwargs = provider.chat_with_retry.call_args.kwargs
         assert call_kwargs["model"] == "gpt-4o-mini"
         assert call_kwargs["temperature"] == 0.0
         assert call_kwargs["max_tokens"] == 10
@@ -346,11 +346,11 @@ class TestLLMClassifierCall:
     @pytest.mark.asyncio
     async def test_system_prompt_contains_all_paradigms(self):
         provider = MagicMock(spec=LLMProvider)
-        provider.chat = AsyncMock(return_value=LLMResponse(content="react"))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="react"))
         c = LLMClassifier(provider, _PARADIGMS)
 
         await c("hi")
-        system_msg = provider.chat.call_args.kwargs["messages"][0]["content"]
+        system_msg = provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
         assert "react" in system_msg
         assert "plan_solve" in system_msg
         assert "Simple Q&A" in system_msg

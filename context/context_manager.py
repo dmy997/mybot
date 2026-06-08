@@ -13,14 +13,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
-    from core.skills import SkillsLoader
+    pass
 
 from memory import MemoryManager
 from memory.store import MemoryStore
@@ -73,10 +71,6 @@ _DEFAULT_MAX_CONTEXT_TOKENS = 128_000
 _DEFAULT_IDLE_COMPRESS_SECONDS = 300
 _COMPRESS_RECENT_RATIO = 0.7
 _IDLE_KEEP_RECENT = 4
-_SUMMARY_PROMPT = (
-    "Summarise the conversation above. Keep all key facts, decisions, "
-    "and action items. Use no more than {max_words} words."
-)
 _INTERRUPT_MESSAGE = "Error: Task interrupted before a response was generated."
 _INTERRUPT_TOOL_RESULT = "Error: Tool execution interrupted."
 
@@ -361,10 +355,8 @@ class ContextManager:
         if not slim:
             return "(empty context)"
 
-        slim.append({
-            "role": "user",
-            "content": _SUMMARY_PROMPT.format(max_words=200),
-        })
+        summary_prompt = render_template("context/summary.md", max_words=200, strip=True)
+        slim.append({"role": "user", "content": summary_prompt})
 
         import asyncio
 
@@ -379,7 +371,7 @@ class ContextManager:
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(
                         asyncio.run,
-                        self.provider.chat(
+                        self.provider.chat_with_retry(
                             messages=slim,
                             tools=[],
                             model=self.compress_model,
@@ -390,7 +382,7 @@ class ContextManager:
                     response = future.result(timeout=30)
             else:
                 response = asyncio.run(
-                    self.provider.chat(
+                    self.provider.chat_with_retry(
                         messages=slim,
                         tools=[],
                         model=self.compress_model,
@@ -404,7 +396,6 @@ class ContextManager:
 
     @staticmethod
     def _idle_truncate_summary(messages: list[dict[str, Any]]) -> str:
-        """Simple truncation fallback — first and last meaningful messages."""
         if not messages:
             return "(empty context)"
 
@@ -534,10 +525,8 @@ class ContextManager:
                 msg["content"] = content[:2000] + "..."
 
         max_words = 200
-        slim.append({
-            "role": "user",
-            "content": _SUMMARY_PROMPT.format(max_words=max_words),
-        })
+        summary_prompt = render_template("context/summary.md", max_words=max_words, strip=True)
+        slim.append({"role": "user", "content": summary_prompt})
 
         try:
             try:
@@ -550,7 +539,7 @@ class ContextManager:
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(
                         asyncio.run,
-                        self.provider.chat(
+                        self.provider.chat_with_retry(
                             messages=slim,
                             tools=[],
                             model=self.compress_model,
@@ -561,7 +550,7 @@ class ContextManager:
                     response = future.result(timeout=30)
             else:
                 response = asyncio.run(
-                    self.provider.chat(
+                    self.provider.chat_with_retry(
                         messages=slim,
                         tools=[],
                         model=self.compress_model,

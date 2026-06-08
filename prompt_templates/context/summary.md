@@ -1,0 +1,1 @@
+Summarise the conversation above. Keep all key facts, decisions, and action items. Use no more than {{ max_words }} words.

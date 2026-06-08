@@ -28,7 +28,7 @@ def workspace():
 @pytest.fixture
 def provider():
     p = MagicMock(spec=LLMProvider)
-    p.chat = AsyncMock(return_value=LLMResponse(content="ok"))
+    p.chat_with_retry = AsyncMock(return_value=LLMResponse(content="ok"))
     return p
 
 

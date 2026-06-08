@@ -35,4 +35,11 @@ def discover_agents(provider: Any) -> dict[str, BaseAgent]:
                 instance = obj(core)
                 agents[instance.paradigm] = instance
 
+    # Ensure "react" is always the first key so it becomes the default.
+    # pkgutil returns modules in filesystem order (alphabetical), which
+    # puts plan_solve before react — we reorder explicitly.
+    if "react" in agents:
+        react = agents.pop("react")
+        agents = {"react": react, **agents}
+
     return agents

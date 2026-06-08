@@ -68,4 +68,6 @@ class BaseAgent(ABC):
             model=overrides.get("model", spec.model),
             max_tokens=overrides.get("max_tokens", spec.max_tokens),
             temperature=overrides.get("temperature", spec.temperature),
+            on_content_delta=overrides.get("on_content_delta", spec.on_content_delta),
+            on_tool_call_delta=overrides.get("on_tool_call_delta", spec.on_tool_call_delta),
         )

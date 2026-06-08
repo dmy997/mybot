@@ -6,6 +6,7 @@ from typing import Any
 
 from loguru import logger
 
+from .guard import ToolGuard
 from .tool import Tool, ToolResult
 
 
@@ -16,8 +17,9 @@ class ToolRegistry:
     function-calling schema lists and dispatches tool calls by name.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, guard: ToolGuard | None = None) -> None:
         self._tools: dict[str, Tool] = {}
+        self.guard = guard
 
     # -- registration ----------------------------------------------------------
 
@@ -31,6 +33,16 @@ class ToolRegistry:
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
+
+    # -- scope filtering -------------------------------------------------------
+
+    def for_scope(self, scope: str) -> list[Tool]:
+        """Return tools that are available in *scope*."""
+        return [t for t in self._tools.values() if t.available_in(scope)]
+
+    def get_definitions_for_scope(self, scope: str) -> list[dict[str, Any]]:
+        """Return tool definitions for tools available in *scope*."""
+        return [t.to_openai_schema() for t in self.for_scope(scope)]
 
     # -- schema export ---------------------------------------------------------
 
@@ -46,6 +58,15 @@ class ToolRegistry:
         if tool is None:
             return ToolResult(success=False, content="", error=f"Unknown tool: {name}")
 
+        # --- ToolGuard pre-check -------------------------------------------
+        if self.guard is not None:
+            allowed, reason = self.guard.pre_check(
+                tool.name, tool.capabilities, arguments,
+            )
+            if not allowed:
+                return ToolResult(success=False, content="", error=reason)
+
+        # --- execute -------------------------------------------------------
         try:
             return await tool.execute(**arguments)
         except Exception as exc:

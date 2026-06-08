@@ -1,17 +1,16 @@
 """LLM Provider基类"""
 
 import asyncio
-import json
-import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from typing import Any
 
-from loguru import logger
+from .errors import (
+    ErrorCategory,
+    LLMErrorInfo,
+)
+from .retry import RetryConfig, with_retry
 
 
 @dataclass
@@ -34,10 +33,10 @@ class LLMResponse:
 
     # 工具调用列表
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
-    
+
     # token用量统计
     usage: dict[str, int] = field(default_factory=dict)
-    
+
     # 调用耗时
     latency_s: int = 0
 
@@ -53,8 +52,8 @@ class LLMResponse:
 
 class LLMProvider(ABC):
     """LLM providers基类"""
-    
-    def __init__(self, 
+
+    def __init__(self,
                  api_key: str | None = None,
                  api_base: str | None = None,
                  temperature: float = 0.7,
@@ -67,7 +66,7 @@ class LLMProvider(ABC):
 
     @abstractmethod
     async def chat(
-        self, 
+        self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         model: str | None = None,
@@ -89,6 +88,84 @@ class LLMProvider(ABC):
             LLMResponse: 至少包含content或tool_calls
         """
         pass
+
+    # -- error classification -------------------------------------------------
+
+    def _classify_error(self, error: Exception) -> LLMErrorInfo:
+        """Categorise an exception raised during a chat call.
+
+        Subclasses SHOULD override this to provide provider-specific
+        classification (e.g. by inspecting OpenAI SDK exception types).
+        The base implementation conservatively treats all errors as
+        retryable.
+        """
+        return LLMErrorInfo(
+            category=ErrorCategory.RETRYABLE,
+            message=str(error) or type(error).__name__,
+            error_type="unknown",
+            raw_error=error,
+        )
+
+    # -- retry wrapper --------------------------------------------------------
+
+    async def chat_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        model: str | None = None,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        retry_config: RetryConfig | None = None,
+    ) -> LLMResponse:
+        """Call :meth:`chat` with automatic retry and error classification.
+
+        Transient errors are retried with exponential backoff.  Permanent
+        errors are raised as typed exceptions so the caller can distinguish
+        retryable / recoverable / fatal.
+        """
+        return await with_retry(
+            self.chat,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            classify_error=self._classify_error,
+            config=retry_config,
+        )
+
+    async def chat_stream_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        retry_config: RetryConfig | None = None,
+    ) -> LLMResponse:
+        """Call :meth:`chat_stream` with automatic retry and error classification."""
+
+        async def _call() -> LLMResponse:
+            return await self.chat_stream(
+                messages=messages,
+                tools=tools or [],
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                on_content_delta=on_content_delta,
+                on_thinking_delta=on_thinking_delta,
+                on_tool_call_delta=on_tool_call_delta,
+            )
+
+        return await with_retry(
+            _call,
+            classify_error=self._classify_error,
+            config=retry_config,
+        )
 
     async def safe_chat(self, **kwargs: Any) -> LLMResponse:
         """安全调用LLM"""
@@ -115,9 +192,9 @@ class LLMProvider(ABC):
         """
         try:
             response = await self.chat(
-                messages, 
-                tools, 
-                model, 
+                messages,
+                tools,
+                model,
                 max_tokens=max_tokens,
                 temperature=temperature
             )
@@ -128,4 +205,3 @@ class LLMProvider(ABC):
             raise
         except Exception as e:
             return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
-        

@@ -292,7 +292,7 @@ class TestExtractTcExtras:
 class TestInit:
     def test_defaults(self):
         p = OpenAICompatibleProvider()
-        assert p._default_model == "deepseek-chat"
+        assert p._default_model == "deepseek/deepseek-v4-flash"
         assert p.is_local is False
         assert p._client is None
 

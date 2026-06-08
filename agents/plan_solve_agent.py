@@ -10,29 +10,17 @@ from __future__ import annotations
 from core.agent_base import BaseAgent
 from core.runner import AgentInput, AgentOutput
 from tools.registry import ToolRegistry
+from utils import render_template
+
+# Load prompts from templates at import time (no variables, static text)
+_PLAN_PROMPT = render_template("agent/plan_solve/plan.md", strip=True)
+_EXEC_PROMPT = render_template("agent/plan_solve/execute.md", strip=True)
 
 
 class PlanSolveAgent(BaseAgent):
     """Agent that plans first, then executes."""
 
     paradigm = "plan_solve"
-
-    _PLAN_PROMPT = (
-        "Let's solve this step by step. First, create a detailed plan. "
-        "List each step as a numbered item. Be specific about what each "
-        "step needs to accomplish and what tools or information you will "
-        "need.\n\n"
-        "Format:\n"
-        "## Plan\n"
-        "1. [Step 1]\n"
-        "2. [Step 2]\n"
-        "..."
-    )
-
-    _EXEC_PROMPT = (
-        "Now follow the plan above. Complete each step, using tools when "
-        "needed. After all steps are done, provide a final summary."
-    )
 
     # -- public entry point -------------------------------------------------
 
@@ -53,7 +41,7 @@ class PlanSolveAgent(BaseAgent):
     async def _plan(self, spec: AgentInput) -> AgentOutput:
         plan_spec = self._with_spec(
             spec,
-            init_messages=list(spec.init_messages) + [self._user(self._PLAN_PROMPT)],
+            init_messages=list(spec.init_messages) + [self._user(_PLAN_PROMPT)],
             tools=ToolRegistry(),
         )
         return await self.core.run(plan_spec)
@@ -61,7 +49,7 @@ class PlanSolveAgent(BaseAgent):
     async def _execute(
         self, spec: AgentInput, plan_output: AgentOutput
     ) -> AgentOutput:
-        exec_messages = list(plan_output.messages) + [self._user(self._EXEC_PROMPT)]
+        exec_messages = list(plan_output.messages) + [self._user(_EXEC_PROMPT)]
         exec_spec = self._with_spec(spec, init_messages=exec_messages)
         return await self.core.run(exec_spec)
 

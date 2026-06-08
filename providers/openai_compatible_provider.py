@@ -3,26 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import importlib.util
-import json
 import os
 import secrets
 import string
 import time
 import uuid
-from collections import deque
 from collections.abc import Awaitable, Callable
-from ipaddress import ip_address
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
-import httpx
+from typing import Any
 
+import httpx
 import json_repair
-from loguru import logger
 from openai import AsyncOpenAI
 
 from .base import LLMProvider, LLMResponse, ToolCallRequest
+from .errors import LLMErrorInfo
 
 _OPENAI_TIMEOUT_S = 120.0
 _NO_SUP_TEMP_MODELS = ("gpt-5", "o1", "o3", "o4")
@@ -64,13 +58,13 @@ class OpenAICompatibleProvider(LLMProvider):
                 "X-OpenRouter-Title": "mybot",
                 "X-OpenRouter-Categories": "cli-agent,personal-agent",
             }
-        
+
         self._client: AsyncOpenAI | None = None
         self._client_lock = asyncio.Lock()
 
     def _build_client(self):
         time_out_s = os.environ.get("_OPENAI_TIMEOUT_S", _OPENAI_TIMEOUT_S)
-        
+
         http_client: httpx.AsyncClient | None = None
 
         if self.is_local:
@@ -79,13 +73,142 @@ class OpenAICompatibleProvider(LLMProvider):
                 limits=httpx.Limits(keepalive_expiry=0)
             )
 
+        # Note: SDK-level max_retries is set to 0 so our own retry layer
+        # has full control.  The SDK retry is opaque and doesn't distinguish
+        # error categories.
         self._client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
             http_client=http_client,
             default_headers=self._default_headers,
-            max_retries=3,
+            max_retries=0,
             timeout=time_out_s
+        )
+
+    # -- error classification -------------------------------------------------
+
+    def _classify_error(self, error: Exception) -> LLMErrorInfo:
+        """Categorise OpenAI SDK exceptions.
+
+        Retryable: rate-limit, server errors, network issues.
+        Recoverable: context too long, content filter.
+        Fatal: auth failures, bad requests, model not found.
+        """
+        from .errors import ErrorCategory, LLMErrorInfo
+
+        # Attempt to import OpenAI SDK exception types
+        try:
+            import openai
+            _openai_available = True
+        except ImportError:
+            _openai_available = False
+
+        # -- Retryable: rate limiting -----------------------------------------
+        if _openai_available and isinstance(error, openai.RateLimitError):
+            retry_after: float | None = None
+            body = getattr(error, "response", None)
+            if body is not None:
+                headers = getattr(body, "headers", {}) or {}
+                raw = headers.get("retry-after") or headers.get("Retry-After")
+                if raw is not None:
+                    try:
+                        retry_after = float(raw)
+                    except (ValueError, TypeError):
+                        pass
+            return LLMErrorInfo(
+                category=ErrorCategory.RETRYABLE,
+                message=str(error),
+                status_code=429,
+                error_type="rate_limit",
+                retry_after=retry_after,
+                raw_error=error,
+            )
+
+        # -- Retryable: server errors -----------------------------------------
+        if _openai_available and isinstance(error, openai.InternalServerError):
+            status = getattr(error, "status_code", None)
+            return LLMErrorInfo(
+                category=ErrorCategory.RETRYABLE,
+                message=str(error),
+                status_code=status or 500,
+                error_type="server_error",
+                raw_error=error,
+            )
+
+        # -- Retryable: connection / timeout ----------------------------------
+        if _openai_available and isinstance(error, (
+            openai.APIConnectionError,
+            openai.APITimeoutError,
+        )):
+            return LLMErrorInfo(
+                category=ErrorCategory.RETRYABLE,
+                message=str(error),
+                error_type="network_error",
+                raw_error=error,
+            )
+
+        # -- Fatal: authentication / permissions ------------------------------
+        if _openai_available and isinstance(error, openai.AuthenticationError):
+            return LLMErrorInfo(
+                category=ErrorCategory.FATAL,
+                message=str(error),
+                status_code=getattr(error, "status_code", 401),
+                error_type="auth_error",
+                raw_error=error,
+            )
+
+        if _openai_available and isinstance(error, openai.PermissionDeniedError):
+            return LLMErrorInfo(
+                category=ErrorCategory.FATAL,
+                message=str(error),
+                status_code=getattr(error, "status_code", 403),
+                error_type="permission_denied",
+                raw_error=error,
+            )
+
+        # -- Bad request — inspect message for recoverable subtypes -----------
+        if _openai_available and isinstance(error, openai.BadRequestError):
+            msg = str(error).lower()
+            if "context_length" in msg or "maximum context" in msg or "token" in msg:
+                return LLMErrorInfo(
+                    category=ErrorCategory.RECOVERABLE,
+                    message=str(error),
+                    status_code=400,
+                    error_type="context_length",
+                    raw_error=error,
+                )
+            if "content_filter" in msg or "content policy" in msg or "safety" in msg:
+                return LLMErrorInfo(
+                    category=ErrorCategory.RECOVERABLE,
+                    message=str(error),
+                    status_code=400,
+                    error_type="content_filter",
+                    raw_error=error,
+                )
+            return LLMErrorInfo(
+                category=ErrorCategory.FATAL,
+                message=str(error),
+                status_code=400,
+                error_type="bad_request",
+                raw_error=error,
+            )
+
+        # -- Fatal: not found -------------------------------------------------
+        if _openai_available and isinstance(error, openai.NotFoundError):
+            return LLMErrorInfo(
+                category=ErrorCategory.FATAL,
+                message=str(error),
+                status_code=404,
+                error_type="not_found",
+                raw_error=error,
+            )
+
+        # -- Fallback: treat unknown errors as retryable ----------------------
+        return LLMErrorInfo(
+            category=ErrorCategory.RETRYABLE,
+            message=str(error) or type(error).__name__,
+            error_type="unknown",
+            raw_error=error,
         )
 
     def _build_chat_completion_body(
@@ -113,7 +236,7 @@ class OpenAICompatibleProvider(LLMProvider):
         if isinstance(obj, dict):
             return obj.get(key)
         return getattr(obj, key, None)
-    
+
     @staticmethod
     def _maybe_convert_to_dict(value: Any) -> dict[str, Any] | None:
         if value is None or isinstance(value, dict):
@@ -129,7 +252,7 @@ class OpenAICompatibleProvider(LLMProvider):
             usage = cls._get(response_dict, "usage")
         else:
             usage = cls._get(response, "usage")
-        
+
         usage_dict = cls._maybe_convert_to_dict(usage)
         if usage_dict:
             result = {
@@ -145,7 +268,7 @@ class OpenAICompatibleProvider(LLMProvider):
             }
         else:
             result = {}
-        
+
         def _get_nested_int(obj: Any, path: tuple[str, ...]) -> int:
             cur = obj
             for segm in path:
@@ -154,7 +277,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 if isinstance(cur, dict):
                     cur = cur.get(segm)
                 else:
-                    cur = getattr(cur, segm, None) 
+                    cur = getattr(cur, segm, None)
             return int(cur or 0)
         for path in (
             ("prompt_tokens_details", "cached_tokens"),
@@ -189,7 +312,7 @@ class OpenAICompatibleProvider(LLMProvider):
             return "".join(parts)
         else:
             return getattr(content, "text", None)
-        
+
     @classmethod
     def _extract_tc_extras(cls, tc: Any) -> tuple[
     dict[str, Any] | None,
@@ -218,7 +341,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 fn_prov = cls._maybe_convert_to_dict(cls._get(fn_obj, "provider_specific_fields"))
 
         return extra_content, prov, fn_prov
-            
+
     def _parse(self, response: Any) -> LLMResponse:
         if isinstance(response, str):
             return LLMResponse(
@@ -249,13 +372,13 @@ class OpenAICompatibleProvider(LLMProvider):
             finish_reason = choice_dict.get("finish_reason")
             usage = self._extract_usage(response_dict)
             reasoning = self._extract_content(choice_dict.get("message", {}).get("reasoning"))
-            
+
             # 只考虑choices[0]
             raw_tool_calls = []
             tool_calls = choice_dict.get("message", {}).get("tool_calls")
             if isinstance(tool_calls, list) and tool_calls:
                 raw_tool_calls.extend(tool_calls)
-            
+
             parsed_tool_calls = []
             for tc in raw_tool_calls:
                 tc_map = self._maybe_convert_to_dict(tc) or {}
@@ -286,7 +409,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 content="Error: API returned empty choices.",
                 finish_reason="error",
             )
-        
+
         choice = response.choices[0]
         msg = choice.message
         content = getattr(msg, "content")
@@ -326,7 +449,7 @@ class OpenAICompatibleProvider(LLMProvider):
             usage=self._extract_usage(response),
             reasoning_content=reasoning_content,
         )
-    
+
     def _parse_chunks(self, chunks: list[Any]) -> LLMResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -424,9 +547,9 @@ class OpenAICompatibleProvider(LLMProvider):
             finish_reason=finish_reason,
             usage=usage,
         )
-    
+
     async def chat(
-        self, 
+        self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
@@ -459,7 +582,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 finish_reason="error",
                 latency_s=time.time() - start
             )
-    
+
 
     async def chat_stream(
         self,
@@ -541,7 +664,7 @@ class OpenAICompatibleProvider(LLMProvider):
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
-    
+
     llm = OpenAICompatibleProvider(
         os.getenv("OPENAI_API_KEY"),
         os.getenv("OPENAI_API_BASE"),
@@ -566,6 +689,6 @@ if __name__ == "__main__":
             on_thinking_delta=on_thinking_delta,
             on_tool_call_delta=on_tool_call_delta,
         ))
-    
+
     test_chat_stream(message)
 

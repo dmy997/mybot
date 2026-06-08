@@ -38,7 +38,7 @@ def ctx(workspace):
 @pytest.fixture
 def provider():
     p = MagicMock(spec=LLMProvider)
-    p.chat = AsyncMock(return_value=LLMResponse(content=""))
+    p.chat_with_retry = AsyncMock(return_value=LLMResponse(content=""))
     return p
 
 
@@ -489,7 +489,7 @@ class TestIdleCompression:
         """Session idle for a long time → older messages summarised."""
         ctx.idle_compress_seconds = 1
         ctx.provider = provider
-        provider.chat = AsyncMock(return_value=LLMResponse(content="Summary of old conversation."))
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Summary of old conversation."))
 
         session = ctx.session.get_session("idle2")
         session.messages = [
@@ -507,7 +507,7 @@ class TestIdleCompression:
         ctx.build_messages("idle2", "new question")
 
         # Provider should have been called for summarisation
-        provider.chat.assert_called_once()
+        provider.chat_with_retry.assert_called_once()
 
         # The summary should be in the session
         session_after = ctx.session.get_session("idle2")
@@ -579,7 +579,7 @@ class TestIdleCompression:
         """When LLM summarisation fails, falls back to truncation."""
         ctx.idle_compress_seconds = 1
         ctx.provider = MagicMock(spec=LLMProvider)
-        ctx.provider.chat = AsyncMock(side_effect=RuntimeError("LLM unavailable"))
+        ctx.provider.chat_with_retry = AsyncMock(side_effect=RuntimeError("LLM unavailable"))
 
         session = ctx.session.get_session("idle6")
         session.messages = [
