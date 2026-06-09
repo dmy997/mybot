@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 import json_repair
+from loguru import logger
 from openai import AsyncOpenAI
 
 from .base import LLMProvider, LLMResponse, ToolCallRequest
@@ -575,8 +576,7 @@ class OpenAICompatibleProvider(LLMProvider):
             llm_response.latency_s = time.time() - start
             return llm_response
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.opt(exception=True).warning("chat() failed: {}", e)
             return LLMResponse(
                 content=f"OpenAI API error: {e}",
                 finish_reason="error",

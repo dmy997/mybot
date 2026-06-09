@@ -8,7 +8,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -17,6 +17,9 @@ from observability.trace import tracer
 from providers.base import LLMProvider, LLMResponse
 from providers.errors import FatalLLMError, RecoverableLLMError, RetryableLLMError
 from tools import ToolRegistry, ToolResult
+
+if TYPE_CHECKING:
+    from core.middleware import MiddlewareChain, MiddlewareContext
 
 # ---------------------------------------------------------------------------
 # Spec / result
@@ -35,6 +38,8 @@ class AgentInput:
     temperature: float | None = None
     on_content_delta: Callable[[str], Awaitable[None]] | None = None
     """Async callback invoked for each content token during streaming."""
+    on_thinking_delta: Callable[[str], Awaitable[None]] | None = None
+    """Async callback invoked for each reasoning/thinking token during streaming."""
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     """Async callback invoked for each tool-call delta during streaming."""
 
@@ -75,10 +80,12 @@ class AgentCore:
         *,
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
         max_tool_result_chars: int = _DEFAULT_MAX_TOOL_RESULT_CHARS,
+        middleware: MiddlewareChain | None = None,
     ) -> None:
         self.provider = provider
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
+        self.middleware = middleware
 
     # -- public entry point ----------------------------------------------------
 
@@ -94,77 +101,134 @@ class AgentCore:
 
         tool_defs = spec.tools.get_definitions() if spec.tools else None
 
-        for _ in range(self.max_iterations):
-            step_count += 1
+        # Middleware: agent start
+        mw = self.middleware
+        ctx = None
+        if mw:
+            from core.middleware import MiddlewareContext
+            ctx = MiddlewareContext(messages=messages, step_count=step_count)
+            await mw.run_agent_start(ctx)
 
-            # Stall detection: warn when step count is abnormally high
-            if step_count == _STALL_WARNING_STEPS:
-                logger.warning(
-                    "Agent reached {} steps — possible stall or infinite loop",
-                    step_count,
+        try:
+            for _ in range(self.max_iterations):
+                step_count += 1
+
+                # Stall detection: warn when step count is abnormally high
+                if step_count == _STALL_WARNING_STEPS:
+                    logger.warning(
+                        "Agent reached {} steps — possible stall or infinite loop",
+                        step_count,
+                    )
+                    REGISTRY.agent_stall_warnings_total.inc()
+
+                # Middleware: agent step
+                if mw:
+                    ctx.step_count = step_count
+                    ctx.messages = messages
+                    async def _step_handler(_c: Any) -> bool:
+                        return True
+
+                    should_continue = await mw.run_agent_step(ctx, _step_handler)
+                    if not should_continue:
+                        output = AgentOutput(
+                            messages=messages, tools_used=tools_used,
+                            content="Agent stopped by middleware.",
+                            usage=total_usage, stop_reason="middleware",
+                            tool_events=tool_events,
+                        )
+                        if mw:
+                            await mw.run_agent_end(ctx, output)
+                        return output
+
+                # LLM call (wrapped by middleware when present)
+                if mw:
+                    ctx.messages = messages
+                    ctx.model = spec.model
+                    ctx.temperature = spec.temperature
+                    ctx.max_tokens = spec.max_tokens
+                    ctx.tool_defs = tool_defs
+
+                    async def _llm_handler(c: MiddlewareContext) -> LLMResponse:
+                        resp = await self._call_llm(spec, c.messages, c.tool_defs)
+                        c.llm_response = resp
+                        return resp
+
+                    response = await mw.run_llm_call(ctx, _llm_handler)
+                else:
+                    response = await self._call_llm(spec, messages, tool_defs)
+
+                # Accumulate token usage across all turns
+                for k, v in response.usage.items():
+                    total_usage[k] = total_usage.get(k, 0) + v
+
+                logger.debug(
+                    "Agent turn: finish={}, content_len={}, tool_calls={}",
+                    response.finish_reason,
+                    len(response.content or ""),
+                    len(response.tool_calls),
                 )
-                REGISTRY.agent_stall_warnings_total.inc()
 
-            response = await self._call_llm(spec, messages, tool_defs)
+                # --- error path ---
+                if response.finish_reason == "error":
+                    REGISTRY.agent_errors_total.inc()
+                    output = AgentOutput(
+                        messages=messages,
+                        tools_used=tools_used,
+                        content=response.content or "",
+                        usage=total_usage,
+                        stop_reason="error",
+                        error=response.content or "LLM returned an error",
+                        tool_events=tool_events,
+                    )
+                    if mw:
+                        await mw.run_agent_end(ctx, output)
+                    return output
 
-            # Accumulate token usage across all turns
-            for k, v in response.usage.items():
-                total_usage[k] = total_usage.get(k, 0) + v
+                # --- tool-call path ---
+                if response.tool_calls:
+                    assistant_msg = self._build_assistant_tool_call_message(response)
+                    messages.append(assistant_msg)
 
-            logger.debug(
-                "Agent turn: finish={}, content_len={}, tool_calls={}",
-                response.finish_reason,
-                len(response.content or ""),
-                len(response.tool_calls),
-            )
+                    await self._execute_tool_calls(
+                        response.tool_calls, spec.tools, tools_used, tool_events, messages, mw, ctx,
+                    )
 
-            # --- error path ---
-            if response.finish_reason == "error":
-                REGISTRY.agent_errors_total.inc()
-                return AgentOutput(
+                    continue  # feed tool results back to LLM
+
+                # --- stop / final-content path ---
+                messages.append({"role": "assistant", "content": response.content or ""})
+                REGISTRY.agent_steps.observe(step_count)
+                output = AgentOutput(
                     messages=messages,
                     tools_used=tools_used,
                     content=response.content or "",
                     usage=total_usage,
-                    stop_reason="error",
-                    error=response.content or "LLM returned an error",
+                    stop_reason=response.finish_reason,
                     tool_events=tool_events,
                 )
+                if mw:
+                    await mw.run_agent_end(ctx, output)
+                return output
 
-            # --- tool-call path ---
-            if response.tool_calls:
-                assistant_msg = self._build_assistant_tool_call_message(response)
-                messages.append(assistant_msg)
-
-                await self._execute_tool_calls(
-                    response.tool_calls, spec.tools, tools_used, tool_events, messages
-                )
-
-                continue  # feed tool results back to LLM
-
-            # --- stop / final-content path ---
-            messages.append({"role": "assistant", "content": response.content or ""})
+            # --- exhausted iteration budget ---
             REGISTRY.agent_steps.observe(step_count)
-            return AgentOutput(
+            REGISTRY.agent_stall_warnings_total.inc()
+            output = AgentOutput(
                 messages=messages,
                 tools_used=tools_used,
-                content=response.content or "",
+                content="Agent stopped: maximum iterations reached.",
                 usage=total_usage,
-                stop_reason=response.finish_reason,
+                stop_reason="max_iterations",
                 tool_events=tool_events,
             )
+            if mw:
+                await mw.run_agent_end(ctx, output)
+            return output
 
-        # --- exhausted iteration budget ---
-        REGISTRY.agent_steps.observe(step_count)
-        REGISTRY.agent_stall_warnings_total.inc()
-        return AgentOutput(
-            messages=messages,
-            tools_used=tools_used,
-            content="Agent stopped: maximum iterations reached.",
-            usage=total_usage,
-            stop_reason="max_iterations",
-            tool_events=tool_events,
-        )
+        except Exception:
+            if mw:
+                await mw.run_agent_end(ctx, None)
+            raise
 
     # -- helpers ---------------------------------------------------------------
 
@@ -213,7 +277,9 @@ class AgentCore:
         with tracer.span("llm.chat", model=model, messages_count=len(messages),
                          tools_count=len(tool_defs or [])):
             try:
-                if spec.on_content_delta is not None or spec.on_tool_call_delta is not None:
+                if (spec.on_content_delta is not None
+                        or spec.on_tool_call_delta is not None
+                        or spec.on_thinking_delta is not None):
                     response = await self.provider.chat_stream_with_retry(
                         messages=messages,
                         tools=tool_defs or [],
@@ -221,6 +287,7 @@ class AgentCore:
                         max_tokens=spec.max_tokens,
                         temperature=spec.temperature,
                         on_content_delta=spec.on_content_delta,
+                        on_thinking_delta=spec.on_thinking_delta,
                         on_tool_call_delta=spec.on_tool_call_delta,
                     )
                 else:
@@ -365,6 +432,8 @@ class AgentCore:
         tools_used: list[str],
         tool_events: list[dict[str, str]],
         messages: list[dict[str, Any]],
+        mw: MiddlewareChain | None = None,
+        ctx: Any = None,
     ) -> None:
         """Execute tool calls, running parallel-safe ones concurrently.
 
@@ -387,6 +456,25 @@ class AgentCore:
 
         async def _exec_one(tc: Any) -> ToolResult:
             t0 = time.monotonic()
+
+            if mw and ctx is not None:
+                ctx.tool_name = tc.name
+                ctx.tool_arguments = tc.arguments
+                ctx.tools = tools
+
+                async def _tool_handler(c: MiddlewareContext) -> ToolResult:
+                    with tracer.span("tool.execute", tool_name=c.tool_name):
+                        result = await tools.execute(c.tool_name, c.tool_arguments)
+                        latency_ms = (time.monotonic() - t0) * 1000
+                        REGISTRY.tool_calls_total.inc()
+                        REGISTRY.tool_latency_ms.observe(latency_ms)
+                        if not result.success:
+                            REGISTRY.tool_calls_errors_total.inc()
+                        c.tool_result = result
+                        return result
+
+                return await mw.run_tool_execute(ctx, _tool_handler)
+
             with tracer.span("tool.execute", tool_name=tc.name):
                 result = await tools.execute(tc.name, tc.arguments)
                 latency_ms = (time.monotonic() - t0) * 1000

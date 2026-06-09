@@ -9,9 +9,9 @@ import pytest
 from agents.plan_solve_agent import PlanSolveAgent
 from agents.react_agent import ReActAgent
 from core.dispatcher import (
+    _DEFAULT_PARADIGM_DESCRIPTIONS,
     Dispatcher,
     LLMClassifier,
-    _DEFAULT_PARADIGM_DESCRIPTIONS,
     _match_explicit_command,
     _match_plan_indicators,
     heuristic_classifier,

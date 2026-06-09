@@ -6,12 +6,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agents.react_agent import ReActAgent
 from core.agent_base import BaseAgent
 from core.runner import AgentCore, AgentInput, AgentOutput
-from agents.react_agent import ReActAgent
-from providers.base import LLMProvider
 from tools import ToolRegistry
-
 
 # ---------------------------------------------------------------------------
 # BaseAgent — abstract enforcement

@@ -2,21 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
-import time
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from providers.base import LLMResponse
 from providers.openai_compatible_provider import (
     _ALNUM,
     _NO_SUP_TEMP_MODELS,
-    _short_tool_id,
     OpenAICompatibleProvider,
+    _short_tool_id,
 )
-from providers.base import LLMResponse, ToolCallRequest
-
 
 # ---------------------------------------------------------------------------
 # Lightweight fakes for object-path testing (no model_dump — avoids

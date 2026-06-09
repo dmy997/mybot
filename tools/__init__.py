@@ -29,7 +29,7 @@ def discover_tools(
     """
     tools: dict[str, Tool] = {}
     tools_dir = Path(__file__).parent
-    _skip_modules = {"tool", "registry", "subagent"}
+    _skip_modules = {"tool", "registry", "subagent", "memory_tools"}
 
     for module_info in pkgutil.iter_modules([str(tools_dir)]):
         name = module_info.name

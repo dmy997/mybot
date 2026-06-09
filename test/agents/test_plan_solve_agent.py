@@ -8,10 +8,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agents.plan_solve_agent import PlanSolveAgent, _merge_usage
-from core.runner import AgentCore, AgentInput, AgentOutput
+from core.runner import AgentCore, AgentInput
 from providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from tools import Tool, ToolRegistry, ToolResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers

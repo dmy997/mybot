@@ -6,12 +6,18 @@ import importlib
 import inspect
 import pkgutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.agent_base import BaseAgent
 
+if TYPE_CHECKING:
+    from core.middleware import MiddlewareChain
 
-def discover_agents(provider: Any) -> dict[str, BaseAgent]:
+
+def discover_agents(
+    provider: Any,
+    middleware: MiddlewareChain | None = None,
+) -> dict[str, BaseAgent]:
     """Auto-discover all :class:`BaseAgent` subclasses in the agents package.
 
     Scans the ``agents/`` directory for Python modules, imports them,
@@ -24,7 +30,7 @@ def discover_agents(provider: Any) -> dict[str, BaseAgent]:
 
     agents: dict[str, BaseAgent] = {}
     agents_dir = Path(__file__).parent
-    core = AgentCore(provider)
+    core = AgentCore(provider, middleware=middleware)
 
     for module_info in pkgutil.iter_modules([str(agents_dir)]):
         if module_info.name.startswith("_"):

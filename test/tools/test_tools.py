@@ -10,7 +10,6 @@ import pytest
 from tools.bash_tool import BashTool, _contains_dangerous_pattern
 from tools.file_tools import ReadTool, WriteTool, _resolve_safe
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -409,7 +408,7 @@ class TestToolIntegration:
         assert "bash" in registry
         assert "read" in registry
         assert "write" in registry
-        assert len(registry) == 3
+        assert len(registry) == 6  # bash, read, write, webfetch, grep, websearch
 
     def test_tool_definitions_valid(self, workspace):
         from tools import ToolRegistry, discover_tools
@@ -419,7 +418,7 @@ class TestToolIntegration:
             registry.register(tool)
 
         definitions = registry.get_definitions()
-        assert len(definitions) == 3
+        assert len(definitions) == 6  # bash, read, write, webfetch, grep, websearch
         for d in definitions:
             assert d["type"] == "function"
             assert d["function"]["name"]
@@ -434,7 +433,7 @@ class TestToolIntegration:
         # Should not contain Tool or ToolResult
         assert "tool" not in tools_dict
         assert "ToolResult" not in tools_dict
-        assert len(tools_dict) == 3
+        assert len(tools_dict) == 6  # bash, read, write, webfetch, grep, websearch
 
     def test_discover_tools_returns_instances(self, workspace):
         from tools import Tool, discover_tools
@@ -456,13 +455,15 @@ class TestToolIntegration:
         # bash is not available in "memory" scope
         core_tools = registry.for_scope("core")
         core_names = {t.name for t in core_tools}
-        assert core_names == {"bash", "read", "write"}
+        assert core_names == {"bash", "read", "write", "webfetch", "grep", "websearch"}
 
         memory_tools = registry.for_scope("memory")
         memory_names = {t.name for t in memory_tools}
         assert "read" in memory_names
+        assert "grep" in memory_names
         assert "bash" not in memory_names
         assert "write" not in memory_names
+        assert "webfetch" not in memory_names
 
     def test_get_definitions_for_scope(self, workspace):
         from tools import ToolRegistry, discover_tools
@@ -472,8 +473,9 @@ class TestToolIntegration:
             registry.register(tool)
 
         defs = registry.get_definitions_for_scope("memory")
-        assert len(defs) == 1
-        assert defs[0]["function"]["name"] == "read"
+        assert len(defs) == 2  # read + grep
+        names = {d["function"]["name"] for d in defs}
+        assert names == {"read", "grep"}
 
     # -- parallel flag -----------------------------------------------------
 
