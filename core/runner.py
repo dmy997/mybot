@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from context.context_manager import _estimate_message_tokens
 from observability.metrics import REGISTRY
 from observability.trace import tracer
 from providers.base import LLMProvider, LLMResponse
@@ -42,6 +43,12 @@ class AgentInput:
     """Async callback invoked for each reasoning/thinking token during streaming."""
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     """Async callback invoked for each tool-call delta during streaming."""
+    on_tool_execute_start: Callable[[str, dict[str, Any], int, int], Awaitable[None]] | None = None
+    """Async callback invoked before each tool executes (name, args, idx, total)."""
+    on_tool_execute_end: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    """Async callback invoked after each tool completes with the tool event dict."""
+    on_new_turn: Callable[[], Awaitable[None]] | None = None
+    """Async callback invoked at the start of each new LLM turn (after the first)."""
 
 
 @dataclass
@@ -65,6 +72,23 @@ _DEFAULT_MAX_ITERATIONS = 20
 _DEFAULT_MAX_TOOL_RESULT_CHARS = 16_000
 _STALL_WARNING_STEPS = 50
 
+# Compaction (lightweight context management during agent execution)
+_RUNNER_MAX_CONTEXT_TOKENS = 128_000
+_COMPACT_TRIGGER_RATIO = 0.8
+_TOOL_SUMMARY_MAX_CHARS = 200
+_RECENT_TOOL_TURNS = 2
+_TOOL_RESULT_MAX_CHARS = 3000
+
+
+def _summarize_args(args: dict[str, Any] | None, max_chars: int = 120) -> str:
+    """Condense tool call arguments into a compact single-line preview."""
+    if not args:
+        return "{}"
+    text = str(args)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars - 3] + "..."
+
 
 class AgentCore:
     """Minimal agent execution loop shared by all top-level agents.
@@ -81,11 +105,13 @@ class AgentCore:
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
         max_tool_result_chars: int = _DEFAULT_MAX_TOOL_RESULT_CHARS,
         middleware: MiddlewareChain | None = None,
+        max_context_tokens: int = _RUNNER_MAX_CONTEXT_TOKENS,
     ) -> None:
         self.provider = provider
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
         self.middleware = middleware
+        self.max_context_tokens = max_context_tokens
 
     # -- public entry point ----------------------------------------------------
 
@@ -112,6 +138,10 @@ class AgentCore:
         try:
             for _ in range(self.max_iterations):
                 step_count += 1
+
+                # Notify new turn (for display reset)
+                if step_count > 1 and spec.on_new_turn:
+                    await spec.on_new_turn()
 
                 # Stall detection: warn when step count is abnormally high
                 if step_count == _STALL_WARNING_STEPS:
@@ -140,9 +170,12 @@ class AgentCore:
                             await mw.run_agent_end(ctx, output)
                         return output
 
+                # Compact context before LLM call (operates on a copy)
+                compacted = self._maybe_compact(messages, tool_defs)
+
                 # LLM call (wrapped by middleware when present)
                 if mw:
-                    ctx.messages = messages
+                    ctx.messages = compacted
                     ctx.model = spec.model
                     ctx.temperature = spec.temperature
                     ctx.max_tokens = spec.max_tokens
@@ -155,7 +188,7 @@ class AgentCore:
 
                     response = await mw.run_llm_call(ctx, _llm_handler)
                 else:
-                    response = await self._call_llm(spec, messages, tool_defs)
+                    response = await self._call_llm(spec, compacted, tool_defs)
 
                 # Accumulate token usage across all turns
                 for k, v in response.usage.items():
@@ -190,7 +223,7 @@ class AgentCore:
                     messages.append(assistant_msg)
 
                     await self._execute_tool_calls(
-                        response.tool_calls, spec.tools, tools_used, tool_events, messages, mw, ctx,
+                        response.tool_calls, spec, tools_used, tool_events, messages, mw, ctx,
                     )
 
                     continue  # feed tool results back to LLM
@@ -256,6 +289,190 @@ class AgentCore:
         # No user message found — append a synthetic one (unusual path)
         messages.append({"role": "user", "content": f"[Goal]\n{goal}"})
         return messages
+
+    # -- compaction (lightweight context management on copies) -----------------
+
+    @staticmethod
+    def _remove_orphan_tool_results(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Step 1: Remove tool results whose tool_call_id has no matching assistant tool_call."""
+        valid_ids: set[str] = set()
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and "id" in tc:
+                        valid_ids.add(tc["id"])
+        return [
+            m for m in messages
+            if m.get("role") != "tool" or m.get("tool_call_id") in valid_ids
+        ]
+
+    @staticmethod
+    def _fill_missing_tool_results(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Step 2: Insert placeholder for tool calls that have no result."""
+        tool_result_ids: set[str] = set()
+        for msg in messages:
+            if msg.get("role") == "tool":
+                tool_result_ids.add(msg.get("tool_call_id", ""))
+
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            result.append(msg)
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    tc_id = tc.get("id") if isinstance(tc, dict) else ""
+                    if tc_id and tc_id not in tool_result_ids:
+                        result.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": "[Tool result unavailable — compacted]",
+                        })
+                        tool_result_ids.add(tc_id)
+        return result
+
+    @staticmethod
+    def _summarize_old_tool_results(
+        messages: list[dict[str, Any]],
+        recent_turns: int = _RECENT_TOOL_TURNS,
+    ) -> list[dict[str, Any]]:
+        """Step 3: Compress old tool results to one-line summaries.
+
+        Tool-calling turns are counted by assistant messages with tool_calls.
+        Results from the last *recent_turns* are kept intact; older ones are
+        replaced with ``[Compacted] {prefix}...``.
+        """
+        total_turns = sum(
+            1 for m in messages
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        cutoff = max(0, total_turns - recent_turns)
+
+        result: list[dict[str, Any]] = []
+        turn = 0
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                turn += 1
+
+            if msg.get("role") == "tool" and turn <= cutoff:
+                content = msg.get("content", "")
+                if isinstance(content, str) and not content.startswith("[Compacted]"):
+                    summary = content[:_TOOL_SUMMARY_MAX_CHARS].replace("\n", " ")
+                    suffix = "..." if len(content) > _TOOL_SUMMARY_MAX_CHARS else ""
+                    result.append({
+                        **msg,
+                        "content": f"[Compacted] {summary}{suffix}",
+                    })
+                else:
+                    result.append(msg)
+            else:
+                result.append(msg)
+        return result
+
+    @staticmethod
+    def _truncate_long_tool_results(
+        messages: list[dict[str, Any]],
+        max_chars: int = _TOOL_RESULT_MAX_CHARS,
+    ) -> list[dict[str, Any]]:
+        """Step 4: Hard-truncate tool results that exceed *max_chars*.
+
+        Only applies to non-current-turn results (last assistant with
+        tool_calls marks the current turn).
+        """
+        # Find the last assistant-with-tool_calls index
+        last_tool_call_idx = -1
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                last_tool_call_idx = i
+
+        result: list[dict[str, Any]] = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "tool" and i < last_tool_call_idx:
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > max_chars:
+                    result.append({
+                        **msg,
+                        "content": content[:max_chars] + "\n... (truncated)",
+                    })
+                else:
+                    result.append(msg)
+            else:
+                result.append(msg)
+        return result
+
+    @staticmethod
+    def _truncate_by_token_budget(
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        tool_defs: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Step 5: Drop oldest non-system messages until within token budget."""
+        reserve = 4096  # output + tool definition overhead
+        if tool_defs:
+            reserve += _estimate_message_tokens(
+                [{"role": "system", "content": str(tool_defs)}]
+            )
+        budget = max_tokens - reserve
+
+        if _estimate_message_tokens(messages) <= budget:
+            return list(messages)
+
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        other_msgs = [m for m in messages if m.get("role") != "system"]
+
+        while (
+            _estimate_message_tokens(system_msgs + other_msgs) > budget
+            and len(other_msgs) > 1
+        ):
+            other_msgs.pop(0)
+
+        return system_msgs + other_msgs
+
+    def _compact_context(
+        self,
+        messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]] | None,
+        max_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Run the full 7-step compaction pipeline on a copy.
+
+        The original *messages* list is never modified.
+        """
+        cleaned = list(messages)
+
+        # Step 1-2: Structural repair
+        cleaned = self._remove_orphan_tool_results(cleaned)
+        cleaned = self._fill_missing_tool_results(cleaned)
+
+        # Step 3-4: Content reduction (old tool results)
+        cleaned = self._summarize_old_tool_results(cleaned)
+        cleaned = self._truncate_long_tool_results(cleaned)
+
+        # Step 5: Token budget enforcement
+        cleaned = self._truncate_by_token_budget(cleaned, max_tokens, tool_defs)
+
+        # Step 6-7: Post-truncation repair
+        cleaned = self._remove_orphan_tool_results(cleaned)
+        cleaned = self._fill_missing_tool_results(cleaned)
+
+        return cleaned
+
+    def _maybe_compact(
+        self,
+        messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Return compacted copy if token budget is tight, else original."""
+        threshold = int(self.max_context_tokens * _COMPACT_TRIGGER_RATIO)
+        if _estimate_message_tokens(messages) <= threshold:
+            return messages
+        logger.debug(
+            "Compacting context: {} tokens exceeds threshold {}",
+            _estimate_message_tokens(messages), threshold,
+        )
+        return self._compact_context(messages, tool_defs, self.max_context_tokens)
 
     async def _call_llm(
         self,
@@ -373,8 +590,18 @@ class AgentCore:
         tool_defs: list[dict[str, Any]] | None,
         info: Any,
     ) -> LLMResponse:
-        """Drop the oldest non-system messages and retry."""
-        # Keep system prompt + last N messages (at least the current user message)
+        """Compact context and retry; fall back to dropping if still too long."""
+        # 1st attempt: compact with a tighter budget
+        reduced_budget = int(self.max_context_tokens * 0.6)
+        compacted = self._compact_context(messages, tool_defs, reduced_budget)
+        if len(compacted) < len(messages):
+            logger.warning(
+                "Context-length recovery: {} messages → {} messages (compacted)",
+                len(messages), len(compacted),
+            )
+            return await self._call_llm(spec, compacted, tool_defs, recovery_attempt=True)
+
+        # 2nd attempt: drop oldest non-system messages
         system_msgs = [m for m in messages if m.get("role") == "system"]
         other_msgs = [m for m in messages if m.get("role") != "system"]
 
@@ -382,11 +609,10 @@ class AgentCore:
             logger.warning("Context still too long after trimming to minimum")
             return self._error_response(info)
 
-        # Drop oldest third of non-system messages
         keep = max(2, len(other_msgs) * 2 // 3)
         trimmed = system_msgs + other_msgs[-keep:]
         logger.warning(
-            "Context-length recovery: {} messages → {} messages",
+            "Context-length recovery (fallback): {} messages → {} messages",
             len(messages), len(trimmed),
         )
         return await self._call_llm(spec, trimmed, tool_defs, recovery_attempt=True)
@@ -428,7 +654,7 @@ class AgentCore:
     async def _execute_tool_calls(
         self,
         tool_calls: list[Any],
-        tools: ToolRegistry,
+        spec: AgentInput,
         tools_used: list[str],
         tool_events: list[dict[str, str]],
         messages: list[dict[str, Any]],
@@ -443,6 +669,9 @@ class AgentCore:
 
         Results are appended to *messages* in the original tool-call order.
         """
+        tools = spec.tools
+        total = len(tool_calls)
+
         # Split by parallel capability
         parallel_group: list[tuple[int, Any]] = []  # (index, tool_call)
         serial_calls: list[tuple[int, Any]] = []
@@ -454,7 +683,7 @@ class AgentCore:
             else:
                 serial_calls.append((idx, tc))
 
-        async def _exec_one(tc: Any) -> ToolResult:
+        async def _exec_one(tc: Any) -> tuple[ToolResult, float]:
             t0 = time.monotonic()
 
             if mw and ctx is not None:
@@ -473,7 +702,9 @@ class AgentCore:
                         c.tool_result = result
                         return result
 
-                return await mw.run_tool_execute(ctx, _tool_handler)
+                result = await mw.run_tool_execute(ctx, _tool_handler)
+                latency_ms = (time.monotonic() - t0) * 1000
+                return result, latency_ms
 
             with tracer.span("tool.execute", tool_name=tc.name):
                 result = await tools.execute(tc.name, tc.arguments)
@@ -482,43 +713,65 @@ class AgentCore:
                 REGISTRY.tool_latency_ms.observe(latency_ms)
                 if not result.success:
                     REGISTRY.tool_calls_errors_total.inc()
-                return result
+                return result, latency_ms
 
-        # Execute parallel group concurrently
-        if parallel_group:
-            tasks = [_exec_one(tc) for _, tc in parallel_group]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for (idx, tc), result in zip(parallel_group, results):
-                if isinstance(result, BaseException):
-                    result = ToolResult(
-                        success=False,
-                        content="",
-                        error=f"Tool raised: {result}",
-                    )
-                    REGISTRY.tool_calls_total.inc()
-                    REGISTRY.tool_calls_errors_total.inc()
-                tools_used.append(tc.name)
-                tool_events.append({
-                    "name": tc.name,
-                    "status": "ok" if result.success else "error",
-                    "detail": (result.content or result.error or "")[:200],
-                })
-                messages.append(
-                    self._build_tool_result_message(tc.id, result),
-                )
-
-        # Execute serial calls one at a time
-        for idx, tc in serial_calls:
-            result = await _exec_one(tc)
-            tools_used.append(tc.name)
-            tool_events.append({
+        def _make_event(tc: Any, result: ToolResult, duration_ms: float) -> dict[str, Any]:
+            args_preview = _summarize_args(tc.arguments, 120)
+            return {
                 "name": tc.name,
                 "status": "ok" if result.success else "error",
                 "detail": (result.content or result.error or "")[:200],
-            })
+                "duration_ms": round(duration_ms, 1),
+                "arguments": args_preview,
+            }
+
+        # Execute parallel group concurrently
+        if parallel_group:
+            # Fire start callbacks for all parallel tools
+            for idx, tc in parallel_group:
+                if spec.on_tool_execute_start:
+                    await spec.on_tool_execute_start(
+                        tc.name, tc.arguments or {}, idx + 1, total,
+                    )
+
+            tasks = [_exec_one(tc) for _, tc in parallel_group]
+            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for (idx, tc), raw in zip(parallel_group, raw_results):
+                if isinstance(raw, BaseException):
+                    result = ToolResult(
+                        success=False,
+                        content="",
+                        error=f"Tool raised: {raw}",
+                    )
+                    duration_ms = 0.0
+                    REGISTRY.tool_calls_total.inc()
+                    REGISTRY.tool_calls_errors_total.inc()
+                else:
+                    result, duration_ms = raw
+                tools_used.append(tc.name)
+                ev = _make_event(tc, result, duration_ms)
+                tool_events.append(ev)
+                messages.append(
+                    self._build_tool_result_message(tc.id, result),
+                )
+                if spec.on_tool_execute_end:
+                    await spec.on_tool_execute_end(ev)
+
+        # Execute serial calls one at a time
+        for idx, tc in serial_calls:
+            if spec.on_tool_execute_start:
+                await spec.on_tool_execute_start(
+                    tc.name, tc.arguments or {}, idx + 1, total,
+                )
+            result, duration_ms = await _exec_one(tc)
+            tools_used.append(tc.name)
+            ev = _make_event(tc, result, duration_ms)
+            tool_events.append(ev)
             messages.append(
                 self._build_tool_result_message(tc.id, result),
             )
+            if spec.on_tool_execute_end:
+                await spec.on_tool_execute_end(ev)
 
     @staticmethod
     def _build_assistant_tool_call_message(

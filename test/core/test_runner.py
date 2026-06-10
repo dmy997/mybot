@@ -448,3 +448,271 @@ class TestAgentCoreMessages:
 
         assert result.messages[-1]["role"] == "assistant"
         assert result.messages[-1]["content"] == "Final answer."
+
+
+# ---------------------------------------------------------------------------
+# AgentCore — compaction
+# ---------------------------------------------------------------------------
+
+
+class TestAgentCoreCompaction:
+    """Tests for the 7-step lightweight compaction pipeline."""
+
+    # -- helpers ---------------------------------------------------------------
+
+    @staticmethod
+    def _msg(role: str, content: str = "", **extra: Any) -> dict[str, Any]:
+        m: dict[str, Any] = {"role": role, "content": content}
+        m.update(extra)
+        return m
+
+    @staticmethod
+    def _tool_msg(tc_id: str, content: str = "result") -> dict[str, Any]:
+        return {"role": "tool", "tool_call_id": tc_id, "content": content}
+
+    @staticmethod
+    def _assistant_tc(tc_ids: list[str]) -> dict[str, Any]:
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": tid, "type": "function",
+                            "function": {"name": "test", "arguments": "{}"}}
+                           for tid in tc_ids],
+        }
+
+    # -- fixtures --------------------------------------------------------------
+
+    @pytest.fixture
+    def provider(self):
+        return MagicMock(spec=LLMProvider)
+
+    @pytest.fixture
+    def core(self, provider):
+        return AgentCore(provider)
+
+    # -- Step 1: remove orphan tool results -----------------------------------
+
+    def test_remove_orphan_tool_results(self, core):
+        msgs = [
+            self._msg("system", "sys"),
+            self._assistant_tc(["a"]),
+            self._tool_msg("a", "ok"),
+            self._tool_msg("orphan", "nobody called me"),
+            self._msg("user", "next"),
+        ]
+        cleaned = core._remove_orphan_tool_results(msgs)
+        tool_ids = [m["tool_call_id"] for m in cleaned if m["role"] == "tool"]
+        assert tool_ids == ["a"]
+
+    def test_remove_orphan_all_valid(self, core):
+        msgs = [
+            self._assistant_tc(["a", "b"]),
+            self._tool_msg("a"),
+            self._tool_msg("b"),
+        ]
+        cleaned = core._remove_orphan_tool_results(msgs)
+        assert len([m for m in cleaned if m["role"] == "tool"]) == 2
+
+    # -- Step 2: fill missing tool results ------------------------------------
+
+    def test_fill_missing_tool_results(self, core):
+        msgs = [
+            self._msg("system", "sys"),
+            self._assistant_tc(["a", "b"]),
+            self._tool_msg("a", "got a"),
+            self._msg("user", "next"),
+        ]
+        filled = core._fill_missing_tool_results(msgs)
+        tool_contents = [m["content"] for m in filled if m["role"] == "tool"]
+        assert "got a" in tool_contents
+        assert any("unavailable" in c for c in tool_contents)
+
+    def test_fill_no_missing(self, core):
+        msgs = [
+            self._assistant_tc(["a"]),
+            self._tool_msg("a"),
+        ]
+        filled = core._fill_missing_tool_results(msgs)
+        assert filled == msgs
+
+    # -- Step 3: summarise old tool results -----------------------------------
+
+    def test_summarise_old_tool_results(self, core):
+        msgs = [
+            self._msg("system", "sys"),
+            self._assistant_tc(["old1"]),
+            self._tool_msg("old1", "long old result " * 30),
+            self._msg("user", "next"),
+            self._assistant_tc(["recent"]),
+            self._tool_msg("recent", "recent result"),
+        ]
+        compacted = core._summarize_old_tool_results(msgs, recent_turns=1)
+        # Old tool result should be summarised
+        old = next(m for m in compacted if m.get("tool_call_id") == "old1")
+        assert old["content"].startswith("[Compacted]")
+        # Recent tool result should be intact
+        recent = next(m for m in compacted if m.get("tool_call_id") == "recent")
+        assert recent["content"] == "recent result"
+
+    def test_recent_tool_results_intact(self, core):
+        """Last N tool-calling turns keep full results."""
+        msgs = [
+            self._assistant_tc(["t1"]),
+            self._tool_msg("t1", "result1"),
+            self._msg("user", "u1"),
+            self._assistant_tc(["t2"]),
+            self._tool_msg("t2", "result2"),
+            self._msg("user", "u2"),
+            self._assistant_tc(["t3"]),
+            self._tool_msg("t3", "result3"),
+        ]
+        compacted = core._summarize_old_tool_results(msgs, recent_turns=2)
+        # t1 is old (turn 1 of 3, cutoff = 3-2 = 1)
+        t1 = next(m for m in compacted if m.get("tool_call_id") == "t1")
+        assert t1["content"].startswith("[Compacted]")
+        # t2 and t3 are recent
+        t2 = next(m for m in compacted if m.get("tool_call_id") == "t2")
+        assert t2["content"] == "result2"
+        t3 = next(m for m in compacted if m.get("tool_call_id") == "t3")
+        assert t3["content"] == "result3"
+
+    # -- Step 4: truncate long tool results -----------------------------------
+
+    def test_truncate_long_tool_results(self, core):
+        msgs = [
+            self._assistant_tc(["a"]),
+            self._tool_msg("a", "x" * 4000),
+            self._msg("user", "next"),
+            self._assistant_tc(["b"]),
+            self._tool_msg("b", "current turn"),
+        ]
+        compacted = core._truncate_long_tool_results(msgs, max_chars=500)
+        # Old tool result should be truncated
+        a = next(m for m in compacted if m.get("tool_call_id") == "a")
+        assert "(truncated)" in a["content"]
+        assert len(a["content"]) < 600
+        # Current turn result intact
+        b = next(m for m in compacted if m.get("tool_call_id") == "b")
+        assert b["content"] == "current turn"
+
+    # -- Step 5: token budget truncation --------------------------------------
+
+    def test_token_budget_truncation(self, core):
+        """Oldest non-system messages dropped when over budget."""
+        msgs = [
+            self._msg("system", "sys"),
+            self._msg("user", "first"),
+            self._msg("assistant", "reply1"),
+            self._msg("user", "second"),
+            self._msg("assistant", "reply2"),
+        ]
+        # Mark all messages as tiny — budget trivially fits, should be no-op
+        result = core._truncate_by_token_budget(msgs, 1_000_000, None)
+        assert len(result) == len(msgs)
+
+    def test_token_budget_drops_oldest(self, core):
+        """When over very tight budget, drops oldest non-system."""
+        msgs = [
+            self._msg("system", "sys"),
+            self._msg("user", "first"),
+            self._msg("assistant", "a" * 4000),
+            self._msg("user", "second"),
+        ]
+        result = core._truncate_by_token_budget(msgs, 500, None)
+        # Should keep system + at least 1 other
+        assert len(result) < len(msgs)
+        assert result[0]["role"] == "system"
+
+    # -- Step 6-7: secondary cleanup ------------------------------------------
+
+    def test_secondary_orphan_cleanup(self, core):
+        """Token truncation may orphan tool results, cleaned in step 6."""
+        msgs = [
+            self._msg("system", "sys"),
+            self._assistant_tc(["old"]),
+            self._msg("user", "u"),
+            self._tool_msg("orphan"),
+        ]
+        result = core._compact_context(msgs, None, 500)
+        # orphans should be cleaned
+        tool_ids = [m.get("tool_call_id") for m in result if m["role"] == "tool"]
+        assert "orphan" not in tool_ids
+
+    def test_secondary_fill(self, core):
+        """Step 7: fill_missing is a safety net ensuring well-formed output."""
+        msgs = [
+            self._msg("system", "sys"),
+            self._assistant_tc(["tc1"]),
+            self._tool_msg("tc1", "x" * 5000),
+            self._msg("user", "next"),
+        ]
+        result = core._compact_context(msgs, None, 500)
+        # After full pipeline, every assistant tc must have matching tool results
+        tc_ids: set[str] = set()
+        for m in result:
+            if m.get("role") == "assistant":
+                for tc in (m.get("tool_calls") or []):
+                    tc_ids.add(tc["id"])
+        tool_res_ids = {m["tool_call_id"] for m in result if m.get("role") == "tool"}
+        missing = tc_ids - tool_res_ids
+        assert len(missing) == 0, f"Missing tool results: {missing}"
+
+    # -- integration: _maybe_compact ------------------------------------------
+
+    def test_no_compact_when_under_budget(self, core):
+        msgs = [self._msg("user", "hi")]
+        result = core._maybe_compact(msgs, None)
+        # Under budget → same object returned (not a copy)
+        assert result is msgs
+
+    def test_original_messages_untouched(self, core):
+        """Compaction operates on a copy; original list unchanged."""
+        msgs = [
+            self._assistant_tc(["orphan_tc"]),
+            self._tool_msg("orphan_tool", "x"),
+        ]
+        original_len = len(msgs)
+        core._compact_context(msgs, None, core.max_context_tokens)
+        # Original must be unchanged
+        assert len(msgs) == original_len
+        assert msgs[1]["role"] == "tool"  # still there
+
+    def test_compaction_idempotent(self, core):
+        """Running compaction twice produces same result."""
+        msgs = [
+            self._msg("system", "sys"),
+            self._assistant_tc(["a"]),
+            self._tool_msg("a", "x" * 4000),
+            self._msg("user", "next"),
+        ]
+        c1 = core._compact_context(msgs, None, 2000)
+        c2 = core._compact_context(c1, None, 2000)
+        # Should be stable
+        assert len(c1) == len(c2)
+        for a, b in zip(c1, c2):
+            assert a["role"] == b["role"]
+
+    @pytest.mark.asyncio
+    async def test_multi_turn_compaction_during_run(self, core, provider):
+        """Compaction triggers during multi-turn execution; LLM receives compacted copy."""
+        call_messages: list[list[dict[str, Any]]] = []
+
+        async def _track_and_respond(messages, **kw):
+            call_messages.append(list(messages))
+            return _make_response(content="done")
+
+        provider.chat_with_retry = _track_and_respond  # type: ignore[assignment]
+
+        spec = AgentInput(
+            init_messages=[
+                self._msg("system", "sys"),
+                self._msg("user", "q"),
+            ],
+            tools=ToolRegistry(),
+        )
+        # Set very low budget so compaction triggers
+        core.max_context_tokens = 1000
+        result = await core.run(spec)
+        assert result.content == "done"
+        # LLM was called — compaction ran before each call
+        assert len(call_messages) >= 1

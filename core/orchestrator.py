@@ -33,11 +33,10 @@ from observability.display import (
     print_error,
     print_stream_delta,
     print_thinking_timer,
-    print_tool_call_start,
     show_banner,
     show_history,
+    show_llm_usage,
     show_sessions,
-    show_tool_results,
 )
 from observability.metrics import REGISTRY
 from observability.trace import tracer
@@ -173,6 +172,20 @@ class Orchestrator:
             return input(prompt)
         return await loop.run_in_executor(None, input, prompt)
 
+    async def _idle_watchdog(self, session_key: str) -> None:
+        """Background task that compresses idle sessions during input wait.
+
+        Sleeps for ``idle_compress_seconds`` then triggers compression of
+        older messages (keeping the 10 most recent).  Designed to run
+        concurrently with :meth:`_ainput` — cancelled when input arrives.
+        """
+        timeout = self.ctx.idle_compress_seconds
+        if timeout <= 0:
+            return
+
+        await asyncio.sleep(timeout)
+        await self.ctx.compress(session_key, keep_recent=10)
+
     def _print_startup_banner(
         self, session_key: str, model: str | None
     ) -> None:
@@ -253,6 +266,11 @@ class Orchestrator:
             while self._running:
                 prompt = f"[{session_key}] {self._last_paradigm} › "
 
+                # Start idle watchdog — compresses session if user is idle too long
+                watchdog = asyncio.create_task(
+                    self._idle_watchdog(session_key)
+                )
+
                 # Read input with line-editing support
                 try:
                     line = await self._ainput(prompt)
@@ -260,6 +278,12 @@ class Orchestrator:
                     # Ctrl+D
                     print()
                     break
+                finally:
+                    watchdog.cancel()
+                    try:
+                        await watchdog
+                    except asyncio.CancelledError:
+                        pass
 
                 user_input = line.strip()
                 if not user_input:
@@ -351,9 +375,9 @@ class Orchestrator:
                 # 1. Resolve active skills
                 active_skills = list(skills or [])
 
-                # 2. Build messages (includes repair, idle compression, token-budget compression)
+                # 2. Build messages (includes repair, token-budget compression)
                 with tracer.span("context.build"):
-                    messages = self.ctx.build_messages(
+                    messages = await self.ctx.build_messages(
                         session_key,
                         user_input,
                         tools=self._tools,
@@ -373,6 +397,10 @@ class Orchestrator:
                         _thinking_task.cancel()
                         _thinking_task = None
                         clear_thinking_timer()
+
+                # Tool-execution / new-turn callbacks (default: None)
+                _on_tool_end_cli: Callable[..., Awaitable[None]] | None = None
+                _on_new_turn_cli: Callable[..., Awaitable[None]] | None = None
 
                 if _use_callbacks:
                     # --- callback mode (HTTP/WS) ---
@@ -401,6 +429,9 @@ class Orchestrator:
                     _content_cb = _on_delta
                     _thinking_cb = _on_thinking_delta
                     _tool_cb = _on_tool_call_delta
+                    # Callback mode: tool-end and new-turn handled via user-provided callbacks
+                    _on_tool_end_cli = None
+                    _on_new_turn_cli = None
 
                 else:
                     # --- CLI mode (rich display) ---
@@ -424,26 +455,31 @@ class Orchestrator:
                             _stream_started = True
                         print_stream_delta(delta)
 
-                    _cli_shown_indices: set[int] = set()
-
+                    # Stop timer when tool calls arrive (LLM is done "thinking").
+                    # Actual execution progress is shown via on_tool_execute_start/end.
                     async def _cli_on_tool_call_delta(tc: dict[str, Any]) -> None:
-                        nonlocal _stream_started
-                        idx = tc.get("index", 0)
-                        if idx in _cli_shown_indices:
-                            return
-                        _cli_shown_indices.add(idx)
-                        fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
-                        name = tc.get("name") or fn.get("name", "?")
                         _stop_thinking()
-                        if not _stream_started:
-                            print()
-                            _stream_started = True
-                        print_tool_call_start(name)
+
+                    # Per-turn: stop old timer, reset stream state, start new timer
+                    # so each LLM response starts on its own line with a fresh timer.
+                    async def _cli_on_new_turn() -> None:
+                        nonlocal _stream_started, _thinking_task
+                        _stop_thinking()
+                        _stream_started = False
+                        _thinking_task = asyncio.create_task(_run_thinking_timer())
+                        print()
+
+                    # Tool execution progress — shown inline as tools complete.
+                    async def _cli_on_tool_execute_end(ev: dict[str, Any]) -> None:
+                        from observability.display import print_tool_progress_end
+                        print_tool_progress_end(ev)
 
                     _thinking_task = asyncio.create_task(_run_thinking_timer())
                     _content_cb = _cli_on_delta
                     _thinking_cb = None
                     _tool_cb = _cli_on_tool_call_delta
+                    _on_tool_end_cli = _cli_on_tool_execute_end
+                    _on_new_turn_cli = _cli_on_new_turn
 
                 spec = AgentInput(
                     init_messages=messages,
@@ -455,6 +491,8 @@ class Orchestrator:
                     on_content_delta=_content_cb,
                     on_thinking_delta=_thinking_cb,
                     on_tool_call_delta=_tool_cb,
+                    on_tool_execute_end=_on_tool_end_cli,
+                    on_new_turn=_on_new_turn_cli,
                 )
 
                 # 5. Run agent (interruptible)
@@ -489,15 +527,19 @@ class Orchestrator:
                 if _use_callbacks and on_thinking_done:
                     await on_thinking_done()
 
-                # Report tool results
+                # Report tool results (callback mode: per-event; CLI: already shown inline)
                 if _use_callbacks and on_tool_end:
                     for ev in output.tool_events:
                         await on_tool_end(ev)
-                else:
-                    show_tool_results(output.tool_events)
 
-                # 6. Save session
-                self.ctx.save_session(session_key, output.messages)
+                # Print token/latency summary (CLI only)
+                if not _use_callbacks:
+                    total_ms = (time.monotonic() - t_start) * 1000
+                    show_llm_usage(output.usage, total_ms, steps)
+
+                # 6. Save session — append only the new exchange
+                assistant_msgs = output.messages[len(messages):]
+                self.ctx.save_exchange(session_key, user_input, assistant_msgs)
 
                 # Record metrics & event
                 total_ms = (time.monotonic() - t_start) * 1000

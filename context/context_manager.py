@@ -2,15 +2,17 @@
 
 Owns the full lifecycle of "what the LLM sees":
 1. Interrupted-session repair (unmatched tool calls, missing assistant responses)
-2. Idle compression (auto-summarise stale conversations)
-3. System prompt assembly (base prompt + memory + tools + skills)
-4. Session history loading / saving
-5. Token-budget compression (on-the-fly when context is too long)
-6. Memory read (context injection) and write (persisting exchange summaries)
+2. System prompt assembly (base + memory + skills + tools + history summaries)
+3. Unified compression (idle and token-budget share the same method)
+4. Session history loading (cursor-based, 100-message cap, turn-boundary-safe)
+5. Token-budget check with pre-emptive compression
+6. Memory read (context injection) and write (persisting exchange excerpts)
 """
 
 from __future__ import annotations
 
+import json as _json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -63,16 +65,39 @@ def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
     return total
 
 
+def _estimate_message_chars(messages: list[dict[str, Any]]) -> int:
+    """Character count for a list of chat messages (fallback metric)."""
+    total = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += len(str(part))
+        if "tool_calls" in msg:
+            total += len(str(msg["tool_calls"]))
+    return total
+
+
 # ---------------------------------------------------------------------------
-# Defaults
+# Constants
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MAX_CONTEXT_TOKENS = 128_000
+_DEFAULT_MAX_CONTEXT_TOKENS = 200_000
 _DEFAULT_IDLE_COMPRESS_SECONDS = 300
-_COMPRESS_RECENT_RATIO = 0.7
-_IDLE_KEEP_RECENT = 4
+_COMPRESS_RECENT_RATIO = 0.5
+_MAX_HISTORY_MESSAGES = 100
+_SUMMARY_MAX_WORDS = 200
+_CONTENT_TRUNCATE_LENGTH = 2000
+_DEHYDRATE_MAX_CONTENT_CHARS = 3000
 _INTERRUPT_MESSAGE = "Error: Task interrupted before a response was generated."
 _INTERRUPT_TOOL_RESULT = "Error: Tool execution interrupted."
+
+# Patterns for dehydration
+_DATA_URI_RE = re.compile(r"data:[^;\"\s]*;base64,[A-Za-z0-9+/=]+", re.IGNORECASE)
+_IMAGE_EXT_RE = re.compile(r"\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)(\s|$)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -93,13 +118,16 @@ class ContextManager:
     system_prompt:
         Base system prompt prepended to every request.
     max_context_tokens:
-        Soft token budget. When exceeded, older messages are compressed.
+        Soft token budget. When exceeded, unsummarised messages are compressed.
     idle_compress_seconds:
         When a session has been idle longer than this, summarise older
         messages on the next access.  Set to ``0`` to disable.
     compress_model:
         Optional model override for compression calls (defaults to provider
         default — set this to a cheap model like ``"gpt-4o-mini"``).
+    compress_ratio:
+        Fraction of ``max_context_tokens`` to reserve for recent messages
+        during token-budget compression.
     """
 
     def __init__(
@@ -111,6 +139,7 @@ class ContextManager:
         max_context_tokens: int = _DEFAULT_MAX_CONTEXT_TOKENS,
         idle_compress_seconds: int = _DEFAULT_IDLE_COMPRESS_SECONDS,
         compress_model: str | None = None,
+        compress_ratio: float = _COMPRESS_RECENT_RATIO,
         disabled_skills: list[str] | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
@@ -119,15 +148,21 @@ class ContextManager:
         self.max_context_tokens = max_context_tokens
         self.idle_compress_seconds = idle_compress_seconds
         self.compress_model = compress_model
+        self.compress_ratio = compress_ratio
 
         from core.skills import SkillsLoader as _SkillsLoader
 
         self.session = SessionManager(self.workspace)
         self.memory = MemoryManager(MemoryStore(self.workspace))
         self.skills_loader = _SkillsLoader(self.workspace, disabled_skills=disabled_skills)
+
+    # ========================================================================
+    # Public API
+    # ========================================================================
+
     # -- message assembly -----------------------------------------------------
 
-    def build_messages(
+    async def build_messages(
         self,
         session_key: str,
         current_input: str,
@@ -138,42 +173,203 @@ class ContextManager:
         """Assemble the complete message list for an agent run.
 
         Composition order:
-        1. Repair interrupted session (unmatched tool calls / user messages)
-        2. Idle compression (summarise if session is stale)
-        3. Fresh system prompt (base + memory + tools + skills)
-        4. Session history (without old system messages)
-        5. Current user input
-        6. Token-budget compression (if over limit)
+        1. Repair interrupted session
+        2. System prompt (base + memory + skills + tools + history summaries)
+        3. Session history from ``consolidated_cursor`` onwards (max 100)
+        4. Current user input
+        5. Token-budget check → compress if over budget → rebuild
 
         Returns a list ready for ``AgentInput.init_messages``.
         """
-        # 0. Repair and idle-compress before assembling
         self._repair_session(session_key)
-        self._maybe_idle_compress(session_key)
 
-        messages: list[dict[str, Any]] = []
+        session = self.session.get_session(session_key)
+        cursor = session.consolidated_cursor
 
-        # 1. System prompt
-        system_content = self._build_system_prompt(tools=tools, skills=skills)
-        messages.append({"role": "system", "content": system_content})
+        # 1. System prompt (includes history.jsonl summaries)
+        system_content = self._build_system_prompt(
+            session_key, tools=tools, skills=skills,
+        )
 
-        # 2. Session history (strip old system messages)
-        history = self.session.get_session_history(session_key)
-        for msg in history:
-            if msg.get("role") != "system":
-                messages.append(msg)
+        # 2. Load unsummarised history (cursor → end, capped at 100)
+        raw_history = session.messages[cursor:]
+        raw_history = raw_history[-_MAX_HISTORY_MESSAGES:]
 
-        messages.append({"role": "user", "content": current_input})
+        # 3. Filter out system messages from history
+        history: list[dict[str, Any]] = [
+            m for m in raw_history if m.get("role") != "system"
+        ]
 
-        # 4. Token-budget compression
-        messages = self._maybe_compress(messages, session_key)
+        # 4. Assemble preliminary list and check budget
+        preliminary: list[dict[str, Any]] = [
+            {"role": "system", "content": system_content},
+        ] + history + [
+            {"role": "user", "content": current_input},
+        ]
 
-        return messages
+        if self.max_context_tokens > 0:
+            total = _estimate_message_tokens(preliminary)
+            if total > self.max_context_tokens:
+                # Compress unsummarised messages to free budget
+                sys_tokens = _estimate_message_tokens([preliminary[0]])
+                user_tokens = _estimate_message_tokens([preliminary[-1]])
+                history_budget = (
+                    int(self.max_context_tokens * self.compress_ratio)
+                    - sys_tokens - user_tokens
+                )
+                if history_budget > 0:
+                    await self.compress(session_key, budget_tokens=history_budget)
 
-    # -- system prompt --------------------------------------------------------
+                # Rebuild after compression
+                session = self.session.get_session(session_key)
+                cursor = session.consolidated_cursor
+                raw_history = session.messages[cursor:]
+                raw_history = raw_history[-_MAX_HISTORY_MESSAGES:]
+                history = [m for m in raw_history if m.get("role") != "system"]
+
+                preliminary = [
+                    {"role": "system", "content": system_content},
+                ] + history + [
+                    {"role": "user", "content": current_input},
+                ]
+
+        return preliminary
+
+    # -- unified compression --------------------------------------------------
+
+    async def compress(
+        self,
+        session_key: str,
+        *,
+        keep_recent: int | None = None,
+        budget_tokens: int | None = None,
+    ) -> int:
+        """Compress unsummarised messages (those after ``consolidated_cursor``).
+
+        Exactly one of *keep_recent* or *budget_tokens* must be provided:
+
+        - **keep_recent**: keep this many most-recent messages (idle compression)
+        - **budget_tokens**: keep as many recent messages as fit within this
+          token budget (token-budget compression)
+
+        The split point is adjusted to preserve user/assistant turn boundaries.
+
+        Original ``session.messages`` are **never modified** — only
+        ``consolidated_cursor`` is advanced and the summary is appended to
+        ``history.jsonl``.
+
+        Returns the number of messages compressed (0 if nothing was done).
+        """
+        if keep_recent is None and budget_tokens is None:
+            raise ValueError("One of keep_recent or budget_tokens is required")
+        if keep_recent is not None and budget_tokens is not None:
+            raise ValueError("Only one of keep_recent or budget_tokens allowed")
+
+        if self.idle_compress_seconds <= 0 and budget_tokens is not None:
+            pass  # budget compression is always allowed
+        elif self.idle_compress_seconds <= 0:
+            return 0
+
+        session = self.session.get_session(session_key)
+        cursor = session.consolidated_cursor
+        unsummarised = session.messages[cursor:]
+
+        if len(unsummarised) <= 1:
+            return 0
+
+        # Determine how many recent messages to keep
+        if keep_recent is not None:
+            keep_count = keep_recent
+        else:
+            keep_count = self._fit_in_budget(unsummarised, budget_tokens)
+
+        if keep_count >= len(unsummarised):
+            return 0
+
+        to_compress = list(unsummarised[:-keep_count])
+        to_keep = list(unsummarised[-keep_count:])
+
+        # Adjust split to preserve turn boundaries
+        self._adjust_split(to_compress, to_keep)
+
+        if not to_compress:
+            return 0
+
+        # Dehydrate + summarise
+        dehydrated = self._dehydrate_messages(to_compress)
+        summary = await self._summarise(dehydrated)
+
+        # Persist summary to history.jsonl
+        self._write_history(session_key, len(to_compress), summary)
+
+        # Advance cursor (session.messages is NOT modified)
+        session.consolidated_cursor = cursor + len(to_compress)
+        session.updated_at = datetime.now()
+        self.session.save_session(session)
+
+        logger.debug(
+            "Compression for {!r}: {} messages summarised, cursor {} → {}",
+            session_key,
+            len(to_compress),
+            cursor,
+            session.consolidated_cursor,
+        )
+        return len(to_compress)
+
+    # -- session lifecycle ----------------------------------------------------
+
+    def save_exchange(
+        self,
+        session_key: str,
+        user_input: str,
+        assistant_messages: list[dict[str, Any]],
+    ) -> None:
+        """Append a user+assistant exchange to the session log.
+
+        Unlike :meth:`save_session` which replaces the entire message list,
+        this appends only the new exchange, preserving the raw conversation
+        log and keeping ``consolidated_cursor`` meaningful.
+        """
+        session = self.session.get_session(session_key)
+        session.messages.append({"role": "user", "content": user_input})
+        for msg in assistant_messages:
+            session.messages.append(msg)
+        session.updated_at = datetime.now()
+        self.session.save_session(session)
+
+    def save_session(
+        self,
+        session_key: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Persist the full message list after an agent run.
+
+        Prefer :meth:`save_exchange` for normal use — it preserves the
+        raw message log and cursor integrity.  Use this method only when
+        you need to replace the entire session.
+        """
+        self.session.set_messages(session_key, messages)
+
+    def get_history(self, session_key: str) -> list[dict[str, Any]]:
+        """Return session messages without the system prompt."""
+        messages = self.session.get_session_history(session_key)
+        return [m for m in messages if m.get("role") != "system"]
+
+    def delete_session(self, session_key: str) -> bool:
+        """Delete a session from disk and memory."""
+        return self.session.delete_session(session_key)
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        """List all saved sessions."""
+        return self.session.list_sessions()
+
+    # ========================================================================
+    # System prompt assembly
+    # ========================================================================
 
     def _build_system_prompt(
         self,
+        session_key: str = "",
         tools: ToolRegistry | None = None,
         skills: list[str] | None = None,
     ) -> str:
@@ -184,12 +380,18 @@ class ContextManager:
         if self.system_prompt:
             parts.append(self.system_prompt)
 
-        # 1. Memory context
+        # 1. Memory context (SOUL.md, USER.md, long-term memory)
         memory_ctx = self.memory.build_memory_context()
         if memory_ctx.strip():
             parts.append(memory_ctx)
 
-        # 2. Skills (via skills_loader + explicit skills)
+        # 2. History summaries from previous compressions
+        if session_key:
+            history_ctx = self._read_history_summaries(session_key)
+            if history_ctx:
+                parts.append(history_ctx)
+
+        # 3. Skills
         autoload_skills = self.skills_loader.build_skills_summary()
         explicit_skills = self.skills_loader.load_skills_for_context(skills or [])
         if not explicit_skills and skills:
@@ -202,7 +404,7 @@ class ContextManager:
         if skills_content:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_content))
 
-        # 3. Tools
+        # 4. Tools
         if tools is not None:
             tool_defs = tools.get_definitions()
             if tool_defs:
@@ -214,47 +416,46 @@ class ContextManager:
 
         return "\n\n".join(parts)
 
-    # -- interrupt repair -----------------------------------------------------
+    # ========================================================================
+    # Interrupt repair
+    # ========================================================================
 
     def _repair_session(self, session_key: str) -> None:
         """Check and repair unmatched message pairs caused by interrupts.
 
-        Detects two interruption patterns:
+        Detects three interruption patterns:
         1. Assistant message with ``tool_calls`` but no matching tool results
-           → insert synthetic error tool results.
         2. Last message is a ``user`` message with no assistant response
-           → append a synthetic error assistant message.
+        3. Last message is a ``tool`` result with no assistant response
         """
         session = self.session.get_session(session_key)
         if not session.messages:
             return
 
-        repaired, modified = self._repair_messages(session.messages)
-        if modified:
+        repaired, fixed_count = self._repair_messages(session.messages)
+        if fixed_count > 0:
             session.messages = repaired
             session.updated_at = datetime.now()
             self.session.save_session(session)
             logger.debug(
                 "Session {!r} repaired: {} unmatched pairs fixed",
-                session_key,
-                len(repaired) - len(session.messages) if modified else 0,
+                session_key, fixed_count,
             )
 
     @staticmethod
     def _repair_messages(
         messages: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """Return *messages* with unmatched pairs repaired.
 
-        Returns ``(repaired_messages, was_modified)``.
+        Returns ``(repaired_messages, fixed_count)``.
         """
         if not messages:
-            return messages, False
+            return messages, 0
 
         repaired: list[dict[str, Any]] = []
-        modified = False
+        fixed_count = 0
 
-        # Collect all existing tool_result ids
         tool_results: set[str] = set()
         for msg in messages:
             if msg.get("role") == "tool":
@@ -275,348 +476,262 @@ class ContextManager:
                             "content": _INTERRUPT_TOOL_RESULT,
                         })
                         tool_results.add(tc_id)
-                        modified = True
+                        fixed_count += 1
 
-        # Pass 2: fix unmatched last user message
-        if repaired and repaired[-1].get("role") == "user":
-            repaired.append({
-                "role": "assistant",
-                "content": _INTERRUPT_MESSAGE,
-                "timestamp": datetime.now().isoformat(),
-            })
-            modified = True
+        # Pass 2: check for interrupted trailing message
+        if repaired:
+            last_role = repaired[-1].get("role")
+            if last_role in ("user", "tool"):
+                repaired.append({
+                    "role": "assistant",
+                    "content": _INTERRUPT_MESSAGE,
+                    "timestamp": datetime.now().isoformat(),
+                })
+                fixed_count += 1
 
-        return repaired, modified
+        return repaired, fixed_count
 
-    # -- idle compression -----------------------------------------------------
+    # ========================================================================
+    # History summaries (read/write)
+    # ========================================================================
 
-    def _maybe_idle_compress(self, session_key: str) -> None:
-        """Summarise older messages when *session_key* has been idle."""
-        if self.idle_compress_seconds <= 0:
-            return
+    def _history_path(self, session_key: str) -> Path:
+        return self.workspace / "sessions" / f"{session_key}_history.jsonl"
 
-        session = self.session.get_session(session_key)
-        if not session.messages:
-            return
-
-        elapsed = (datetime.now() - session.updated_at).total_seconds()
-        if elapsed <= self.idle_compress_seconds:
-            return
-
-        if len(session.messages) <= _IDLE_KEEP_RECENT:
-            return
-
-        cutoff = len(session.messages) - _IDLE_KEEP_RECENT
-        if cutoff <= session.consolidated_cursor:
-            return
-
-        to_summarise = session.messages[:cutoff]
-        to_keep = session.messages[cutoff:]
-
-        summary = self._idle_summarise(to_summarise)
-
-        session.messages = [
-            {"role": "user", "content": f"[Session summary]\n{summary}"}
-        ] + to_keep
-        session.consolidated_cursor = cutoff
-        session.updated_at = datetime.now()
-        self.session.save_session(session)
-
-        logger.debug(
-            "Idle compression for {!r}: {} messages → summary, {} kept",
-            session_key,
-            len(to_summarise),
-            len(to_keep),
-        )
-
-    def _idle_summarise(self, messages: list[dict[str, Any]]) -> str:
-        """Summarise *messages* using the provider, falling back to truncation."""
-        if self.provider is None:
-            return self._idle_truncate_summary(messages)
+    def _write_history(
+        self, session_key: str, compressed_count: int, summary: str,
+    ) -> None:
+        """Append a compression record to history.jsonl."""
+        path = self._history_path(session_key)
+        record = _json.dumps({
+            "timestamp": datetime.now().isoformat(),
+            "compressed_count": compressed_count,
+            "summary": summary,
+        }, ensure_ascii=False)
         try:
-            return self._idle_llm_summarise(messages)
-        except Exception:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(record + "\n")
+        except OSError:
             logger.opt(exception=True).warning(
-                "Idle compression summarisation failed, falling back to truncation"
+                "Failed to write history.jsonl for {!r}", session_key,
             )
-            return self._idle_truncate_summary(messages)
 
-    def _idle_llm_summarise(self, messages: list[dict[str, Any]]) -> str:
-        """Use a lightweight LLM call to summarise messages."""
-        slim: list[dict[str, Any]] = []
-        for m in messages:
-            if m.get("role") not in ("user", "assistant"):
-                continue
-            content = m.get("content", "")
-            if isinstance(content, str) and len(content) > 2000:
-                content = content[:2000] + "..."
-            slim.append({**m, "content": content})
-
-        if not slim:
-            return "(empty context)"
-
-        summary_prompt = render_template("context/summary.md", max_words=200, strip=True)
-        slim.append({"role": "user", "content": summary_prompt})
-
-        import asyncio
-
-        try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop is not None:
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        asyncio.run,
-                        self.provider.chat_with_retry(
-                            messages=slim,
-                            tools=[],
-                            model=self.compress_model,
-                            max_tokens=300,
-                            temperature=0.0,
-                        ),
-                    )
-                    response = future.result(timeout=30)
-            else:
-                response = asyncio.run(
-                    self.provider.chat_with_retry(
-                        messages=slim,
-                        tools=[],
-                        model=self.compress_model,
-                        max_tokens=300,
-                        temperature=0.0,
-                    ),
-                )
-            return response.content or "(summarisation produced no output)"
-        except Exception:
-            raise
-
-    @staticmethod
-    def _idle_truncate_summary(messages: list[dict[str, Any]]) -> str:
-        if not messages:
-            return "(empty context)"
+    def _read_history_summaries(self, session_key: str) -> str:
+        """Read history.jsonl and format summaries for the system prompt."""
+        path = self._history_path(session_key)
+        if not path.exists():
+            return ""
 
         parts: list[str] = []
-        for msg in messages:
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    parts.append(f"Conversation started with: {content[:300]}")
-                    break
+        try:
+            for line in path.read_text(encoding="utf-8").strip().split("\n"):
+                if not line.strip():
+                    continue
+                record = _json.loads(line)
+                ts = record.get("timestamp", "")[:19]
+                summary = record.get("summary", "")
+                compressed = record.get("compressed_count", 0)
+                if summary:
+                    parts.append(
+                        f"## Historical Summary ({ts}, {compressed} messages)\n\n{summary}"
+                    )
+        except (_json.JSONDecodeError, OSError):
+            return ""
 
-        parts.append(f"(... {len(messages)} messages compressed ...)")
+        if not parts:
+            return ""
 
+        return (
+            "# Previous Conversation Summaries\n\n"
+            "The following summaries capture earlier parts of this conversation "
+            "that have been archived:\n\n" + "\n\n".join(parts)
+        )
+
+    # ========================================================================
+    # Compression helpers
+    # ========================================================================
+
+    @staticmethod
+    def _fit_in_budget(
+        messages: list[dict[str, Any]], budget_tokens: int,
+    ) -> int:
+        """Count how many messages from the end fit within *budget_tokens*."""
+        count = 0
+        tokens = 0
         for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    parts.append(f"Last response was: {content[:300]}")
-                    break
-
-        return "\n".join(parts)
-
-    # -- token-budget compression ---------------------------------------------
-
-    def _maybe_compress(
-        self,
-        messages: list[dict[str, Any]],
-        session_key: str,
-    ) -> list[dict[str, Any]]:
-        """Apply compression if *messages* exceed the token budget."""
-        if self.max_context_tokens <= 0:
-            return messages
-
-        budget = self.max_context_tokens
-        total = _estimate_message_tokens(messages)
-        if total <= budget:
-            return messages
-
-        logger.info(
-            "Context over budget ({} > {} tokens), compressing session {!r}",
-            total, budget, session_key,
-        )
-
-        system_msg = messages[0]
-        rest = messages[1:]
-        recent_budget = int(budget * _COMPRESS_RECENT_RATIO)
-
-        recent: list[dict[str, Any]] = []
-        recent_tokens = 0
-        for msg in reversed(rest):
             t = _estimate_message_tokens([msg])
-            if recent_tokens + t > recent_budget:
+            if tokens + t > budget_tokens:
                 break
-            recent.insert(0, msg)
-            recent_tokens += t
+            count += 1
+            tokens += t
+        # Ensure at least 1 message is kept
+        return max(count, 1)
 
-        older = rest[: len(rest) - len(recent)]
-        if not older:
-            return messages
+    @staticmethod
+    def _adjust_split(
+        to_compress: list[dict[str, Any]],
+        to_keep: list[dict[str, Any]],
+    ) -> None:
+        """Move messages from *to_compress* to *to_keep* to avoid splitting turns.
 
-        summary = self._summarise(older)
-        result: list[dict[str, Any]] = [system_msg]
-        result.append({
-            "role": "user",
-            "content": f"[Context summary of earlier conversation]\n\n{summary}",
-        })
-        result.extend(recent)
+        Adjusts so that *to_keep* starts on a clean boundary:
+        - "user" → safe (start of a new exchange)
+        - "assistant" with tool_calls → safe (tool results follow in to_keep)
+        - "assistant" without tool_calls → move preceding "user" into to_keep
+        - "tool" → move preceding "assistant" (with tool_calls) into to_keep
+        """
+        while to_compress and to_keep:
+            first_keep = to_keep[0]
+            role = first_keep.get("role", "")
 
-        logger.debug(
-            "Compressed {} older messages into {} tokens of summary, "
-            "keeping {} recent messages ({} tokens)",
-            len(older), _count_tokens(summary), len(recent), recent_tokens,
-        )
+            if role == "tool":
+                # Need the preceding assistant (with tool_calls)
+                prev = to_compress[-1]
+                if prev.get("role") == "assistant" and prev.get("tool_calls"):
+                    to_keep.insert(0, to_compress.pop())
+                else:
+                    break
+            elif role == "assistant" and not first_keep.get("tool_calls"):
+                # Need the preceding user message
+                prev = to_compress[-1]
+                if prev.get("role") == "user":
+                    to_keep.insert(0, to_compress.pop())
+                else:
+                    break
+            else:
+                # "user" or "assistant" with tool_calls → safe
+                break
 
-        return result
+    @staticmethod
+    def _dehydrate_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Strip non-critical payload before sending to the summarisation API.
 
-    def _summarise(self, messages: list[dict[str, Any]]) -> str:
-        """Summarise *messages* for token-budget compression."""
+        - Truncates content strings to ``_DEHYDRATE_MAX_CONTENT_CHARS``
+        - Replaces base64 data URIs with ``[binary: ...]`` placeholders
+        - Drops tool call arguments (keeps function names only)
+        """
+        dehydrated: list[dict[str, Any]] = []
+        for msg in messages:
+            d: dict[str, Any] = {}
+            for k, v in msg.items():
+                if k == "content" and isinstance(v, str):
+                    # Strip data URIs
+                    v = _DATA_URI_RE.sub("[binary data removed]", v)
+                    # Truncate oversized content
+                    if len(v) > _DEHYDRATE_MAX_CONTENT_CHARS:
+                        v = v[:_DEHYDRATE_MAX_CONTENT_CHARS] + (
+                            f"\n[... {len(v) - _DEHYDRATE_MAX_CONTENT_CHARS} "
+                            f"more chars truncated]"
+                        )
+                    d[k] = v
+                elif k == "tool_calls" and isinstance(v, list):
+                    # Keep only function names to prevent OOM from huge arguments
+                    slim_calls = []
+                    for tc in v:
+                        fn = tc.get("function", {})
+                        slim_calls.append({
+                            "id": tc.get("id", ""),
+                            "type": "function",
+                            "function": {"name": fn.get("name", "?"), "arguments": "{...}"},
+                        })
+                    d[k] = slim_calls
+                else:
+                    d[k] = v
+            dehydrated.append(d)
+        return dehydrated
+
+    # ========================================================================
+    # Summarisation (shared by compress → idle and budget paths)
+    # ========================================================================
+
+    async def _summarise(self, messages: list[dict[str, Any]]) -> str:
+        """Summarise *messages* via LLM, falling back to hard truncation."""
         if self.provider is None:
             return self._truncate_summary(messages)
         try:
-            return self._llm_summarise(messages)
+            return await self._llm_summarise(messages)
         except Exception:
             logger.opt(exception=True).warning(
                 "LLM summarisation failed, falling back to truncation"
             )
             return self._truncate_summary(messages)
 
-    def _truncate_summary(self, messages: list[dict[str, Any]]) -> str:
-        """Simple truncation-based summary."""
+    @staticmethod
+    def _truncate_summary(
+        messages: list[dict[str, Any]], *, max_chars: int = 2000,
+    ) -> str:
+        """Hard-truncation fallback: concatenate truncated messages.
+
+        Each message is capped at 150 chars; the total summary is capped at
+        *max_chars*.  This is a last-resort fallback when the LLM summarisation
+        API is unavailable.
+        """
         if not messages:
             return "(empty context)"
 
         parts: list[str] = []
+        total = 0
         for msg in messages:
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    parts.append(f"Conversation started with: {content[:300]}")
-                    break
-
-        parts.append(f"(... {len(messages)} messages compressed ...)")
-
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    parts.append(f"Last response was: {content[:300]}")
-                    break
-
-        return "\n".join(parts)
-
-    def _llm_summarise(self, messages: list[dict[str, Any]]) -> str:
-        """Use a lightweight LLM call to summarise older messages."""
-        import asyncio
-
-        slim: list[dict[str, Any]] = [
-            m for m in messages
-            if m.get("role") in ("user", "assistant")
-        ]
-        if not slim:
-            return "(empty context)"
-
-        for msg in slim:
-            content = msg.get("content", "")
-            if isinstance(content, str) and len(content) > 2000:
-                msg["content"] = content[:2000] + "..."
-
-        max_words = 200
-        summary_prompt = render_template("context/summary.md", max_words=max_words, strip=True)
-        slim.append({"role": "user", "content": summary_prompt})
-
-        try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop is not None:
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        asyncio.run,
-                        self.provider.chat_with_retry(
-                            messages=slim,
-                            tools=[],
-                            model=self.compress_model,
-                            max_tokens=300,
-                            temperature=0.0,
-                        ),
-                    )
-                    response = future.result(timeout=30)
-            else:
-                response = asyncio.run(
-                    self.provider.chat_with_retry(
-                        messages=slim,
-                        tools=[],
-                        model=self.compress_model,
-                        max_tokens=300,
-                        temperature=0.0,
-                    ),
-                )
-            return response.content or "(summarisation produced no output)"
-        except Exception:
-            raise
-
-    # -- session lifecycle ----------------------------------------------------
-
-    def save_session(
-        self,
-        session_key: str,
-        messages: list[dict[str, Any]],
-    ) -> None:
-        """Persist the full message list after an agent run."""
-        self.session.set_messages(session_key, messages)
-        self._record_to_memory(session_key, messages)
-
-    def get_history(self, session_key: str) -> list[dict[str, Any]]:
-        """Return session messages without the system prompt."""
-        messages = self.session.get_session_history(session_key)
-        return [m for m in messages if m.get("role") != "system"]
-
-    def delete_session(self, session_key: str) -> bool:
-        """Delete a session from disk and memory."""
-        return self.session.delete_session(session_key)
-
-    def list_sessions(self) -> list[dict[str, Any]]:
-        """List all saved sessions."""
-        return self.session.list_sessions()
-
-    # -- memory integration ---------------------------------------------------
-
-    def _record_to_memory(
-        self,
-        session_key: str,
-        messages: list[dict[str, Any]],
-    ) -> None:
-        """Record a summary of the latest exchange to long-term memory."""
-        last_user = ""
-        last_assistant = ""
-        for msg in reversed(messages):
-            role = msg.get("role", "")
+            role = msg.get("role", "?")
             content = msg.get("content", "")
             if isinstance(content, list):
                 content = " ".join(
                     p.get("text", "") for p in content if isinstance(p, dict)
                 )
-            if role == "assistant" and not last_assistant:
-                last_assistant = str(content)[:500]
-            elif role == "user" and not last_user:
-                last_user = str(content)[:500]
-            if last_user and last_assistant:
+            content = str(content)
+            # First/last message keep more detail; middle messages get shorter
+            is_edge = (msg is messages[0] or msg is messages[-1])
+            limit = 300 if is_edge else 150
+            if len(content) > limit:
+                content = content[:limit] + "..."
+            line = f"[{role}] {content}" if content.strip() else f"[{role}] (no content)"
+            if total + len(line) > max_chars:
+                parts.append(f"[+{len(messages) - len(parts)} more messages truncated]")
                 break
+            parts.append(line)
+            total += len(line)
 
-        if last_user:
-            entry = f"[{session_key}] User: {last_user}"
-            if last_assistant:
-                entry += f"\n[{session_key}] Assistant: {last_assistant}"
-            self.memory.record(entry)
+        return "\n".join(parts) if parts else "(empty context)"
 
-    # -- memory access --------------------------------------------------------
+    async def _llm_summarise(self, messages: list[dict[str, Any]]) -> str:
+        """Use a lightweight LLM call to summarise messages.
+
+        Messages should already be dehydrated before calling this method.
+        """
+        slim: list[dict[str, Any]] = [
+            {**m, "content": (
+                m.get("content", "")[:_CONTENT_TRUNCATE_LENGTH] + "..."
+                if isinstance(m.get("content", ""), str)
+                and len(m.get("content", "")) > _CONTENT_TRUNCATE_LENGTH
+                else m.get("content", "")
+            )}
+            for m in messages
+            if m.get("role") in ("user", "assistant")
+        ]
+
+        if not slim:
+            return "(empty context)"
+
+        summary_prompt = render_template(
+            "context/summary.md", max_words=_SUMMARY_MAX_WORDS, strip=True,
+        )
+        slim.append({"role": "user", "content": summary_prompt})
+
+        response = await self.provider.chat_with_retry(
+            messages=slim,
+            tools=[],
+            model=self.compress_model,
+            max_tokens=300,
+            temperature=0.0,
+        )
+        return response.content or "(summarisation produced no output)"
+
+    # ========================================================================
+    # Memory access (long-term user/feedback/project/reference)
+    # ========================================================================
 
     def remember(
         self,

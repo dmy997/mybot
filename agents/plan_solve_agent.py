@@ -49,8 +49,12 @@ class PlanSolveAgent(BaseAgent):
     async def _execute(
         self, spec: AgentInput, plan_output: AgentOutput
     ) -> AgentOutput:
-        exec_messages = list(plan_output.messages) + [self._user(_EXEC_PROMPT)]
-        exec_spec = self._with_spec(spec, init_messages=exec_messages)
+        plan_text = plan_output.content or ""
+        base = list(spec.init_messages)
+        # Embed plan as a system message so runner compaction never drops it
+        base.append({"role": "system", "content": f"[Plan]\n{plan_text}"})
+        base.append(self._user(_EXEC_PROMPT))
+        exec_spec = self._with_spec(spec, init_messages=base)
         return await self.core.run(exec_spec)
 
     # -- helpers ------------------------------------------------------------

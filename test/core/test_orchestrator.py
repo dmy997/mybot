@@ -140,7 +140,9 @@ class TestRunHappy:
         await orchestrator._process_once("s2", "query")
         history = orchestrator.context.get_history("s2")
         assert len(history) >= 1
-        assert history[0]["content"] == "hi"
+        # save_exchange saves the real user_input, then assistant responses
+        assert history[0]["content"] == "query"
+        assert history[-1]["content"] == "Hello!"
 
     @pytest.mark.asyncio
     async def test_two_turn_conversation(self, orchestrator, react_agent):
