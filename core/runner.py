@@ -13,7 +13,16 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from context.context_manager import _estimate_message_tokens
-from observability.metrics import REGISTRY
+from core.events import (
+    AgentCompleted,
+    AgentStarted,
+    AgentStallWarning,
+    AgentStepStarted,
+    LLMResponseReady,
+    ToolExecutionCompleted,
+    ToolExecutionStarted,
+    bus,
+)
 from observability.trace import tracer
 from providers.base import LLMProvider, LLMResponse
 from providers.errors import FatalLLMError, RecoverableLLMError, RetryableLLMError
@@ -37,6 +46,10 @@ class AgentInput:
     model: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
+    session_key: str = ""
+    """Session identifier used for event publishing."""
+    paradigm: str = ""
+    """Agent paradigm name (react, plan_solve)."""
     on_content_delta: Callable[[str], Awaitable[None]] | None = None
     """Async callback invoked for each content token during streaming."""
     on_thinking_delta: Callable[[str], Awaitable[None]] | None = None
@@ -135,6 +148,13 @@ class AgentCore:
             ctx = MiddlewareContext(messages=messages, step_count=step_count)
             await mw.run_agent_start(ctx)
 
+        await bus.publish(AgentStarted(
+            session_key=spec.session_key,
+            paradigm=spec.paradigm,
+            messages_count=len(messages),
+            tools_count=len(tool_defs or []),
+        ))
+
         try:
             for _ in range(self.max_iterations):
                 step_count += 1
@@ -143,13 +163,19 @@ class AgentCore:
                 if step_count > 1 and spec.on_new_turn:
                     await spec.on_new_turn()
 
+                await bus.publish(AgentStepStarted(
+                    session_key=spec.session_key, step_count=step_count,
+                ))
+
                 # Stall detection: warn when step count is abnormally high
                 if step_count == _STALL_WARNING_STEPS:
                     logger.warning(
                         "Agent reached {} steps — possible stall or infinite loop",
                         step_count,
                     )
-                    REGISTRY.agent_stall_warnings_total.inc()
+                    await bus.publish(AgentStallWarning(
+                        session_key=spec.session_key, step_count=step_count,
+                    ))
 
                 # Middleware: agent step
                 if mw:
@@ -168,6 +194,11 @@ class AgentCore:
                         )
                         if mw:
                             await mw.run_agent_end(ctx, output)
+                        await bus.publish(AgentCompleted(
+                            session_key=spec.session_key,
+                            paradigm=spec.paradigm, steps=step_count,
+                            stop_reason="middleware",
+                        ))
                         return output
 
                 # Compact context before LLM call (operates on a copy)
@@ -203,7 +234,6 @@ class AgentCore:
 
                 # --- error path ---
                 if response.finish_reason == "error":
-                    REGISTRY.agent_errors_total.inc()
                     output = AgentOutput(
                         messages=messages,
                         tools_used=tools_used,
@@ -215,6 +245,12 @@ class AgentCore:
                     )
                     if mw:
                         await mw.run_agent_end(ctx, output)
+                    await bus.publish(AgentCompleted(
+                        session_key=spec.session_key,
+                        paradigm=spec.paradigm, steps=step_count,
+                        total_latency_ms=0, stop_reason="error",
+                        error=output.error,
+                    ))
                     return output
 
                 # --- tool-call path ---
@@ -229,23 +265,29 @@ class AgentCore:
                     continue  # feed tool results back to LLM
 
                 # --- stop / final-content path ---
-                messages.append({"role": "assistant", "content": response.content or ""})
-                REGISTRY.agent_steps.observe(step_count)
+                final_content = response.content or response.reasoning_content or ""
+                messages.append({"role": "assistant", "content": final_content})
                 output = AgentOutput(
                     messages=messages,
                     tools_used=tools_used,
-                    content=response.content or "",
+                    content=final_content,
                     usage=total_usage,
                     stop_reason=response.finish_reason,
                     tool_events=tool_events,
                 )
                 if mw:
                     await mw.run_agent_end(ctx, output)
+                await bus.publish(AgentCompleted(
+                    session_key=spec.session_key,
+                    paradigm=spec.paradigm, steps=step_count,
+                    stop_reason=response.finish_reason,
+                ))
                 return output
 
             # --- exhausted iteration budget ---
-            REGISTRY.agent_steps.observe(step_count)
-            REGISTRY.agent_stall_warnings_total.inc()
+            await bus.publish(AgentStallWarning(
+                session_key=spec.session_key, step_count=step_count,
+            ))
             output = AgentOutput(
                 messages=messages,
                 tools_used=tools_used,
@@ -256,6 +298,11 @@ class AgentCore:
             )
             if mw:
                 await mw.run_agent_end(ctx, output)
+            await bus.publish(AgentCompleted(
+                session_key=spec.session_key,
+                paradigm=spec.paradigm, steps=step_count,
+                stop_reason="max_iterations",
+            ))
             return output
 
         except Exception:
@@ -522,19 +569,31 @@ class AgentCore:
                 tokens_out = usage.get("completion_tokens", 0)
                 tokens_total = usage.get("total_tokens", tokens_in + tokens_out)
 
-                REGISTRY.llm_calls_total.inc()
-                REGISTRY.llm_latency_ms.observe(latency_ms)
-                if tokens_total:
-                    REGISTRY.llm_tokens_total.inc(tokens_total)
-
-                if response.finish_reason == "error":
-                    REGISTRY.llm_calls_errors_total.inc()
+                await bus.publish(LLMResponseReady(
+                    session_key=spec.session_key,
+                    step_count=0,  # caller should set this via ctx if needed
+                    model=model,
+                    latency_ms=latency_ms,
+                    messages_count=len(messages),
+                    tools_count=len(tool_defs or []),
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    tokens_total=tokens_total,
+                    finish_reason=response.finish_reason,
+                ))
 
                 return response
 
             except RecoverableLLMError as exc:
-                REGISTRY.llm_calls_total.inc()
-                REGISTRY.llm_calls_errors_total.inc()
+                await bus.publish(LLMResponseReady(
+                    session_key=spec.session_key,
+                    model=model,
+                    latency_ms=(time.monotonic() - t_start) * 1000,
+                    messages_count=len(messages),
+                    tools_count=len(tool_defs or []),
+                    finish_reason="error",
+                    error=exc.info.message,
+                ))
                 # Apply recovery strategy (once only to avoid loops)
                 if recovery_attempt:
                     logger.warning(
@@ -545,20 +604,41 @@ class AgentCore:
                 return await self._recover_and_retry(spec, messages, tool_defs, exc.info)
 
             except RetryableLLMError as exc:
-                REGISTRY.llm_calls_total.inc()
-                REGISTRY.llm_calls_errors_total.inc()
                 logger.error("LLM call failed after all retries: {}", exc.info.message)
+                await bus.publish(LLMResponseReady(
+                    session_key=spec.session_key,
+                    model=model,
+                    latency_ms=(time.monotonic() - t_start) * 1000,
+                    messages_count=len(messages),
+                    tools_count=len(tool_defs or []),
+                    finish_reason="error",
+                    error=exc.info.message,
+                ))
                 return self._error_response(exc.info)
 
             except FatalLLMError as exc:
-                REGISTRY.llm_calls_total.inc()
-                REGISTRY.llm_calls_errors_total.inc()
                 logger.error("Fatal LLM error: {}", exc.info.message)
+                await bus.publish(LLMResponseReady(
+                    session_key=spec.session_key,
+                    model=model,
+                    latency_ms=(time.monotonic() - t_start) * 1000,
+                    messages_count=len(messages),
+                    tools_count=len(tool_defs or []),
+                    finish_reason="error",
+                    error=exc.info.message,
+                ))
                 return self._error_response(exc.info)
 
             except Exception:
-                REGISTRY.llm_calls_total.inc()
-                REGISTRY.llm_calls_errors_total.inc()
+                await bus.publish(LLMResponseReady(
+                    session_key=spec.session_key,
+                    model=model,
+                    latency_ms=(time.monotonic() - t_start) * 1000,
+                    messages_count=len(messages),
+                    tools_count=len(tool_defs or []),
+                    finish_reason="error",
+                    error="unexpected exception in LLM call",
+                ))
                 raise
 
     # -- recovery -------------------------------------------------------------
@@ -694,25 +774,30 @@ class AgentCore:
                 async def _tool_handler(c: MiddlewareContext) -> ToolResult:
                     with tracer.span("tool.execute", tool_name=c.tool_name):
                         result = await tools.execute(c.tool_name, c.tool_arguments)
-                        latency_ms = (time.monotonic() - t0) * 1000
-                        REGISTRY.tool_calls_total.inc()
-                        REGISTRY.tool_latency_ms.observe(latency_ms)
-                        if not result.success:
-                            REGISTRY.tool_calls_errors_total.inc()
                         c.tool_result = result
                         return result
 
                 result = await mw.run_tool_execute(ctx, _tool_handler)
                 latency_ms = (time.monotonic() - t0) * 1000
+                await bus.publish(ToolExecutionCompleted(
+                    session_key=spec.session_key,
+                    tool_name=tc.name,
+                    success=result.success,
+                    latency_ms=latency_ms,
+                    error=result.error,
+                ))
                 return result, latency_ms
 
             with tracer.span("tool.execute", tool_name=tc.name):
                 result = await tools.execute(tc.name, tc.arguments)
                 latency_ms = (time.monotonic() - t0) * 1000
-                REGISTRY.tool_calls_total.inc()
-                REGISTRY.tool_latency_ms.observe(latency_ms)
-                if not result.success:
-                    REGISTRY.tool_calls_errors_total.inc()
+                await bus.publish(ToolExecutionCompleted(
+                    session_key=spec.session_key,
+                    tool_name=tc.name,
+                    success=result.success,
+                    latency_ms=latency_ms,
+                    error=result.error,
+                ))
                 return result, latency_ms
 
         def _make_event(tc: Any, result: ToolResult, duration_ms: float) -> dict[str, Any]:
@@ -727,12 +812,19 @@ class AgentCore:
 
         # Execute parallel group concurrently
         if parallel_group:
-            # Fire start callbacks for all parallel tools
+            # Fire start callbacks + publish events for all parallel tools
             for idx, tc in parallel_group:
                 if spec.on_tool_execute_start:
                     await spec.on_tool_execute_start(
                         tc.name, tc.arguments or {}, idx + 1, total,
                     )
+                await bus.publish(ToolExecutionStarted(
+                    session_key=spec.session_key,
+                    tool_name=tc.name,
+                    arguments=tc.arguments or {},
+                    index=idx + 1,
+                    total=total,
+                ))
 
             tasks = [_exec_one(tc) for _, tc in parallel_group]
             raw_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -744,8 +836,13 @@ class AgentCore:
                         error=f"Tool raised: {raw}",
                     )
                     duration_ms = 0.0
-                    REGISTRY.tool_calls_total.inc()
-                    REGISTRY.tool_calls_errors_total.inc()
+                    await bus.publish(ToolExecutionCompleted(
+                        session_key=spec.session_key,
+                        tool_name=tc.name,
+                        success=False,
+                        latency_ms=0,
+                        error=str(raw),
+                    ))
                 else:
                     result, duration_ms = raw
                 tools_used.append(tc.name)
@@ -763,6 +860,13 @@ class AgentCore:
                 await spec.on_tool_execute_start(
                     tc.name, tc.arguments or {}, idx + 1, total,
                 )
+            await bus.publish(ToolExecutionStarted(
+                session_key=spec.session_key,
+                tool_name=tc.name,
+                arguments=tc.arguments or {},
+                index=idx + 1,
+                total=total,
+            ))
             result, duration_ms = await _exec_one(tc)
             tools_used.append(tc.name)
             ev = _make_event(tc, result, duration_ms)

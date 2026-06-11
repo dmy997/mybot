@@ -1,13 +1,9 @@
 """Observability: structured logging, tracing, metrics, and display."""
 
 from .display import (
-    clear_thinking_timer,
     console,
     print_error,
     print_plain,
-    print_stream_delta,
-    print_thinking_timer,
-    print_tool_call_start,
     render_content,
     show_banner,
     show_history,
@@ -60,10 +56,6 @@ __all__ = [
     "show_history",
     "show_sessions",
     "render_content",
-    "print_stream_delta",
-    "print_thinking_timer",
-    "clear_thinking_timer",
-    "print_tool_call_start",
     "print_plain",
     "print_error",
     "console",

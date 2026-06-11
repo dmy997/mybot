@@ -126,7 +126,7 @@ class TestInit:
 class TestRunHappy:
     @pytest.mark.asyncio
     async def test_full_lifecycle(self, orchestrator):
-        result = await orchestrator._process_once("s1", "hello")
+        result = await orchestrator.process_message("s1", "hello")
 
         assert result.content == "Hello!"
         assert result.session_key == "s1"
@@ -137,7 +137,7 @@ class TestRunHappy:
 
     @pytest.mark.asyncio
     async def test_persists_session(self, orchestrator):
-        await orchestrator._process_once("s2", "query")
+        await orchestrator.process_message("s2", "query")
         history = orchestrator.context.get_history("s2")
         assert len(history) >= 1
         # save_exchange saves the real user_input, then assistant responses
@@ -153,8 +153,8 @@ class TestRunHappy:
             return AgentOutput(messages=msgs, content=msgs[-1]["content"])
         react_agent.run = echo_run
 
-        await orchestrator._process_once("s3", "first")
-        await orchestrator._process_once("s3", "second")
+        await orchestrator.process_message("s3", "first")
+        await orchestrator.process_message("s3", "second")
 
         history = orchestrator.context.get_history("s3")
         contents = [m.get("content", "") for m in history if m.get("role") == "user"]
@@ -163,7 +163,7 @@ class TestRunHappy:
 
     @pytest.mark.asyncio
     async def test_passes_model_params(self, orchestrator, react_agent):
-        await orchestrator._process_once("s4", "query", model="gpt-5", temperature=0.5, max_tokens=1000)
+        await orchestrator.process_message("s4", "query", model="gpt-5", temperature=0.5, max_tokens=1000)
         spec: AgentInput = react_agent.run.call_args[0][0]
         assert spec.model == "gpt-5"
         assert spec.temperature == 0.5
@@ -171,14 +171,14 @@ class TestRunHappy:
 
     @pytest.mark.asyncio
     async def test_passes_goal(self, orchestrator, react_agent):
-        await orchestrator._process_once("s5", "query", goal="Be concise.")
+        await orchestrator.process_message("s5", "query", goal="Be concise.")
         spec: AgentInput = react_agent.run.call_args[0][0]
         assert spec.goal == "Be concise."
 
     @pytest.mark.asyncio
     async def test_empty_input_raises(self, orchestrator):
         with pytest.raises(ValueError, match="user_input"):
-            await orchestrator._process_once("s6", "   ")
+            await orchestrator.process_message("s6", "   ")
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ class TestRunKeyboardInterrupt:
         react_agent.run.side_effect = KeyboardInterrupt()
 
         with pytest.raises(KeyboardInterrupt):
-            await orchestrator._process_once("int1", "query")
+            await orchestrator.process_message("int1", "query")
 
         # Partial state should be saved
         session = orchestrator.context.session.get_session("int1")
@@ -211,7 +211,7 @@ class TestRunError:
     async def test_returns_error_result(self, orchestrator, react_agent):
         react_agent.run.side_effect = RuntimeError("Something went wrong")
 
-        result = await orchestrator._process_once("err1", "query")
+        result = await orchestrator.process_message("err1", "query")
 
         assert result.stop_reason == "error"
         assert "Something went wrong" in (result.error or "")
@@ -225,7 +225,7 @@ class TestRunError:
             side_effect=RuntimeError("session corrupted")
         )
 
-        result = await orchestrator._process_once("err3", "query")
+        result = await orchestrator.process_message("err3", "query")
         assert result.stop_reason == "error"
         assert result.paradigm == "unknown"
 
@@ -244,7 +244,7 @@ class TestSkillsLoader:
             return_value="**web-search**: Search the web."
         )
 
-        await orchestrator._process_once("sk1", "search for cats")
+        await orchestrator.process_message("sk1", "search for cats")
 
         spec: AgentInput = react_agent.run.call_args[0][0]
         system_msg = spec.init_messages[0]["content"]
@@ -253,7 +253,7 @@ class TestSkillsLoader:
     @pytest.mark.asyncio
     async def test_no_loader(self, orchestrator, react_agent):
         """Without a loader, no skills are injected."""
-        await orchestrator._process_once("sk2", "query")
+        await orchestrator.process_message("sk2", "query")
         spec: AgentInput = react_agent.run.call_args[0][0]
         system_msg = spec.init_messages[0]["content"]
         assert "Available Skills" not in system_msg
@@ -266,7 +266,7 @@ class TestSkillsLoader:
             return_value="**loaded-skill**: A loaded skill."
         )
 
-        await orchestrator._process_once("sk3", "query", skills=["explicit-skill"])
+        await orchestrator.process_message("sk3", "query", skills=["explicit-skill"])
 
         spec: AgentInput = react_agent.run.call_args[0][0]
         system_msg = spec.init_messages[0]["content"]
@@ -341,7 +341,7 @@ class TestTools:
                 return ToolResult(success=True, content="")
 
         orchestrator.register_tool(SearchTool())
-        await orchestrator._process_once("t1", "query")
+        await orchestrator.process_message("t1", "query")
 
         spec: AgentInput = react_agent.run.call_args[0][0]
         assert "search" in spec.tools

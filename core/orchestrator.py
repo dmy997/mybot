@@ -10,13 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
-
-try:
-    import readline  # noqa: F401 — enables arrow keys, backspace, history in input()
-except ImportError:
-    pass
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -26,19 +21,10 @@ if TYPE_CHECKING:
 from loguru import logger
 
 from context.context_manager import ContextManager
-from observability import AgentRunEvent, LogConfig, SessionEvent, emit, init_logging
-from observability.display import (
-    clear_thinking_timer,
-    console,
-    print_error,
-    print_stream_delta,
-    print_thinking_timer,
-    show_banner,
-    show_history,
-    show_llm_usage,
-    show_sessions,
-)
-from observability.metrics import REGISTRY
+from core.events import SessionCreated, SessionDeleted, bus
+from core.message_bus import InboundMessage, MessageBus, OutboundMessage
+from observability import LogConfig, init_logging
+from observability.subscribers import install as install_subscribers
 from observability.trace import tracer
 from tools import ToolRegistry
 from tools.tool import Tool
@@ -105,8 +91,9 @@ class Orchestrator:
         self._running = False
         self.workspace = Path(workspace).expanduser().resolve()
 
-        # Observability — configure loguru once
+        # Observability — configure loguru + event bus subscribers once
         init_logging(log_config)
+        install_subscribers(debug=(log_config is not None and log_config.level == "DEBUG"))
 
         # Context (idle compression is handled by ContextManager)
         self.ctx = ContextManager(
@@ -159,174 +146,6 @@ class Orchestrator:
 
     # -- helpers ---------------------------------------------------------------
 
-    @staticmethod
-    async def _ainput(prompt: str = "") -> str:
-        """Async wrapper around :func:`input` with readline line-editing.
-
-        Uses ``run_in_executor`` so the event loop is not blocked while
-        waiting for user input.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return input(prompt)
-        return await loop.run_in_executor(None, input, prompt)
-
-    async def _idle_watchdog(self, session_key: str) -> None:
-        """Background task that compresses idle sessions during input wait.
-
-        Sleeps for ``idle_compress_seconds`` then triggers compression of
-        older messages (keeping the 10 most recent).  Designed to run
-        concurrently with :meth:`_ainput` — cancelled when input arrives.
-        """
-        timeout = self.ctx.idle_compress_seconds
-        if timeout <= 0:
-            return
-
-        await asyncio.sleep(timeout)
-        await self.ctx.compress(session_key, keep_recent=10)
-
-    def _print_startup_banner(
-        self, session_key: str, model: str | None
-    ) -> None:
-        """Print session info and available commands on first entry."""
-        session = self.ctx.session.get_session(session_key)
-        show_banner(
-            session_key=session_key,
-            model=model or "(provider default)",
-            msg_count=len(session.messages),
-            agents=list(self._dispatcher.agents.keys()),
-        )
-
-    async def _handle_command(
-        self, cmd: str, session_key: str, model: str | None
-    ) -> bool:
-        """Handle a built-in slash command.  Returns True if handled."""
-        parts = cmd.split(maxsplit=1)
-        name = parts[0].lower()
-
-        if name == "/help":
-            self._print_startup_banner(session_key, model)
-            return True
-
-        if name == "/history":
-            await self._cmd_history(session_key)
-            return True
-
-        if name == "/clear":
-            console.clear()
-            return True
-
-        if name == "/sessions":
-            await self._cmd_sessions()
-            return True
-
-        return False
-
-    async def _cmd_history(self, session_key: str) -> None:
-        """Print a summary of the current session's conversation."""
-        session = self.ctx.session.get_session(session_key)
-        show_history(session_key, session.messages)
-
-    async def _cmd_sessions(self) -> None:
-        """List all saved sessions."""
-        show_sessions(self.sessions)
-
-    # -- interactive loop ------------------------------------------------------
-
-    async def run(
-        self,
-        session_key: str,
-        *,
-        model: str | None = None,
-        max_tokens: int | None = None,
-        temperature: float | None = None,
-        goal: str | None = None,
-        skills: list[str] | None = None,
-    ) -> None:
-        """Continuous interactive loop — reads stdin, processes, prints results.
-
-        Uses readline for line-editing (arrow keys, backspace, history).
-        When the idle time between messages exceeds ``idle_compress_seconds``,
-        older session messages are automatically compressed by
-        :class:`ContextManager`.
-
-        Type ``/exit`` or ``/quit`` (or send EOF/Ctrl+D) to stop the loop.
-        """
-        self._running = True
-        self._last_paradigm: str = "react"  # updated after each _process_once
-        session = self.ctx.session.get_session(session_key)
-        emit(SessionEvent(session_key=session_key, action="resumed",
-                          message_count=len(session.messages)))
-
-        # Startup banner
-        self._print_startup_banner(session_key, model)
-
-        try:
-            while self._running:
-                prompt = f"[{session_key}] {self._last_paradigm} › "
-
-                # Start idle watchdog — compresses session if user is idle too long
-                watchdog = asyncio.create_task(
-                    self._idle_watchdog(session_key)
-                )
-
-                # Read input with line-editing support
-                try:
-                    line = await self._ainput(prompt)
-                except EOFError:
-                    # Ctrl+D
-                    print()
-                    break
-                finally:
-                    watchdog.cancel()
-                    try:
-                        await watchdog
-                    except asyncio.CancelledError:
-                        pass
-
-                user_input = line.strip()
-                if not user_input:
-                    continue
-
-                # --- built-in commands ---
-                if user_input.lower() in ("/exit", "/quit"):
-                    break
-
-                if user_input.lower().startswith("/"):
-                    handled = await self._handle_command(
-                        user_input, session_key, model
-                    )
-                    if handled:
-                        continue
-                    # If not handled, pass through to agent (unknown command)
-
-                # Process the single message
-                result = await self._process_once(
-                    session_key,
-                    user_input,
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    goal=goal,
-                    skills=skills,
-                )
-
-                if result.error:
-                    print_error(f"[{result.paradigm}] {result.error}")
-                elif result.content:
-                    print()  # trailing newline after streamed content
-
-                # Track paradigm for prompt display
-                if result.paradigm and result.paradigm != "unknown":
-                    self._last_paradigm = result.paradigm
-
-        except KeyboardInterrupt:
-            print("\nInterrupted.")
-        finally:
-            self._running = False
-            logger.info("Orchestrator loop ended for session {!r}", session_key)
-
     # -- single-message processing --------------------------------------------
 
     async def process_message(
@@ -344,27 +163,26 @@ class Orchestrator:
         on_thinking_done: Callable[[], Awaitable[None]] | None = None,
         on_tool_start: Callable[[str], Awaitable[None]] | None = None,
         on_tool_end: Callable[[dict[str, str]], Awaitable[None]] | None = None,
+        on_tool_execute_start: (
+            Callable[[str, dict[str, Any], int, int], Awaitable[None]] | None
+        ) = None,
+        on_tool_execute_end: (
+            Callable[[dict[str, Any]], Awaitable[None]] | None
+        ) = None,
     ) -> OrchestratorResult:
         """Execute a single agent run for *user_input*.
 
         Lifecycle: resolve skills → build context → resolve paradigm
         → agent.run → save session → return result.
 
-        Callbacks are used for streaming output.  When omitted (CLI mode),
-        built-in rich display helpers are used automatically.
+        Callbacks are used for streaming output to external consumers
+        (HTTP/WS, CLI via MessageBus).  The caller is responsible for
+        rendering or forwarding output appropriately.
         """
         if not user_input.strip():
             raise ValueError("user_input must not be empty")
 
-        # Determine mode: if any callback is provided, use callback mode
-        _use_callbacks = any(
-            x is not None for x in (on_delta, on_thinking, on_thinking_done,
-                                     on_tool_start, on_tool_end)
-        )
-
         paradigm: str = "unknown"
-        steps = 0
-        t_start = time.monotonic()
 
         with tracer.trace(
             "orchestrator.process",
@@ -388,98 +206,26 @@ class Orchestrator:
                 with tracer.span("dispatcher.resolve"):
                     paradigm = await self._dispatcher.resolve(user_input)
 
-                # 4. Build streaming callbacks (CLI or callback mode)
-                _thinking_task: asyncio.Task[None] | None = None
+                # 4. Build streaming callbacks
+                _shown_tool_indices: set[int] = set()
 
-                def _stop_thinking() -> None:
-                    nonlocal _thinking_task
-                    if _thinking_task is not None:
-                        _thinking_task.cancel()
-                        _thinking_task = None
-                        clear_thinking_timer()
+                async def _on_delta(delta: str) -> None:
+                    if on_delta:
+                        await on_delta(delta)
 
-                # Tool-execution / new-turn callbacks (default: None)
-                _on_tool_end_cli: Callable[..., Awaitable[None]] | None = None
-                _on_new_turn_cli: Callable[..., Awaitable[None]] | None = None
+                async def _on_thinking_delta(token: str) -> None:
+                    if on_thinking:
+                        await on_thinking(token)
 
-                if _use_callbacks:
-                    # --- callback mode (HTTP/WS) ---
-                    _shown_tool_indices: set[int] = set()
-
-                    async def _on_delta(delta: str) -> None:
-                        _stop_thinking()
-                        if on_delta:
-                            await on_delta(delta)
-
-                    async def _on_thinking_delta(token: str) -> None:
-                        if on_thinking:
-                            await on_thinking(token)
-
-                    async def _on_tool_call_delta(tc: dict[str, Any]) -> None:
-                        idx = tc.get("index", 0)
-                        if idx in _shown_tool_indices:
-                            return
-                        _shown_tool_indices.add(idx)
-                        fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
-                        name = tc.get("name") or fn.get("name", "?")
-                        _stop_thinking()
-                        if on_tool_start:
-                            await on_tool_start(name)
-
-                    _content_cb = _on_delta
-                    _thinking_cb = _on_thinking_delta
-                    _tool_cb = _on_tool_call_delta
-                    # Callback mode: tool-end and new-turn handled via user-provided callbacks
-                    _on_tool_end_cli = None
-                    _on_new_turn_cli = None
-
-                else:
-                    # --- CLI mode (rich display) ---
-                    _stream_started = False
-
-                    async def _run_thinking_timer() -> None:
-                        start = time.monotonic()
-                        try:
-                            while True:
-                                elapsed = time.monotonic() - start
-                                print_thinking_timer(elapsed)
-                                await asyncio.sleep(0.1)
-                        except asyncio.CancelledError:
-                            pass
-
-                    async def _cli_on_delta(delta: str) -> None:
-                        nonlocal _stream_started
-                        _stop_thinking()
-                        if not _stream_started:
-                            print()
-                            _stream_started = True
-                        print_stream_delta(delta)
-
-                    # Stop timer when tool calls arrive (LLM is done "thinking").
-                    # Actual execution progress is shown via on_tool_execute_start/end.
-                    async def _cli_on_tool_call_delta(tc: dict[str, Any]) -> None:
-                        _stop_thinking()
-
-                    # Per-turn: stop old timer, reset stream state, start new timer
-                    # so each LLM response starts on its own line with a fresh timer.
-                    async def _cli_on_new_turn() -> None:
-                        nonlocal _stream_started, _thinking_task
-                        _stop_thinking()
-                        _stream_started = False
-                        _thinking_task = asyncio.create_task(_run_thinking_timer())
-                        print()
-
-                    # Tool execution progress — shown inline as tools complete.
-                    async def _cli_on_tool_execute_end(ev: dict[str, Any]) -> None:
-                        from observability.display import print_tool_progress_end
-                        print_tool_progress_end(ev)
-
-                    _thinking_task = asyncio.create_task(_run_thinking_timer())
-                    _content_cb = _cli_on_delta
-                    _thinking_cb = None
-                    _tool_cb = _cli_on_tool_call_delta
-                    _on_tool_end_cli = _cli_on_tool_execute_end
-                    _on_new_turn_cli = _cli_on_new_turn
+                async def _on_tool_call_delta(tc: dict[str, Any]) -> None:
+                    idx = tc.get("index", 0)
+                    if idx in _shown_tool_indices:
+                        return
+                    _shown_tool_indices.add(idx)
+                    fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                    name = tc.get("name") or fn.get("name", "?")
+                    if on_tool_start:
+                        await on_tool_start(name)
 
                 spec = AgentInput(
                     init_messages=messages,
@@ -488,18 +234,19 @@ class Orchestrator:
                     max_tokens=max_tokens,
                     temperature=temperature,
                     goal=goal,
-                    on_content_delta=_content_cb,
-                    on_thinking_delta=_thinking_cb,
-                    on_tool_call_delta=_tool_cb,
-                    on_tool_execute_end=_on_tool_end_cli,
-                    on_new_turn=_on_new_turn_cli,
+                    session_key=session_key,
+                    paradigm=paradigm,
+                    on_content_delta=_on_delta,
+                    on_thinking_delta=_on_thinking_delta,
+                    on_tool_call_delta=_on_tool_call_delta,
+                    on_tool_execute_start=on_tool_execute_start,
+                    on_tool_execute_end=on_tool_execute_end,
                 )
 
                 # 5. Run agent (interruptible)
                 try:
                     with tracer.span(f"agent.{paradigm}.run"):
                         output = await self._dispatcher.agents[paradigm].run(spec)
-                        steps = len(output.tool_events)
                 except asyncio.CancelledError:
                     logger.warning("Session {!r} cancelled by user", session_key)
                     partial = list(messages)
@@ -508,7 +255,6 @@ class Orchestrator:
                         "content": "[Session interrupted by user]",
                     })
                     self.ctx.session.set_messages(session_key, partial)
-                    REGISTRY.agent_errors_total.inc()
                     raise
                 except KeyboardInterrupt:
                     logger.warning("Session {!r} interrupted by user", session_key)
@@ -518,40 +264,18 @@ class Orchestrator:
                         "content": "[Session interrupted by user]",
                     })
                     self.ctx.session.set_messages(session_key, partial)
-                    REGISTRY.agent_errors_total.inc()
                     raise
-                finally:
-                    _stop_thinking()
 
-                # Notify thinking completed (callback mode)
-                if _use_callbacks and on_thinking_done:
+                if on_thinking_done:
                     await on_thinking_done()
 
-                # Report tool results (callback mode: per-event; CLI: already shown inline)
-                if _use_callbacks and on_tool_end:
+                if on_tool_end:
                     for ev in output.tool_events:
                         await on_tool_end(ev)
-
-                # Print token/latency summary (CLI only)
-                if not _use_callbacks:
-                    total_ms = (time.monotonic() - t_start) * 1000
-                    show_llm_usage(output.usage, total_ms, steps)
 
                 # 6. Save session — append only the new exchange
                 assistant_msgs = output.messages[len(messages):]
                 self.ctx.save_exchange(session_key, user_input, assistant_msgs)
-
-                # Record metrics & event
-                total_ms = (time.monotonic() - t_start) * 1000
-                REGISTRY.agent_steps.observe(steps)
-                emit(AgentRunEvent(
-                    session_key=session_key,
-                    paradigm=paradigm,
-                    steps=steps,
-                    total_latency_ms=round(total_ms, 3),
-                    stop_reason=output.stop_reason,
-                    error=output.error,
-                ))
 
                 return OrchestratorResult(
                     content=output.content,
@@ -570,7 +294,6 @@ class Orchestrator:
                 logger.opt(exception=True).error(
                     "Orchestrator.process_message() failed for {!r}", session_key
                 )
-                REGISTRY.agent_errors_total.inc()
                 return OrchestratorResult(
                     content="",
                     session_key=session_key,
@@ -580,8 +303,97 @@ class Orchestrator:
                     error=str(exc),
                 )
 
-    # Keep alias for internal use (run() method)
-    _process_once = process_message
+    # -- MessageBus-based serving ---------------------------------------------
+
+    async def serve(self, bus_msg: MessageBus, session_key: str) -> None:
+        """Continuously process inbound messages and write results to the outbound queue.
+
+        Reads one :class:`InboundMessage` at a time from
+        ``bus_msg.inbound(session_key)``, calls :meth:`process_message`, and
+        publishes streaming output as :class:`OutboundMessage` on
+        ``bus_msg.outbound``.
+
+        Each outbound message carries the *correlation_id* from the inbound
+        message that triggered it, so output consumers can filter by request.
+
+        Sentinels: a ``None`` on the inbound queue causes the loop to exit.
+        """
+        queue = bus_msg.inbound(session_key)
+        self._running = True
+
+        await bus.publish(SessionCreated(session_key=session_key))
+
+        try:
+            while self._running:
+                raw = await queue.get()
+                if raw is None:  # sentinel
+                    break
+
+                msg: InboundMessage = raw
+                cid = msg.correlation_id
+
+                async def _on_delta(token: str) -> None:
+                    await bus_msg.outbound.put(
+                        OutboundMessage(session_key, cid, "delta", token))
+
+                async def _on_thinking(token: str) -> None:
+                    await bus_msg.outbound.put(
+                        OutboundMessage(session_key, cid, "thinking", token))
+
+                async def _on_thinking_done() -> None:
+                    await bus_msg.outbound.put(
+                        OutboundMessage(session_key, cid, "thinking_done", None))
+
+                async def _on_tool_start(name: str) -> None:
+                    await bus_msg.outbound.put(
+                        OutboundMessage(session_key, cid, "tool_start", name))
+
+                async def _on_tool_end(ev: dict[str, str]) -> None:
+                    await bus_msg.outbound.put(
+                        OutboundMessage(session_key, cid, "tool_end", ev))
+
+                async def _on_tool_exec_start(
+                    name: str, args: dict[str, Any], idx: int, total: int,
+                ) -> None:
+                    await bus_msg.outbound.put(OutboundMessage(
+                        session_key, cid, "tool_exec_start",
+                        {"name": name, "args": args, "index": idx, "total": total}))
+
+                async def _on_tool_exec_end(ev: dict[str, Any]) -> None:
+                    await bus_msg.outbound.put(
+                        OutboundMessage(session_key, cid, "tool_exec_end", ev))
+
+                t_start = time.monotonic()
+                try:
+                    result = await self.process_message(
+                        session_key=session_key,
+                        user_input=msg.content,
+                        model=msg.model,
+                        goal=msg.goal,
+                        skills=msg.skills,
+                        on_delta=_on_delta,
+                        on_thinking=_on_thinking,
+                        on_thinking_done=_on_thinking_done,
+                        on_tool_start=_on_tool_start,
+                        on_tool_end=_on_tool_end,
+                        on_tool_execute_start=_on_tool_exec_start,
+                        on_tool_execute_end=_on_tool_exec_end,
+                    )
+                    await bus_msg.outbound.put(OutboundMessage(
+                        session_key, cid, "final",
+                        {"content": result.content, "usage": result.usage,
+                         "stop_reason": result.stop_reason,
+                         "paradigm": result.paradigm,
+                         "elapsed_ms": (time.monotonic() - t_start) * 1000},
+                    ))
+                except Exception as exc:
+                    logger.opt(exception=True).error(
+                        "serve() failed for session {!r}", session_key)
+                    await bus_msg.outbound.put(
+                        OutboundMessage(session_key, cid, "error", str(exc)))
+        finally:
+            self._running = False
+            logger.info("serve() ended for session {!r}", session_key)
 
     # -- delegation -----------------------------------------------------------
 
@@ -594,7 +406,11 @@ class Orchestrator:
         """Delete a session and its on-disk data."""
         ok = self.ctx.delete_session(key)
         if ok:
-            emit(SessionEvent(session_key=key, action="deleted"))
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(bus.publish(SessionDeleted(session_key=key)))
+            except RuntimeError:
+                pass  # no event loop (e.g. sync test), skip event
         return ok
 
     def remember(
@@ -646,9 +462,28 @@ class Orchestrator:
 
 def main() -> None:
     """CLI entry point for the interactive chat loop."""
+    import os
+    import select
     import sys
+    import uuid
+    from contextlib import suppress
+
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.patch_stdout import patch_stdout
 
     from config import Config
+    from core.message_bus import InboundMessage, MessageBus
+    from observability.display import (
+        console,
+        print_error,
+        show_banner,
+        show_history,
+        show_llm_usage,
+        show_sessions,
+    )
+    from observability.stream_renderer import StreamRenderer
     from providers.openai_compatible_provider import OpenAICompatibleProvider
 
     console_level = "DEBUG" if "--debug" in sys.argv else "WARNING"
@@ -667,7 +502,231 @@ def main() -> None:
         log_config=LogConfig(level=console_level),
     )
 
-    asyncio.run(orche.run("default"))
+    bus_msg = MessageBus()
+
+    # -- startup banner -------------------------------------------------------
+    session_key = "default"
+    session = orche.ctx.session.get_session(session_key)
+    model = Config.default_model
+    show_banner(
+        session_key=session_key,
+        model=model or "(provider default)",
+        msg_count=len(session.messages),
+        agents=list(orche.dispatcher.agents.keys()),
+    )
+
+    # -- prompt_toolkit session -----------------------------------------------
+    _prompt_session: PromptSession | None = None
+
+    def _init_prompt_session() -> None:
+        nonlocal _prompt_session
+        history_file = (
+            orche.workspace / ".cli_history"
+        )
+        history_file.parent.mkdir(parents=True, exist_ok=True)
+        _prompt_session = PromptSession(
+            history=FileHistory(str(history_file)),
+            enable_open_in_editor=False,
+            multiline=False,
+        )
+
+    def _flush_pending_tty_input() -> None:
+        """Drop unread keypresses typed while the agent was generating output."""
+        try:
+            fd = sys.stdin.fileno()
+            if not os.isatty(fd):
+                return
+        except Exception:
+            return
+        with suppress(Exception):
+            import termios
+            termios.tcflush(fd, termios.TCIFLUSH)
+            return
+        with suppress(Exception):
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0)
+                if not ready:
+                    break
+                if not os.read(fd, 4096):
+                    break
+
+    async def _read_input_async() -> str:
+        """Read user input using prompt_toolkit."""
+        if _prompt_session is None:
+            raise RuntimeError("Call _init_prompt_session() first")
+        try:
+            with patch_stdout():
+                return await _prompt_session.prompt_async(
+                    HTML("<b fg='ansiblue'>You:</b> "),
+                )
+        except EOFError:
+            raise KeyboardInterrupt from None
+
+    # -- synchronization ------------------------------------------------------
+    _last_paradigm: str = "react"
+    _processing_done = asyncio.Event()
+    _processing_done.set()
+
+    # -- CLI consumer ---------------------------------------------------------
+
+    async def _consume_outbound(renderer: StreamRenderer) -> None:
+        """Read outbound messages and route to StreamRenderer."""
+        while True:
+            raw = await bus_msg.outbound.get()
+            if raw is None:
+                break
+            out: OutboundMessage = raw
+
+            if out.msg_type == "thinking":
+                pass  # chain-of-thought reasoning, not for display
+
+            elif out.msg_type == "thinking_done":
+                pass
+
+            elif out.msg_type == "delta":
+                await renderer.on_delta(out.data)
+
+            elif out.msg_type == "tool_start":
+                with renderer.pause_spinner():
+                    renderer.ensure_header()
+                    renderer.console.print(
+                        f"  [dim cyan][tool:{out.data}][/dim cyan]",
+                        highlight=False,
+                    )
+
+            elif out.msg_type == "tool_exec_start":
+                d = out.data
+                with renderer.pause_spinner():
+                    renderer.ensure_header()
+                    from observability.display import print_tool_progress_start
+                    print_tool_progress_start(
+                        d["name"], d.get("args", {}),
+                        d.get("index", 1), d.get("total", 1),
+                    )
+
+            elif out.msg_type == "tool_exec_end":
+                with renderer.pause_spinner():
+                    renderer.ensure_header()
+                    from observability.display import print_tool_progress_end
+                    print_tool_progress_end(out.data)
+
+            elif out.msg_type == "tool_end":
+                pass  # already shown inline via tool_exec_start/end
+
+            elif out.msg_type == "final":
+                data = out.data or {}
+                content = data.get("content", "")
+                if renderer.streamed:
+                    await renderer.on_end()
+                else:
+                    # No streaming deltas — print content directly
+                    await renderer.close()
+                    if content:
+                        print()
+                        from observability.display import render_content
+                        render_content(content)
+                print()
+                show_llm_usage(data.get("usage", {}), data.get("elapsed_ms", 0), 0)
+                if data.get("paradigm"):
+                    _last_paradigm = data["paradigm"]
+                _processing_done.set()
+
+            elif out.msg_type == "error":
+                await renderer.close()
+                print()
+                print_error(out.data)
+                print()
+                _processing_done.set()
+
+    # -- interactive loop -----------------------------------------------------
+
+    async def _run() -> None:
+        nonlocal _prompt_session
+
+        _init_prompt_session()
+        serve_task = asyncio.create_task(orche.serve(bus_msg, session_key))
+
+        renderer: StreamRenderer | None = None
+        consumer_task: asyncio.Task[None] | None = None
+
+        try:
+            while True:
+                _flush_pending_tty_input()
+                if renderer:
+                    renderer.stop_for_input()
+
+                try:
+                    line = await _read_input_async()
+                except KeyboardInterrupt:
+                    print("\nInterrupted.")
+                    break
+
+                user_input = line.strip()
+                if not user_input:
+                    continue
+
+                if user_input.lower() in ("/exit", "/quit"):
+                    print("Goodbye!")
+                    break
+
+                if user_input.lower().startswith("/"):
+                    parts = user_input.split(maxsplit=1)
+                    cmd = parts[0].lower()
+                    if cmd == "/help":
+                        show_banner(
+                            session_key=session_key,
+                            model=model or "(provider default)",
+                            msg_count=len(orche.ctx.session.get_session(session_key).messages),
+                            agents=list(orche.dispatcher.agents.keys()),
+                        )
+                        continue
+                    if cmd == "/history":
+                        session = orche.ctx.session.get_session(session_key)
+                        show_history(session_key, session.messages)
+                        continue
+                    if cmd == "/clear":
+                        console.clear()
+                        continue
+                    if cmd == "/sessions":
+                        show_sessions(orche.sessions)
+                        continue
+
+                _processing_done.clear()
+                if consumer_task:
+                    consumer_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await consumer_task
+
+                renderer = StreamRenderer(bot_name="mybot")
+                consumer_task = asyncio.create_task(_consume_outbound(renderer))
+
+                await bus_msg.inbound(session_key).put(InboundMessage(
+                    session_key=session_key,
+                    content=user_input,
+                    source="cli",
+                    correlation_id=uuid.uuid4().hex,
+                ))
+
+                await _processing_done.wait()
+
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+        finally:
+            if consumer_task:
+                consumer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await consumer_task
+            if renderer:
+                await renderer.close()
+            await bus_msg.inbound(session_key).put(None)
+            serve_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await serve_task
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

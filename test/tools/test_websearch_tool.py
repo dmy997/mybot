@@ -8,7 +8,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tools.websearch_tool import (
+    DuckDuckGoProvider,
     GoogleSearchProvider,
+    SearchResult,
+    TavilySearchProvider,
     WebSearchTool,
     _DDGResultParser,
     _detect_providers,
@@ -102,6 +105,16 @@ class TestProviderDetection:
         providers = _detect_providers()
         assert "bing" in providers
 
+    def test_tavily_disabled_without_key(self, monkeypatch):
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        providers = _detect_providers()
+        assert "tavily" not in providers
+
+    def test_tavily_enabled_with_key(self, monkeypatch):
+        monkeypatch.setenv("TAVILY_API_KEY", "key")
+        providers = _detect_providers()
+        assert "tavily" in providers
+
 
 class TestWebSearchTool:
     def test_rejects_empty_query(self):
@@ -143,6 +156,94 @@ class TestWebSearchTool:
         tool = WebSearchTool()
         # max_results > 10 is clamped
         assert tool is not None  # tool creation is fine
+
+
+class TestMultiSource:
+    """Tests for source='all' multi-source search mode."""
+
+    @pytest.mark.asyncio
+    async def test_all_queries_multiple_providers(self, monkeypatch):
+        """source='all' should query all available providers."""
+        from tools.websearch_tool import DuckDuckGoProvider, TavilySearchProvider, WebSearchTool
+
+        # Use two providers that we can mock
+        monkeypatch.setenv("TAVILY_API_KEY", "fake-key")
+        tool = WebSearchTool()
+        assert "tavily" in tool._providers
+
+        # Mock both providers' search methods
+        ddg_results = [SearchResult("DDG Title", "https://a.com/ddg", "ddg snippet")]
+        tavily_results = [SearchResult("Tavily Title", "https://b.com/tavily", "tavily snippet")]
+
+        with (
+            patch.object(DuckDuckGoProvider, "search", AsyncMock(return_value=ddg_results)),
+            patch.object(TavilySearchProvider, "search", AsyncMock(return_value=tavily_results)),
+        ):
+            result = await tool.execute("test", source="all", max_results=5)
+            assert result.success is True
+            assert "Multi-source" in result.content
+            assert "[duckduckgo]" in result.content
+            assert "[tavily]" in result.content
+            assert "DDG Title" in result.content
+            assert "Tavily Title" in result.content
+
+    @pytest.mark.asyncio
+    async def test_all_deduplicates_by_url(self, monkeypatch):
+        """source='all' should deduplicate results by URL."""
+        from tools.websearch_tool import DuckDuckGoProvider, TavilySearchProvider, WebSearchTool
+
+        monkeypatch.setenv("TAVILY_API_KEY", "fake-key")
+        tool = WebSearchTool()
+
+        # Same URL appears in both providers
+        ddg_results = [SearchResult("Title A", "https://same.com/page", "snippet")]
+        tavily_results = [SearchResult("Title A (dup)", "https://same.com/page", "snippet")]
+
+        with (
+            patch.object(DuckDuckGoProvider, "search", AsyncMock(return_value=ddg_results)),
+            patch.object(TavilySearchProvider, "search", AsyncMock(return_value=tavily_results)),
+        ):
+            result = await tool.execute("test", source="all", max_results=5)
+            assert result.success is True
+            # Tavily is first in provider order, its result should be kept by dedup
+            assert "[tavily]" in result.content
+            # Only one result total (deduped)
+            assert "1 unique" in result.content or "unique shown" in result.content
+
+    @pytest.mark.asyncio
+    async def test_all_handles_provider_errors(self, monkeypatch):
+        """source='all' should continue when some providers fail."""
+        from tools.websearch_tool import DuckDuckGoProvider, TavilySearchProvider, WebSearchTool
+
+        monkeypatch.setenv("TAVILY_API_KEY", "fake-key")
+        tool = WebSearchTool()
+
+        # DDG fails, Tavily succeeds
+        ddg_results: list[SearchResult] = []
+        tavily_results = [SearchResult("Tavily Title", "https://t.com", "tavily snippet")]
+
+        with (
+            patch.object(DuckDuckGoProvider, "search", AsyncMock(side_effect=RuntimeError("down"))),
+            patch.object(TavilySearchProvider, "search", AsyncMock(return_value=tavily_results)),
+        ):
+            result = await tool.execute("test", source="all", max_results=5)
+            assert result.success is True
+            assert "[tavily]" in result.content
+            assert "Tavily Title" in result.content
+
+    @pytest.mark.asyncio
+    async def test_all_with_single_provider(self):
+        """source='all' with only one provider should still work."""
+        tool = WebSearchTool()
+        # DDG is the only provider when no API keys are set
+        assert len(tool._providers) == 1
+
+        # Actually, this test would hit real DDG, so let's mock
+        mock_results = [SearchResult("Only DDG", "https://ddg.com", "snippet")]
+        with patch.object(DuckDuckGoProvider, "search", AsyncMock(return_value=mock_results)):
+            result = await tool.execute("test", source="all", max_results=5)
+            assert result.success is True
+            assert "[duckduckgo]" in result.content
 
 
 class TestGoogleProvider:
@@ -233,6 +334,52 @@ class TestBingProvider:
             assert results == []
 
 
+class TestTavilyProvider:
+    @pytest.mark.asyncio
+    async def test_tavily_search_mocked(self):
+        from tools.websearch_tool import TavilySearchProvider
+
+        provider = TavilySearchProvider("fake-key")
+
+        mock_response = {
+            "results": [
+                {"title": "Tavily Result", "url": "https://t.com", "content": "Tavily snippet"},
+            ]
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = mock_response
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=AsyncMock(return_value=mock_resp))
+            )
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=None)
+            results = await provider.search("test")
+            assert len(results) == 1
+            assert results[0].title == "Tavily Result"
+            assert results[0].url == "https://t.com"
+            assert results[0].snippet == "Tavily snippet"
+
+    @pytest.mark.asyncio
+    async def test_tavily_search_error(self):
+        from tools.websearch_tool import TavilySearchProvider
+
+        provider = TavilySearchProvider("fake-key")
+
+        async def _raise(*args, **kwargs):
+            raise RuntimeError("Tavily down")
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=AsyncMock(side_effect=_raise))
+            )
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=None)
+            results = await provider.search("test")
+            assert results == []
+
+
 class TestDDGProvider:
     @pytest.mark.asyncio
     async def test_ddg_returns_results(self):
@@ -255,7 +402,7 @@ class TestDDGProvider:
 
         with patch("httpx.AsyncClient") as mock_client:
             mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(post=AsyncMock(side_effect=_raise))
+                return_value=MagicMock(get=AsyncMock(side_effect=_raise))
             )
             mock_client.return_value.__aexit__ = AsyncMock(return_value=None)
             results = await provider.search("test")

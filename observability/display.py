@@ -125,50 +125,6 @@ def render_content(content: str) -> None:
     console.print(Markdown(content))
 
 
-# ---------------------------------------------------------------------------
-# Streaming helpers
-# ---------------------------------------------------------------------------
-
-
-def print_stream_delta(delta: str) -> None:
-    """Print a single streaming token without a trailing newline."""
-    console.print(delta, end="")
-    console.file.flush() if console.file else None
-
-
-def print_thinking_timer(elapsed: float) -> None:
-    """Print or update the thinking indicator."""
-    console.file.write(f"\r  ⏳ 思考中 ({elapsed:.1f}s)  ")
-    console.file.flush()
-
-
-def clear_thinking_timer() -> None:
-    """Erase the thinking-timer line."""
-    console.file.write("\r" + " " * 40 + "\r")
-    console.file.flush()
-
-
-# ---------------------------------------------------------------------------
-# Tool call in-flight indicator
-# ---------------------------------------------------------------------------
-
-
-def print_tool_call_start(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
-    """Print a tool-call-in-progress indicator with key arguments."""
-    args_str = _summarize_args_display(arguments)
-    if args_str:
-        console.print(
-            f"  [dim cyan][tool:{tool_name}][/dim cyan] 执行中...  "
-            f"[dim]{args_str}[/dim]",
-            highlight=False,
-        )
-    else:
-        console.print(
-            f"  [dim cyan][tool:{tool_name}][/dim cyan] 执行中...",
-            highlight=False,
-        )
-
-
 def print_tool_progress_start(
     name: str, args: dict[str, Any] | None, index: int, total: int,
 ) -> None:
@@ -179,6 +135,7 @@ def print_tool_progress_start(
         f"[dim]{args_str}[/dim]",
         highlight=False,
     )
+    console.file.flush() if console.file else None
 
 
 def print_tool_progress_end(ev: dict[str, Any]) -> None:
@@ -195,6 +152,7 @@ def print_tool_progress_end(ev: dict[str, Any]) -> None:
         f"[dim]{args}[/dim]  [dim]{detail}[/dim]",
         highlight=False,
     )
+    console.file.flush() if console.file else None
 
 
 def _summarize_args_display(args: dict[str, Any] | None, max_chars: int = 80) -> str:

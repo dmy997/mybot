@@ -80,10 +80,14 @@ class MemoryRecallTool(Tool):
     _parallel = True
     capabilities = set()
     description = (
-        "Search long-term memories by keyword. "
+        "Search the persistent long-term memory store by keyword. "
         "Returns matching memory entries with their content. "
-        "Use this to recall past conversations, user preferences, project decisions, "
-        "or any previously saved information."
+        "IMPORTANT: Recent conversation history and system-level memories "
+        "(MEMORY.md, user preferences, project context) are already loaded "
+        "in the system prompt — do NOT call this to retrieve information "
+        "already visible in context. Only use this to search for memories "
+        "that were explicitly saved via memory_remember in past sessions "
+        "and may not be currently loaded."
     )
     parameters: dict[str, Any] = {
         "type": "object",

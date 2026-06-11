@@ -7,17 +7,18 @@ A multi-provider AI agent framework with plugin-style agents, streaming output, 
 ```
 mybot/
   config/           # Config — .env auto-loading, typed configuration
-  core/             # Orchestrator, Dispatcher, AgentCore, Middleware, SkillsLoader
+  core/             # Orchestrator, Dispatcher, AgentCore, Middleware, EventBus, MessageBus
   agents/           # Paradigm agents (ReAct, PlanSolve) — auto-discovered
   context/          # ContextManager — session persistence, compression, repair
   providers/        # LLMProvider abstraction + OpenAI-compatible implementation
   tools/            # 10 tools (bash, file R/W, grep, webfetch, websearch, memory, subagent)
   memory/           # Long-term memory (file-based, LLM-callable CRUD)
-  observability/    # Structured logging (loguru), metrics, tracing
+  observability/    # Logging (loguru), metrics, tracing, CLI streaming (Rich Live)
+  skills/           # 13 built-in skills (docx, pptx, pdf, canvas-design, etc.)
   utils/            # Jinja2 template rendering
   prompt_templates/ # 14 agent prompt templates
   server_web/       # Web chat UI
-  test/             # 612 tests
+  test/             # 676 tests
 ```
 
 ### Request Flow
@@ -32,14 +33,17 @@ HTTP/WS → Orchestrator → Dispatcher → Paradigm Agent → AgentCore → LLM
 
 ### Key Components
 
-- **Orchestrator** (`core/orchestrator.py`) — 顶层协调层，交互式 CLI + HTTP API 双模式，管理请求全生命周期
+- **Orchestrator** (`core/orchestrator.py`) — 顶层协调层，交互式 CLI (prompt_toolkit + Rich Live) + HTTP API，管理请求全生命周期
+- **MessageBus** (`core/message_bus.py`) — 双队列消息总线，解耦输入源（CLI/HTTP/WS）与输出消费者（流式渲染）
+- **EventBus** (`core/events.py`) — 异步发布/订阅事件总线，isinstance 匹配，Agent 生命周期/LLM/Tool 事件通知
 - **Server** (`core/server.py`) — Starlette HTTP API，SSE 流式 + WebSocket + Bearer 认证
 - **Web UI** (`server_web/index.html`) — 浏览器聊天界面，流式渲染、Markdown、会话管理
 - **Dispatcher** (`core/dispatcher.py`) — 四层路由：显式命令 → 关键词匹配 → LLM 分类 → 默认回退
-- **AgentCore** (`core/runner.py`) — 共享的 agent 执行循环，支持流式 + 非流式，工具调用，中间件拦截
+- **AgentCore** (`core/runner.py`) — 共享的 agent 执行循环，流式 + 非流式，工具并行/串行执行，上下文压缩，LLM 错误恢复
 - **Middleware** (`core/middleware.py`) — 可插拔的中间件链，拦截 LLM 调用、工具执行、agent 生命周期
 - **ContextManager** (`context/context_manager.py`) — 会话管理、空闲压缩、token 预算压缩、中断修复
 - **SkillsLoader** (`core/skills.py`) — 基于文件的 skill 发现（YAML 语法），自动注入系统 prompt
+- **StreamRenderer** (`observability/stream_renderer.py`) — Rich Live 流式渲染器，支持原地更新 Markdown + ThinkingSpinner
 - **Config** (`config/config.py`) — `.env` 自动加载，类型化配置
 
 ### Agent Paradigms
@@ -143,7 +147,7 @@ pytest test/core/test_middleware.py -v
 ## Requirements
 
 - Python 3.10+
-- Dependencies: `openai`, `loguru`, `json-repair`, `rich`, `httpx`, `jinja2`, `python-dotenv`, `pyyaml`
+- Dependencies: `openai`, `loguru`, `json-repair`, `rich`, `httpx`, `jinja2`, `python-dotenv`, `pyyaml`, `prompt_toolkit`
 - Optional (server): `starlette`, `uvicorn`
 
 ## Roadmap / TODO
@@ -163,9 +167,12 @@ pytest test/core/test_middleware.py -v
 
 ### P1 — Agent 系统核心能力缺口
 
-9. **MCP（Model Context Protocol）集成** — 作为 MCP client 连接外部工具服务器，接入业界标准的工具生态，大幅扩展可用工具集
-10. **内置 Skills** — `skills/` 目录为空，SkillsLoader 已是死代码。需要至少 2-3 个示例 skill 验证插件体系
-11. **EventBus / MessageBus** — `core/events.py` 空文件。事件总线让组件解耦通信（工具调用事件、agent 状态变更、会话生命周期），替代直接方法调用
+9. ~~**内置 Skills**~~ ✅ — 13 个内置 skill（docx, pptx, pdf, xlsx, canvas-design, frontend-design, algorithmic-art, brand-guidelines, internal-comms, mcp-builder, skill-creator, slack-gif-creator, theme-factory, web-artifacts-builder, webapp-testing）
+10. ~~**EventBus / MessageBus**~~ ✅ — `core/events.py` 异步发布/订阅事件总线，`core/message_bus.py` 双队列消息总线，解耦输入输出
+
+### P1 — Agent 系统核心能力缺口（续）
+
+11. **MCP（Model Context Protocol）集成** — 作为 MCP client 连接外部工具服务器，接入业界标准的工具生态
 
 ### P2 — 质量与可靠性
 

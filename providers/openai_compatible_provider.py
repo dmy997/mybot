@@ -362,7 +362,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 )
                 if content is not None:
                     return LLMResponse(
-                        content=content,
+                        content=content or reasoning_content,
                         reasoning_content=reasoning_content,
                         finish_reason=str(response_dict.get("finish_reason") or "stop"),
                         usage=self._extract_usage(response_dict),
@@ -398,7 +398,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 ))
 
             return LLMResponse(
-                content=content,
+                content=content or reasoning,
                 tool_calls=parsed_tool_calls,
                 finish_reason=finish_reason,
                 usage=usage,
@@ -444,7 +444,7 @@ class OpenAICompatibleProvider(LLMProvider):
             reasoning_content = msg.reasoning
 
         return LLMResponse(
-            content=content,
+            content=content or reasoning_content,
             tool_calls=tool_calls,
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
@@ -541,10 +541,17 @@ class OpenAICompatibleProvider(LLMProvider):
                 function_provider_specific_fields=acc["function_provider_specific_fields"],
             ))
 
+        content = "".join(content_parts)
+        reasoning = "".join(reasoning_parts) if reasoning_parts else None
+        # Some models (e.g. DeepSeek) emit the visible response through
+        # reasoning_content rather than content.  Merge so downstream consumers
+        # never receive an empty content when reasoning is present.
+        if not content and reasoning:
+            content = reasoning
         return LLMResponse(
-            content="".join(content_parts),
+            content=content,
             tool_calls=tool_calls,
-            reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
+            reasoning_content=reasoning,
             finish_reason=finish_reason,
             usage=usage,
         )

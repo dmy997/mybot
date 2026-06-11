@@ -1,7 +1,8 @@
 """WebSearch tool — multi-source web search with provider auto-detection.
 
 Supports DuckDuckGo (free, always available), Google Custom Search
-(needs GOOGLE_API_KEY + GOOGLE_CSE_ID), and Bing (needs BING_API_KEY).
+(needs GOOGLE_API_KEY + GOOGLE_CSE_ID), Bing (needs BING_API_KEY),
+and Tavily (needs TAVILY_API_KEY).
 Providers are detected at init time from environment variables.
 """
 
@@ -13,6 +14,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import quote, unquote
 
 import httpx
 from loguru import logger
@@ -93,7 +95,6 @@ class _DDGResultParser(HTMLParser):
         # DDG wraps URLs as //duckduckgo.com/l/?uddg=ENCODED_URL&rut=...
         m = re.search(r"uddg=([^&]+)", url)
         if m:
-            from urllib.parse import unquote
             return unquote(m.group(1))
         return url
 
@@ -122,18 +123,26 @@ class DuckDuckGoProvider(SearchProvider):
     name = "duckduckgo"
     _BASE = "https://html.duckduckgo.com/html/"
 
+    _HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://duckduckgo.com/",
+    }
+
     def __init__(self, timeout: int = DEFAULT_TIMEOUT) -> None:
         self._timeout = timeout
 
     async def search(self, query: str, max_results: int = MAX_RESULTS) -> list[SearchResult]:
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(
-                    self._BASE,
-                    data={"q": query, "b": ""},
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    follow_redirects=True,
-                )
+            async with httpx.AsyncClient(
+                timeout=self._timeout, headers=self._HEADERS, follow_redirects=True,
+            ) as client:
+                resp = await client.get(f"{self._BASE}?q={quote(query)}")
                 html = resp.text
         except Exception as exc:
             logger.warning("DuckDuckGo search failed: {}", exc)
@@ -222,6 +231,49 @@ class BingSearchProvider(SearchProvider):
         return results[:max_results]
 
 
+class TavilySearchProvider(SearchProvider):
+    """Tavily Search API.
+
+    Requires TAVILY_API_KEY environment variable.
+    """
+
+    name = "tavily"
+    _BASE = "https://api.tavily.com/search"
+
+    def __init__(self, api_key: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+        self._api_key = api_key
+        self._timeout = timeout
+
+    async def search(self, query: str, max_results: int = MAX_RESULTS) -> list[SearchResult]:
+        body = {
+            "api_key": self._api_key,
+            "query": query,
+            "max_results": max_results,
+            "search_depth": "basic",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    self._BASE,
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            logger.warning("Tavily search failed: {}", exc)
+            return []
+
+        results: list[SearchResult] = []
+        for item in data.get("results", []):
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                url=item.get("url", ""),
+                snippet=item.get("content", ""),
+            ))
+        return results[:max_results]
+
+
 # ---------------------------------------------------------------------------
 # Provider detection
 # ---------------------------------------------------------------------------
@@ -230,13 +282,16 @@ class BingSearchProvider(SearchProvider):
 def _detect_providers(timeout: int = DEFAULT_TIMEOUT) -> dict[str, SearchProvider]:
     """Build a dict of available search providers from environment config.
 
-    DuckDuckGo is always available (free, no key).  Google and Bing are
-    enabled only when their respective API keys are set.
+    Registration order determines priority: API-key providers come first,
+    DuckDuckGo is the last-resort fallback (free, but unreliable due to
+    bot-detection challenges).
     """
     providers: dict[str, SearchProvider] = {}
 
-    # DuckDuckGo — always available
-    providers["duckduckgo"] = DuckDuckGoProvider(timeout=timeout)
+    # Tavily — preferred (AI-optimized, reliable)
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    if tavily_key:
+        providers["tavily"] = TavilySearchProvider(tavily_key, timeout=timeout)
 
     # Google Custom Search
     google_key = os.getenv("GOOGLE_API_KEY", "")
@@ -249,6 +304,9 @@ def _detect_providers(timeout: int = DEFAULT_TIMEOUT) -> dict[str, SearchProvide
     if bing_key:
         providers["bing"] = BingSearchProvider(bing_key, timeout=timeout)
 
+    # DuckDuckGo — always available, last resort (unreliable bot detection)
+    providers["duckduckgo"] = DuckDuckGoProvider(timeout=timeout)
+
     return providers
 
 
@@ -260,8 +318,15 @@ def _detect_providers(timeout: int = DEFAULT_TIMEOUT) -> dict[str, SearchProvide
 class WebSearchTool(Tool):
     """Multi-source web search with automatic provider detection.
 
-    DuckDuckGo is always available (free).  Google and Bing are enabled
-    when their API keys are configured via environment variables.
+    DuckDuckGo is always available (free).  Google, Bing, and Tavily are
+    enabled when their respective API keys are configured via environment
+    variables.
+
+    Supports single-source (``source="auto"`` or named provider) and
+    multi-source (``source="all"``) modes.  Multi-source queries all
+    available providers in parallel, deduplicates by URL, and merges
+    results — useful for comprehensive research, fact-checking, or when
+    a single engine may miss relevant results.
     """
 
     name = "websearch"
@@ -283,9 +348,14 @@ class WebSearchTool(Tool):
             "source": {
                 "type": "string",
                 "description": (
-                    "Search provider to use.  Use 'auto' (default) for the first "
-                    "available provider, or specify a named source.  "
-                    "Available sources are listed in the tool description."
+                    "Search provider to use.  Options:\n"
+                    "- 'auto' (default): use the first available provider.\n"
+                    "- Provider name: 'duckduckgo', 'google', 'bing', 'tavily'.\n"
+                    "- 'all': query ALL available providers in parallel, "
+                    "deduplicate by URL, and merge results.  "
+                    "Use this for comprehensive research when a single engine "
+                    "may miss relevant results, or when you need to cross-check "
+                    "facts across multiple sources."
                 ),
             },
             "max_results": {
@@ -304,7 +374,8 @@ class WebSearchTool(Tool):
         self.description = (
             "Search the web and return results with titles, URLs, and snippets. "
             f"Available sources: {', '.join(sources)}. "
-            "Use 'auto' to pick the first available source."
+            "Use 'auto' to pick the first available source, "
+            "or 'all' to query every available source in parallel."
         )
 
     async def execute(
@@ -323,7 +394,13 @@ class WebSearchTool(Tool):
                 success=False, content="", error="No search providers available"
             )
 
-        # Resolve provider
+        max_results = max(1, min(max_results, MAX_RESULTS))
+
+        # ---- multi-source mode ----
+        if source == "all":
+            return await self._search_all(query, max_results)
+
+        # ---- single-source mode ----
         if source == "auto":
             provider = next(iter(self._providers.values()))
         elif source in self._providers:
@@ -333,10 +410,8 @@ class WebSearchTool(Tool):
             return ToolResult(
                 success=False,
                 content="",
-                error=f"Unknown source '{source}'. Available: {available}",
+                error=f"Unknown source '{source}'. Available: {available}, all",
             )
-
-        max_results = max(1, min(max_results, MAX_RESULTS))
 
         results = await provider.search(query, max_results=max_results)
 
@@ -349,6 +424,60 @@ class WebSearchTool(Tool):
         lines = [f"--- {len(results)} result(s) for '{query}' via {provider.name} ---"]
         for i, r in enumerate(results, 1):
             lines.append(f"{i}. {r.title}")
+            lines.append(f"   {r.url}")
+            if r.snippet:
+                lines.append(f"   {r.snippet}")
+            lines.append("")
+
+        return ToolResult(success=True, content="\n".join(lines))
+
+    async def _search_all(self, query: str, max_results: int) -> ToolResult:
+        """Query all available providers in parallel, deduplicate, and merge."""
+        import asyncio
+
+        tasks = {
+            name: provider.search(query, max_results=max_results)
+            for name, provider in self._providers.items()
+        }
+        gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        # Collect per-provider results, silently dropping errors
+        per_provider: dict[str, list[SearchResult]] = {}
+        for (name, _), raw in zip(tasks.items(), gathered):
+            if isinstance(raw, BaseException):
+                logger.warning("Provider {!r} failed in multi-source search: {}", name, raw)
+                continue
+            if raw:  # non-empty list
+                per_provider[name] = raw
+
+        if not per_provider:
+            return ToolResult(
+                success=True,
+                content=f"No results found for '{query}' across all providers.",
+            )
+
+        # Deduplicate by URL, keeping the first occurrence (higher-priority provider)
+        seen: set[str] = set()
+        deduped: list[tuple[SearchResult, str]] = []  # (result, provider_name)
+        for name, results in per_provider.items():
+            for r in results:
+                key = r.url.lower().rstrip("/")
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append((r, name))
+
+        total_before = sum(len(v) for v in per_provider.values())
+        deduped = deduped[:max_results]
+
+        provider_list = ", ".join(per_provider.keys())
+        lines = [
+            f"--- Multi-source search for '{query}' ---",
+            f"Providers: {provider_list}",
+            f"Total: {total_before} raw, {len(deduped)} unique shown (max {max_results})",
+            "",
+        ]
+        for i, (r, src) in enumerate(deduped, 1):
+            lines.append(f"{i}. [{src}] {r.title}")
             lines.append(f"   {r.url}")
             if r.snippet:
                 lines.append(f"   {r.snippet}")

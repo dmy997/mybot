@@ -4,74 +4,129 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-mybot is an early-stage multi-provider AI agent framework. It abstracts LLM backends behind a unified `LLMProvider` interface and is designed to support OpenAI-compatible APIs, OpenRouter, DeepSeek, and local models.
-
-The only working module currently is `providers/`. The `core/`, `agents/`, `context/`, `tools/`, and `skills/` packages are empty stubs — they scaffold the planned architecture but contain no logic yet.
+mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, and HTTP/WS API. Designed to work with any OpenAI-compatible API endpoint. 635 tests, all passing.
 
 ## Development Setup
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,server]"
+cp .env.example .env   # then fill in your keys
 ```
-
-Copy `.env` and fill in your keys. The provider module reads `OPENAI_API_KEY`, `OPENAI_API_BASE`, `LLM_MODEL_ID`, and `PROVIDER_NAME` from the environment at runtime (uses `python-dotenv`).
 
 ## Build & Test
 
 ```bash
-# Lint
-ruff check .
-
-# Run all tests
-pytest
-
-# Run a single test file
-pytest test/providers/test_openai_compatible_provider.py
-
-# Run a single test class or function
-pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices
-
-# Verbose output
-pytest -v
+ruff check .           # lint
+pytest                 # all 635 tests (pytest-asyncio, asyncio_mode = "auto")
+pytest test/core/test_middleware.py -v   # single file
+pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 ```
 
-Tests use `pytest-asyncio` (asyncio_mode = "auto" in pyproject.toml). All LLM calls are async, so tests should use `@pytest.mark.asyncio` or rely on the auto-mode.
+## Running
 
-## Package Structure
+```bash
+mybot                  # interactive CLI (core.orchestrator:main)
+mybot-server           # HTTP/WS server (core.server:main), then open http://127.0.0.1:8080
+```
 
-- `providers/` — **The active module.** LLM backend abstraction (`LLMProvider` base class) + `OpenAICompatibleProvider` implementation.
-- `core/` — Agent lifecycle, event system, runner, skill orchestration (all stubs)
-- `agents/` — Agent definitions (stub)
-- `context/` — Conversation memory/context management (stub)
-- `tools/` — Tool definitions for LLM function calling (stub)
-- `skills/` — Pluggable skills (stub)
-- `observability/` — Logging, tracing, monitoring (stub)
+## Package Layout (flat, no `mybot/` subdirectory)
 
-## Key Abstractions
+- `providers/` — LLM backend abstraction (`LLMProvider` base, `OpenAICompatibleProvider`, retry logic, error types, factory)
+- `core/` — Orchestrator, Dispatcher, AgentCore (runner), Agent base class, Middleware chain, SkillsLoader, HTTP/WS server
+- `agents/` — ReAct Agent (single-pass) + PlanSolve Agent (two-phase). Auto-discovered via `discover_agents()`
+- `context/` — ContextManager (system prompt assembly, compression, session repair) + SessionManager (JSON persistence)
+- `tools/` — 10 tools (bash, file R/W, grep, webfetch, websearch, memory CRUD, subagent), ToolRegistry, ToolGuard security
+- `memory/` — Long-term file-based memory (MemoryStore, MemoryManager, typed entries)
+- `observability/` — Structured logging (loguru), Prometheus-style metrics, span tracing, rich CLI display
+- `config/` — `.env` auto-loading, typed `Config` class
+- `utils/` — Jinja2 template rendering (`render_template()`)
+- `prompt_templates/` — 14 agent prompt templates (Jinja2 `.md`)
+- `skills/` — Empty (only `__init__.py`). SkillsLoader works but has no skill directories to load
+- `server_web/` — Single `index.html` for the browser chat UI
 
-**`LLMProvider`** (`providers/base.py`) — Abstract base. Subclasses must implement `async def chat(messages, tools, model, max_tokens, temperature) -> LLMResponse`. The base provides `safe_chat()` with automatic error wrapping, and a default `safe_chat_stream()` that falls back to `chat()` for providers that don't support true streaming.
+## Request Flow
 
-**`LLMResponse`** (`providers/base.py`) — Unified response dataclass: `content`, `tool_calls`, `usage`, `latency_s`, `reasoning_content` (for thinking models), `finish_reason`, `error`.
+```
+HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
+                                   ├─ repair interrupted session
+                                   ├─ assemble system prompt (base + memory + skills + tools + history summaries)
+                                   ├─ load session history (cursor-based, 100-msg cap)
+                                   └─ token-budget check → compress if needed
+                → Dispatcher.resolve()
+                    ├─ Layer 1: explicit commands (/react, /plan)
+                    ├─ Layer 2: keyword heuristics (multi-step → plan_solve)
+                    ├─ Layer 3: LLM classification (optional, cheap model)
+                    └─ Layer 4: default (react)
+                → Agent.run(AgentInput) → AgentCore.run()
+                    └─ loop: LLM call → tool calls (parallel + serial) → feed results back
+                → ContextManager.save_exchange() → persist to disk
+```
 
-**`ToolCallRequest`** (`providers/base.py`) — Parsed tool call with `id`, `name`, `arguments`, plus `extra_content`, `provider_specific_fields`, and `function_provider_specific_fields` for provider-specific metadata.
+## Key Abstractions & Patterns
 
-**`OpenAICompatibleProvider`** (`providers/openai_compatible_provider.py`) — The main provider implementation. Key behaviors:
+**`LLMProvider` → `OpenAICompatibleProvider`** (`providers/base.py`, `providers/openai_compatible_provider.py`):
+- Abstract base: `async chat(messages, tools, model, max_tokens, temperature) -> LLMResponse`
+- Also provides `safe_chat()`, `chat_with_retry()`, `chat_stream()` (true SSE with delta callbacks), `chat_stream_with_retry()`
+- Lazy `AsyncOpenAI` client init protected by async lock
+- OpenRouter auto-detection: sets referer/session-affinity headers when `name="openrouter"` or URL contains "openrouter"
 
-- **Two parsing paths**: `_parse()` handles complete responses (dict or Pydantic object), `_parse_chunks()` accumulates streaming chunks. Both handle malformed JSON via `json-repair`.
-- **Streaming**: `chat_stream()` uses true SSE streaming with delta callbacks (`on_content_delta`, `on_thinking_delta`, `on_tool_call_delta`). Always sets `stream_options: {"include_usage": True}` for token counting.
-- **OpenRouter auto-detection**: Sets `_default_headers` with `HTTP-Referer`, `X-OpenRouter-Title`, and `X-Session-Affinity` when `name="openrouter"` or the API base URL contains "openrouter".
-- **Temperature gating**: Skips temperature for reasoning models in `_NO_SUP_TEMP_MODELS` (gpt-5, o1, o3, o4).
-- **Token usage**: `_extract_usage()` probes three paths for cache-hit tokens: `prompt_tokens_details.cached_tokens`, `cached_tokens`, `prompt_cache_hit_tokens` — covering OpenAI, Anthropic, and OpenRouter conventions.
-- **Lazy client init**: `AsyncOpenAI` client is built on first `chat()`/`chat_stream()` call, protected by an async lock.
+**`AgentCore`** (`core/runner.py`): The shared execution loop used by ALL agent paradigms. Calls LLM in a loop, executes tool calls, feeds results back. Handles:
+- Parallel vs serial tool execution (`asyncio.gather` for parallel-safe tools)
+- Context compaction (7-step pipeline on copies: remove orphans → fill missing → summarize old → truncate long → token budget → repair)
+- LLM error recovery (context_length → compact & retry; content_filter → append compliance hint & retry)
+- Stall detection at 50+ steps
+- Middleware hooks at agent start/step/end, LLM call, tool execution
+
+**`BaseAgent`** (`core/agent_base.py`): ABC for paradigm agents. Each subclass implements `run(AgentInput) -> AgentOutput`. Paradigm agents only describe *what* messages to send — they never touch LLM APIs directly.
+
+**`AgentInput` / `AgentOutput`** (`core/runner.py`): The universal I/O contract. `AgentInput` carries messages + tools + streaming callbacks (`on_content_delta`, `on_thinking_delta`, `on_tool_call_delta`, `on_tool_execute_start/end`, `on_new_turn`). `AgentOutput` carries full message history so callers can continue the conversation.
+
+**Middleware** (`core/middleware.py`): Chain-of-responsibility pattern. `MiddlewareChain` nests `call_next` closures so middleware[n] wraps middleware[n+1]. Five hook points: `on_agent_start`, `on_agent_step` (can abort loop), `on_llm_call` (modify messages/model before, inspect response after), `on_tool_execute` (block/modify/cache results), `on_agent_end`. Shared mutable state via `MiddlewareContext.data`.
+
+**`Dispatcher`** (`core/dispatcher.py`): Four-layer routing (regex commands → keyword heuristics → optional LLM classification → default). The LLM classifier is instantiated internally when `provider` is given — uses a cheap model for <10 token responses.
+
+**`ContextManager`** (`context/context_manager.py`): Unified context assembly and compression. Key behaviors:
+- Compression is **non-destructive**: `session.messages` is never modified. Only `consolidated_cursor` advances and summaries are appended to `history.jsonl`
+- System prompt assembly: base prompt → memory context (SOUL.md, USER.md, long-term memories) → history summaries → skills → tools
+- Session repair on load: detects unmatched tool calls, missing assistant responses (3 interruption patterns)
+- Idle compression + token-budget compression share the same `compress()` method
+
+**`Tool` / `ToolRegistry` / `ToolGuard`** (`tools/`):
+- Every tool extends `Tool` ABC: set `name`, `description`, `parameters` (JSON Schema), `capabilities`, `_scopes`, `_parallel`
+- `ToolGuard` maps capabilities to security checks: SHELL → injection detection, NETWORK → SSRF check, FILE_READ/WRITE → sensitive path blocklist
+- Tools are auto-discovered by `discover_tools()`, scanning for `Tool` subclasses
+
+**Auto-discovery**: Both agents (`agents/discover_agents()`) and tools (`tools/discover_tools()`) use `pkgutil.iter_modules` + `inspect.getmembers` to find subclasses at import time. New agents/tools are picked up automatically.
 
 ## Code Conventions
 
 - Python 3.10+ with modern typing (`list[dict]`, `str | None`, `dict[str, Any]`)
-- Use `loguru` for logging (`from loguru import logger`)
-- Use `dataclasses` for data containers
-- Use `abc.ABC` / `@abstractmethod` for abstract interfaces
-- Async-first: all LLM calls are `async`
-- Provider implementations go in `providers/` and extend `LLMProvider`
-- Imports within the package use relative paths: `from .base import LLMProvider`
-- Use `json_repair.loads()` when parsing LLM-generated JSON (tool call arguments are frequently malformed)
-- Module-level constants are prefixed with `_` (e.g., `_ALNUM`, `_NO_SUP_TEMP_MODELS`, `_STANDARD_TC_KEYS`)
+- `loguru` for logging (`from loguru import logger`)
+- `dataclasses` for data containers; `abc.ABC` / `@abstractmethod` for interfaces
+- Async-first: all LLM calls and tool executions are `async`
+- Package imports use relative paths: `from .base import LLMProvider`
+- `json_repair.loads()` for parsing LLM-generated JSON (arguments frequently malformed)
+- Module-level constants prefixed with `_` (e.g., `_NO_SUP_TEMP_MODELS`, `_DEFAULT_MAX_ITERATIONS`)
+- Prompt templates in `prompt_templates/`, loaded via `utils.render_template(name, **vars)`
+- Templates ending in `.md` are rendered as Jinja2 with `strip=True`
+
+## Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OPENAI_API_KEY` | — | API key |
+| `OPENAI_API_BASE` | — | API base URL |
+| `PROVIDER_NAME` | `openrouter` | Provider identifier |
+| `LLM_MODEL_ID` | `deepseek/deepseek-v4-flash` | Default model |
+| `LIGHT_MODEL_NAME` | same as above | Cheap model for compression/classification |
+| `LLM_TIMEOUT` | `60` | Request timeout (seconds) |
+| `WORKSPACE` | `~/.mybot/workspace` | Sessions + memory storage |
+| `MYBOT_API_KEY` | — | Bearer auth for HTTP/WS (disabled when unset) |
+| `MYBOT_HOST` | `127.0.0.1` | Server bind address |
+| `MYBOT_PORT` | `8080` | Server port |
+
+## Known Gaps (from README.md roadmap)
+
+- **P1**: MCP integration, built-in skills (SkillsLoader is dead code without skill dirs), EventBus (`core/events.py` is 0 lines)
+- **P2**: Agent eval benchmarks, checkpoint/resume for long tasks, Memory Dream system
+- **P3**: Multimodal input, more providers (Anthropic direct, Ollama), external chat channels

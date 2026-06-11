@@ -14,6 +14,19 @@ from .store import MemoryStore
 from .types import MEMORY_TYPES, MemoryEntry
 
 
+_TEMPLATE_MARKERS = [
+    "Edit this file to customize",
+    "(your timezone",
+    "(your role",
+    "(preferred language",
+]
+
+
+def _is_template(content: str) -> bool:
+    """Return True if *content* looks like an unfilled user-profile template."""
+    return any(marker.lower() in content.lower() for marker in _TEMPLATE_MARKERS)
+
+
 class MemoryManager:
     """High-level memory API for the agent.
 
@@ -139,9 +152,9 @@ class MemoryManager:
         if soul.strip():
             parts.append(f"# Identity (SOUL.md)\n\n{soul}")
 
-        # User profile
+        # User profile — skip if it looks like an unfilled template
         user = self.store.read_user()
-        if user.strip():
+        if user.strip() and not _is_template(user):
             parts.append(f"# User Profile (USER.md)\n\n{user}")
 
         # Memory index + full content of each memory
