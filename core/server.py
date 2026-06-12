@@ -4,6 +4,9 @@ Provides a lightweight HTTP/WS frontend for the Orchestrator.  Start with::
 
     python -m core.server --port 8080
 
+Requests flow through the MessageBus for decoupled I/O:
+  client → InboundMessage → Orchestrator.serve() → OutboundMessage → client
+
 Environment variables
 ---------------------
 ``MYBOT_API_KEY``
@@ -20,12 +23,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from .orchestrator import Orchestrator, OrchestratorResult
+from .message_bus import InboundMessage, MessageBus
+from .orchestrator import Orchestrator
 
 # ---------------------------------------------------------------------------
 # SSE helpers
@@ -76,8 +81,18 @@ def _ws_check_auth(headers: list) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def create_app(orchestrator: Orchestrator) -> Any:
-    """Build the Starlette application.  Requires ``starlette`` to be installed."""
+def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) -> Any:
+    """Build the Starlette application.  Requires ``starlette`` to be installed.
+
+    Parameters
+    ----------
+    orchestrator:
+        The top-level Orchestrator instance.
+    bus_msg:
+        Optional MessageBus for decoupled I/O.  When provided, requests flow
+        through the bus instead of calling ``process_message`` directly.
+        A default bus is created if omitted.
+    """
     try:
         from starlette.applications import Starlette  # noqa: F811
         from starlette.requests import Request
@@ -89,6 +104,19 @@ def create_app(orchestrator: Orchestrator) -> Any:
             "starlette is required for the HTTP API.  Install with: "
             "pip install starlette"
         ) from None
+
+    if bus_msg is None:
+        bus_msg = MessageBus()
+
+    # Per-session serve tasks (lazy-started on first request)
+    _serve_tasks: dict[str, asyncio.Task[None]] = {}
+
+    async def _ensure_serve_task(session_key: str) -> None:
+        """Start a serve() background task for *session_key* if not already running."""
+        if session_key not in _serve_tasks or _serve_tasks[session_key].done():
+            _serve_tasks[session_key] = asyncio.create_task(
+                orchestrator.serve(bus_msg, session_key)
+            )
 
     # ------------------------------------------------------------------
     # HTTP endpoints
@@ -113,75 +141,60 @@ def create_app(orchestrator: Orchestrator) -> Any:
 
         model = body.get("model")
         temperature = body.get("temperature")
+        cid = uuid.uuid4().hex
 
         async def event_stream():
-            queue: asyncio.Queue[tuple[str, Any] | None] = asyncio.Queue()
+            await _ensure_serve_task(session_id)
 
-            async def _emit(event: str, data: Any = None) -> None:
-                await queue.put((event, data))
-
-            async def on_delta(token: str) -> None:
-                await _emit("delta", {"token": token})
-
-            async def on_thinking(token: str) -> None:
-                await _emit("thinking", {"token": token})
-
-            async def on_thinking_done() -> None:
-                await _emit("thinking_done", {})
-
-            async def on_tool_start(name: str) -> None:
-                await _emit("tool_start", {"name": name})
-
-            async def on_tool_end(ev: dict[str, str]) -> None:
-                await _emit("tool_end", ev)
-
-            async def _run() -> OrchestratorResult:
-                try:
-                    return await orchestrator.process_message(
-                        session_id, message,
-                        model=model,
-                        temperature=temperature,
-                        on_delta=on_delta,
-                        on_thinking=on_thinking,
-                        on_thinking_done=on_thinking_done,
-                        on_tool_start=on_tool_start,
-                        on_tool_end=on_tool_end,
-                    )
-                finally:
-                    await queue.put(None)
-
-            task = asyncio.create_task(_run())
+            await bus_msg.inbound(session_id).put(InboundMessage(
+                session_key=session_id,
+                content=message,
+                source="http",
+                correlation_id=cid,
+                model=model,
+                temperature=temperature,
+            ))
 
             try:
                 while True:
-                    item = await queue.get()
-                    if item is None:
+                    out = await bus_msg.outbound.get()
+                    if out is None:
                         break
-                    event, data = item
-                    yield _sse_event(event, data)
-            except asyncio.CancelledError:
-                task.cancel()
-                raise
-            finally:
-                # Drain remaining events and send final result
-                try:
-                    result = await task
-                except asyncio.CancelledError:
-                    yield _sse_event("error", {"message": "Request cancelled"})
-                    return
-                except Exception as exc:
-                    yield _sse_event("error", {"message": str(exc)})
-                    return
+                    if out.correlation_id != cid:
+                        continue  # not for this request
 
-                if result.error:
-                    yield _sse_event("error", {"message": result.error})
-                else:
-                    yield _sse_event("done", {
-                        "content": result.content,
-                        "stop_reason": result.stop_reason,
-                        "paradigm": result.paradigm,
-                        "usage": result.usage,
-                    })
+                    if out.msg_type == "delta":
+                        yield _sse_event("delta", {"token": out.data})
+                    elif out.msg_type == "thinking":
+                        yield _sse_event("thinking", {"token": out.data})
+                    elif out.msg_type == "thinking_done":
+                        yield _sse_event("thinking_done", {})
+                    elif out.msg_type == "tool_start":
+                        yield _sse_event("tool_start", {"name": out.data})
+                    elif out.msg_type == "tool_end":
+                        yield _sse_event("tool_end", out.data)
+                    elif out.msg_type == "tool_exec_start":
+                        yield _sse_event("tool_exec_start", out.data)
+                    elif out.msg_type == "tool_exec_end":
+                        yield _sse_event("tool_exec_end", out.data)
+                    elif out.msg_type == "final":
+                        data = out.data or {}
+                        content = data.get("content", "")
+                        if data.get("error"):
+                            yield _sse_event("error", {"message": data["error"]})
+                        else:
+                            yield _sse_event("done", {
+                                "content": content,
+                                "stop_reason": data.get("stop_reason", "completed"),
+                                "paradigm": data.get("paradigm", "unknown"),
+                                "usage": data.get("usage", {}),
+                            })
+                        break  # final — end stream
+                    elif out.msg_type == "error":
+                        yield _sse_event("error", {"message": out.data})
+                        break
+            except asyncio.CancelledError:
+                raise
 
         return StreamingResponse(
             event_stream(),
@@ -239,43 +252,58 @@ def create_app(orchestrator: Orchestrator) -> Any:
                 msg.update(data)
             await websocket.send_json(msg)
 
-        async def on_delta(token: str) -> None:
-            await _send("delta", {"token": token})
-
-        async def on_thinking(token: str) -> None:
-            await _send("thinking", {"token": token})
-
-        async def on_thinking_done() -> None:
-            await _send("thinking_done", {})
-
-        async def on_tool_start(name: str) -> None:
-            await _send("tool_start", {"name": name})
-
-        async def on_tool_end(ev: dict[str, str]) -> None:
-            await _send("tool_end", ev)
-
         async def _run(message: str, model: str | None, temperature: float | None) -> None:
             nonlocal _current_task
+            cid = uuid.uuid4().hex
             try:
-                result = await orchestrator.process_message(
-                    session_id, message,
+                await _ensure_serve_task(session_id)
+
+                await bus_msg.inbound(session_id).put(InboundMessage(
+                    session_key=session_id,
+                    content=message,
+                    source="websocket",
+                    correlation_id=cid,
                     model=model,
                     temperature=temperature,
-                    on_delta=on_delta,
-                    on_thinking=on_thinking,
-                    on_thinking_done=on_thinking_done,
-                    on_tool_start=on_tool_start,
-                    on_tool_end=on_tool_end,
-                )
-                if result.error:
-                    await _send("error", {"message": result.error})
-                else:
-                    await _send("done", {
-                        "content": result.content,
-                        "stop_reason": result.stop_reason,
-                        "paradigm": result.paradigm,
-                        "usage": result.usage,
-                    })
+                ))
+
+                while True:
+                    out = await bus_msg.outbound.get()
+                    if out is None:
+                        break
+                    if out.correlation_id != cid:
+                        continue
+
+                    if out.msg_type == "delta":
+                        await _send("delta", {"token": out.data})
+                    elif out.msg_type == "thinking":
+                        await _send("thinking", {"token": out.data})
+                    elif out.msg_type == "thinking_done":
+                        await _send("thinking_done", {})
+                    elif out.msg_type == "tool_start":
+                        await _send("tool_start", {"name": out.data})
+                    elif out.msg_type == "tool_end":
+                        await _send("tool_end", out.data)
+                    elif out.msg_type == "tool_exec_start":
+                        await _send("tool_exec_start", out.data)
+                    elif out.msg_type == "tool_exec_end":
+                        await _send("tool_exec_end", out.data)
+                    elif out.msg_type == "final":
+                        data = out.data or {}
+                        content = data.get("content", "")
+                        if data.get("error"):
+                            await _send("error", {"message": data["error"]})
+                        else:
+                            await _send("done", {
+                                "content": content,
+                                "stop_reason": data.get("stop_reason", "completed"),
+                                "paradigm": data.get("paradigm", "unknown"),
+                                "usage": data.get("usage", {}),
+                            })
+                        break
+                    elif out.msg_type == "error":
+                        await _send("error", {"message": out.data})
+                        break
             except asyncio.CancelledError:
                 await _send("error", {"message": "Request cancelled"})
 

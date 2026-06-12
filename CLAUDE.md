@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, and HTTP/WS API. Designed to work with any OpenAI-compatible API endpoint. 635 tests, all passing.
+mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, and HTTP/WS API. Designed to work with any OpenAI-compatible API endpoint. 678 tests, all passing.
 
 ## Development Setup
 
@@ -17,7 +17,7 @@ cp .env.example .env   # then fill in your keys
 
 ```bash
 ruff check .           # lint
-pytest                 # all 635 tests (pytest-asyncio, asyncio_mode = "auto")
+pytest                 # all 678 tests (pytest-asyncio, asyncio_mode = "auto")
 pytest test/core/test_middleware.py -v   # single file
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 ```
@@ -127,6 +127,7 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 
 ## Known Gaps (from README.md roadmap)
 
-- **P1**: MCP integration, built-in skills (SkillsLoader is dead code without skill dirs), EventBus (`core/events.py` is 0 lines)
+- **P1**: MCP integration
 - **P2**: Agent eval benchmarks, checkpoint/resume for long tasks, Memory Dream system
 - **P3**: Multimodal input, more providers (Anthropic direct, Ollama), external chat channels
+- See `README.md` Roadmap for the full prioritized list with status markers

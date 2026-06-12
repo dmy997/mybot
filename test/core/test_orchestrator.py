@@ -252,11 +252,12 @@ class TestSkillsLoader:
 
     @pytest.mark.asyncio
     async def test_no_loader(self, orchestrator, react_agent):
-        """Without a loader, no skills are injected."""
+        """Builtin skills are auto-discovered and injected."""
         await orchestrator.process_message("sk2", "query")
         spec: AgentInput = react_agent.run.call_args[0][0]
         system_msg = spec.init_messages[0]["content"]
-        assert "Available Skills" not in system_msg
+        # Skills directory is populated → skills section is present
+        assert "Available Skills" in system_msg
 
     @pytest.mark.asyncio
     async def test_explicit_skills_merged(self, orchestrator, react_agent):

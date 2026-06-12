@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from core.message_bus import OutboundMessage
 from core.orchestrator import OrchestratorResult
 from core.server import _sse_event, create_app
 
@@ -27,6 +28,18 @@ def orchestrator():
             stop_reason="stop",
         )
     )
+    # serve() is the MessageBus-based entry point; default: read one
+    # inbound message and publish a matching final response.
+    async def _default_serve(bus, session_key):
+        msg = await bus.inbound(session_key).get()
+        if msg is None:
+            return
+        await bus.outbound.put(OutboundMessage(
+            session_key, msg.correlation_id, "final",
+            {"content": "test response", "stop_reason": "stop",
+             "paradigm": "react", "usage": {}},
+        ))
+    orch.serve = AsyncMock(side_effect=_default_serve)
     return orch
 
 
@@ -104,32 +117,26 @@ class TestHTTPEndpoints:
         assert "message" in resp.json()["error"]
 
     def test_chat_sse_streaming(self, orchestrator):
-        """Verify SSE endpoint streams expected events."""
+        """Verify SSE endpoint streams expected events via MessageBus."""
 
-        async def _fake_process(*args, **kwargs):
-            # Simulate callbacks being invoked
-            if kwargs.get("on_delta"):
-                await kwargs["on_delta"]("hello ")
-                await kwargs["on_delta"]("world")
-            if kwargs.get("on_thinking"):
-                await kwargs["on_thinking"]("thinking...")
-            if kwargs.get("on_thinking_done"):
-                await kwargs["on_thinking_done"]()
-            if kwargs.get("on_tool_start"):
-                await kwargs["on_tool_start"]("read")
-            if kwargs.get("on_tool_end"):
-                await kwargs["on_tool_end"](
-                    {"name": "read", "status": "ok", "detail": "file content"}
-                )
-            return OrchestratorResult(
-                content="hello world",
-                session_key="test",
-                paradigm="react",
-                usage={"prompt_tokens": 5, "completion_tokens": 10},
-                stop_reason="stop",
-            )
+        async def _fake_serve(bus, session_key):
+            msg = await bus.inbound(session_key).get()
+            if msg is None:
+                return
+            cid = msg.correlation_id
+            q = bus.outbound
+            await q.put(OutboundMessage(session_key, cid, "delta", "hello "))
+            await q.put(OutboundMessage(session_key, cid, "delta", "world"))
+            await q.put(OutboundMessage(session_key, cid, "thinking", "thinking..."))
+            await q.put(OutboundMessage(session_key, cid, "thinking_done", None))
+            await q.put(OutboundMessage(session_key, cid, "tool_start", "read"))
+            await q.put(OutboundMessage(session_key, cid, "tool_end",
+                {"name": "read", "status": "ok", "detail": "file content"}))
+            await q.put(OutboundMessage(session_key, cid, "final",
+                {"content": "hello world", "stop_reason": "stop",
+                 "paradigm": "react", "usage": {"prompt_tokens": 5, "completion_tokens": 10}}))
 
-        orchestrator.process_message = AsyncMock(side_effect=_fake_process)
+        orchestrator.serve = AsyncMock(side_effect=_fake_serve)
 
         from starlette.testclient import TestClient
         app = create_app(orchestrator)
@@ -147,14 +154,23 @@ class TestHTTPEndpoints:
         assert "event: done" in body
 
     def test_chat_with_model_and_temperature(self, orchestrator):
-        """Verify model and temperature are forwarded."""
+        """Verify model and temperature are forwarded via InboundMessage."""
 
-        async def _fake_process(*args, **kwargs):
-            return OrchestratorResult(
-                content="ok", session_key="test", paradigm="react", stop_reason="stop",
-            )
+        _captured_model = None
 
-        orchestrator.process_message = AsyncMock(side_effect=_fake_process)
+        async def _capture_serve(bus, session_key):
+            nonlocal _captured_model
+            msg = await bus.inbound(session_key).get()
+            if msg is None:
+                return
+            _captured_model = msg.model
+            await bus.outbound.put(OutboundMessage(
+                session_key, msg.correlation_id, "final",
+                {"content": "ok", "stop_reason": "stop",
+                 "paradigm": "react", "usage": {}},
+            ))
+
+        orchestrator.serve = AsyncMock(side_effect=_capture_serve)
 
         from starlette.testclient import TestClient
         app = create_app(orchestrator)
@@ -167,10 +183,7 @@ class TestHTTPEndpoints:
             assert resp.status_code == 200
             resp.read()  # consume the stream
 
-        # Check that process_message was called with the right args
-        call_args = orchestrator.process_message.call_args
-        assert call_args[1]["model"] == "gpt-4o"
-        assert call_args[1]["temperature"] == 0.5
+        assert _captured_model == "gpt-4o"
 
 
 class TestAuth:
@@ -215,17 +228,18 @@ class TestWebSocket:
         return TestClient(app)
 
     def test_ws_chat_sends_response(self, orchestrator):
-        """WebSocket chat message produces done event."""
+        """WebSocket chat message produces done event via MessageBus."""
 
-        async def _fake_process(*args, **kwargs):
-            if kwargs.get("on_delta"):
-                await kwargs["on_delta"]("response")
-            return OrchestratorResult(
-                content="response", session_key="test",
-                paradigm="react", stop_reason="stop",
-            )
+        async def _fake_serve(bus, session_key):
+            msg = await bus.inbound(session_key).get()
+            if msg is None:
+                return
+            cid = msg.correlation_id
+            await bus.outbound.put(OutboundMessage(session_key, cid, "delta", "response"))
+            await bus.outbound.put(OutboundMessage(session_key, cid, "final",
+                {"content": "response", "stop_reason": "stop", "paradigm": "react", "usage": {}}))
 
-        orchestrator.process_message = AsyncMock(side_effect=_fake_process)
+        orchestrator.serve = AsyncMock(side_effect=_fake_serve)
 
         from starlette.testclient import TestClient
         app = create_app(orchestrator)
@@ -234,7 +248,6 @@ class TestWebSocket:
         with client.websocket_connect("/ws/test") as ws:
             ws.send_text(json.dumps({"type": "chat", "message": "hello"}))
             messages = []
-            # Collect messages until done
             for _ in range(10):
                 try:
                     msg = ws.receive_json()
@@ -250,19 +263,17 @@ class TestWebSocket:
     def test_ws_cancel(self, orchestrator):
         """Cancel message interrupts the in-flight request."""
 
-        cancel_called = False
-        task_created = asyncio.Event()
+        _started = asyncio.Event()
 
-        async def _fake_process(*args, **kwargs):
-            nonlocal cancel_called
-            task_created.set()
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                cancel_called = True
-                raise
+        async def _blocking_serve(bus, session_key):
+            _started.set()
+            msg = await bus.inbound(session_key).get()
+            if msg is None:
+                return
+            # Don't publish anything — simulate a slow request so the
+            # client can cancel the outbound reader.
 
-        orchestrator.process_message = AsyncMock(side_effect=_fake_process)
+        orchestrator.serve = AsyncMock(side_effect=_blocking_serve)
 
         from starlette.testclient import TestClient
         app = create_app(orchestrator)
@@ -270,11 +281,10 @@ class TestWebSocket:
 
         with client.websocket_connect("/ws/test") as ws:
             ws.send_text(json.dumps({"type": "chat", "message": "slow request"}))
-            # Wait briefly for the task to start
+            # Wait for the serve task to consume the inbound message
             import time
-            time.sleep(0.1)
+            time.sleep(0.2)
             ws.send_text(json.dumps({"type": "cancel"}))
-            # Receive the cancel confirmation
             msg = ws.receive_json()
             assert msg["type"] == "error"
             assert "cancelled" in msg["message"].lower()

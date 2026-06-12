@@ -369,6 +369,8 @@ class Orchestrator:
                         session_key=session_key,
                         user_input=msg.content,
                         model=msg.model,
+                        temperature=msg.temperature,
+                        max_tokens=msg.max_tokens,
                         goal=msg.goal,
                         skills=msg.skills,
                         on_delta=_on_delta,

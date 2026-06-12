@@ -514,16 +514,18 @@ class TestBudgetCompressionIntegration:
     async def test_build_messages_triggers_compress_when_over_budget(self, ctx, provider):
         """When assembled context exceeds max_context_tokens, compress() is called."""
         ctx.provider = provider
-        ctx.max_context_tokens = 200
+        ctx.max_context_tokens = 4000
         ctx.compress_ratio = 0.5
         provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Summary."))
 
         session = ctx.session.get_session("bi1")
-        # Create messages with enough content to exceed budget
+        # Varied text to avoid tiktoken compression of repeated chars.
+        # 20 messages × ~250 tokens + system prompt (~1700) ≈ 6700 > 4000.
+        body = "The quick brown fox jumps over the lazy dog. " * 20  # ~250 tokens per msg
         session.messages = [
-            {"role": "user", "content": "x" * 200},
-            {"role": "assistant", "content": "y" * 200},
-        ] * 10  # 20 messages, lots of tokens
+            {"role": "user", "content": body},
+            {"role": "assistant", "content": body},
+        ] * 10  # 20 messages, ~5000 tokens of history
         ctx.session.save_session(session)
 
         msgs = await ctx.build_messages("bi1", "hello")

@@ -60,6 +60,8 @@ class InboundMessage:
     source: str = ""  # "cli" | "http" | "websocket" | "telegram"
     correlation_id: str = ""
     model: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
     goal: str | None = None
     skills: list[str] | None = None
     timestamp: float = field(default_factory=_time.monotonic)
