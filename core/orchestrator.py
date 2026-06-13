@@ -769,6 +769,7 @@ def main() -> None:
             serve_task.cancel()
             with suppress(asyncio.CancelledError):
                 await serve_task
+            await orche.stop_mcp()
 
     try:
         asyncio.run(_run())

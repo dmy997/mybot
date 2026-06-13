@@ -145,81 +145,103 @@ class MCPClientManager:
         """Disconnect all MCP servers and unregister their tools."""
         self._running = False
 
+        # Cancel background tasks — their finally blocks will clean up
+        # connections inside the correct task context.
         for task in self._tasks.values():
             task.cancel()
+        for task in self._tasks.values():
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._tasks.clear()
-
-        for name in list(self._connections.keys()):
-            await self._disconnect_server(name)
 
         logger.info("MCP client manager stopped")
 
     # -- internal: per-server loop -------------------------------------------
 
     async def _run_server_loop(self, server_name: str) -> None:
-        """Connect, register tools, and reconnect on failure for one server."""
+        """Connect, register tools, and reconnect on failure for one server.
+
+        All connection cleanup happens inside this task so that the
+        ``stdio_client`` async context manager is always closed from
+        the same task it was entered from (avoiding anyio cancel-scope
+        errors).
+        """
         delay = 0.0
 
-        while self._running:
-            if delay > 0:
-                await asyncio.sleep(delay)
+        try:
+            while self._running:
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
-            config = self._server_configs.get(server_name)
-            if config is None:
-                break  # server was removed from config
+                config = self._server_configs.get(server_name)
+                if config is None:
+                    break  # server was removed from config
 
-            try:
-                conn = config.to_connection()
-                await conn.connect()
-                self._connections[server_name] = conn
+                try:
+                    conn = config.to_connection()
+                    await conn.connect()
+                    self._connections[server_name] = conn
 
-                # Discover tools and register them
-                tool_defs = await conn.list_tools()
-                self._register_server_tools(server_name, conn, tool_defs)
+                    # Discover tools and register them
+                    tool_defs = await conn.list_tools()
+                    self._register_server_tools(server_name, conn, tool_defs)
 
-                self._emit(MCPClientManagerEvent(
-                    event="connected",
-                    server_name=server_name,
-                    tool_names=[t["name"] for t in tool_defs],
-                ))
+                    self._emit(MCPClientManagerEvent(
+                        event="connected",
+                        server_name=server_name,
+                        tool_names=[t["name"] for t in tool_defs],
+                    ))
 
-                delay = 0.0  # reset on successful connection
+                    delay = 0.0  # reset on successful connection
 
-                # Idle — wait for disconnect or stop
-                while self._running and conn.connected:
-                    await asyncio.sleep(1.0)
+                    # Idle — wait for disconnect or stop
+                    while self._running and conn.connected:
+                        await asyncio.sleep(1.0)
 
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.warning(
-                    "MCP server {!r} error: {}. Reconnecting in {!s}s...",
-                    server_name, exc, delay,
+                except Exception as exc:
+                    logger.warning(
+                        "MCP server {!r} error: {}. Reconnecting in {!s}s...",
+                        server_name, exc, delay,
+                    )
+                    self._emit(MCPClientManagerEvent(
+                        event="disconnected",
+                        server_name=server_name,
+                        error=str(exc),
+                    ))
+
+                finally:
+                    # Always clean up the connection from within this task.
+                    # stop() cancels us → CancelledError surfaces here, and
+                    # the finally block still runs in the same task that
+                    # entered the stdio_client context manager.
+                    await self._cleanup_server(server_name)
+
+                # Exponential backoff
+                delay = min(
+                    self._RECONNECT_DELAY if delay == 0 else delay * 2,
+                    self._MAX_RECONNECT_DELAY,
                 )
-                self._emit(MCPClientManagerEvent(
-                    event="disconnected",
-                    server_name=server_name,
-                    error=str(exc),
-                ))
+        except asyncio.CancelledError:
+            # Final cleanup on task cancellation
+            await self._cleanup_server(server_name)
 
-            # Unregister tools from the failed connection
-            await self._unregister_server_tools(server_name)
-            self._connections.pop(server_name, None)
-
-            # Exponential backoff
-            delay = min(
-                self._RECONNECT_DELAY if delay == 0 else delay * 2,
-                self._MAX_RECONNECT_DELAY,
-            )
-
-    async def _disconnect_server(self, server_name: str) -> None:
-        """Disconnect a single server and unregister its tools."""
+    async def _cleanup_server(self, server_name: str) -> None:
+        """Unregister tools and disconnect (safe to call from server task only)."""
         await self._unregister_server_tools(server_name)
         conn = self._connections.pop(server_name, None)
         if conn:
-            await conn.disconnect()
+            try:
+                await conn.disconnect()
+            except Exception:
+                logger.debug("MCP server {!r} disconnect error (ignored)", server_name)
+
+    async def _disconnect_server(self, server_name: str) -> None:
+        """Disconnect a single server and unregister its tools.
+
+        Prefer using the in-task cleanup path.  This is a fallback for
+        external callers that runs within the server loop task.
+        """
+        await self._cleanup_server(server_name)
 
     # -- tool registry management --------------------------------------------
 
