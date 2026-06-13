@@ -420,7 +420,14 @@ def main() -> None:
 
     try:
         import uvicorn
-        uvicorn.run(app, host=host, port=port)
+
+        async def _serve():
+            config = uvicorn.Config(app, host=host, port=port)
+            server = uvicorn.Server(config)
+            await orchestrator.start_mcp()
+            await server.serve()
+
+        asyncio.run(_serve())
     except ImportError:
         logger.error("uvicorn is required to run the server.  Install with: pip install uvicorn")
         sys.exit(1)

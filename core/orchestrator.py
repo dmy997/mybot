@@ -27,6 +27,7 @@ from observability import LogConfig, init_logging
 from observability.subscribers import install as install_subscribers
 from observability.trace import tracer
 from tools import ToolRegistry
+from tools.mcp.client_manager import MCPClientManager
 from tools.tool import Tool
 
 from .dispatcher import Dispatcher
@@ -87,6 +88,7 @@ class Orchestrator:
         disabled_skills: list[str] | None = None,
         log_config: LogConfig | None = None,
         middleware: MiddlewareChain | None = None,
+        mcp_config_path: str | Path | None = None,
     ) -> None:
         self._running = False
         self.workspace = Path(workspace).expanduser().resolve()
@@ -123,6 +125,13 @@ class Orchestrator:
         )
         self._register_default_tools()
 
+        # MCP (Model Context Protocol) integration
+        self._mcp_manager: MCPClientManager | None = None
+        self._mcp_config_path: Path | None = (
+            Path(mcp_config_path).expanduser().resolve() if mcp_config_path else None
+        )
+        self._setup_mcp()
+
     def _register_default_tools(self) -> None:
         """Auto-discover and register tools available in the ``"core"`` scope."""
         from tools import discover_tools
@@ -143,6 +152,41 @@ class Orchestrator:
         self._tools.register(MemoryRememberTool(self.ctx))
         self._tools.register(MemoryRecallTool(self.ctx))
         self._tools.register(MemoryForgetTool(self.ctx))
+
+    # -- MCP -----------------------------------------------------------------
+
+    def _setup_mcp(self) -> None:
+        """Load MCP config (if any) and create the client manager but don't connect yet."""
+        from tools.mcp.client_manager import load_mcp_config, MCPServerConfig  # noqa: F811
+
+        config_path = self._mcp_config_path
+        if config_path is None:
+            default = self.workspace / "mcp_servers.json"
+            if default.exists():
+                config_path = default
+
+        if config_path is not None and Path(config_path).exists():
+            try:
+                servers = load_mcp_config(config_path)
+                if servers:
+                    self._mcp_manager = MCPClientManager(self._tools)
+                    self._mcp_manager.configure(servers)
+                    logger.info(
+                        "MCP config loaded from {!s}: {!s} server(s)",
+                        config_path, len(servers),
+                    )
+            except Exception:
+                logger.exception("Failed to load MCP config from {!s}", config_path)
+
+    async def start_mcp(self) -> None:
+        """Connect to configured MCP servers and register their tools."""
+        if self._mcp_manager is not None:
+            await self._mcp_manager.start()
+
+    async def stop_mcp(self) -> None:
+        """Disconnect all MCP servers and unregister their tools."""
+        if self._mcp_manager is not None:
+            await self._mcp_manager.stop()
 
     # -- helpers ---------------------------------------------------------------
 
@@ -646,6 +690,7 @@ def main() -> None:
         nonlocal _prompt_session
 
         _init_prompt_session()
+        await orche.start_mcp()
         serve_task = asyncio.create_task(orche.serve(bus_msg, session_key))
 
         renderer: StreamRenderer | None = None
