@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -108,13 +109,19 @@ class McpConnection:
     async def _connect_stdio(self) -> None:
         """Establish a stdio transport connection."""
         assert self._stdio is not None
+
         params = mcp_stdio.StdioServerParameters(
             command=self._stdio.command,
             args=self._stdio.args,
             env=self._stdio.env,
             cwd=self._stdio.cwd,
         )
-        stdio_ctx = mcp_stdio.stdio_client(params)
+
+        # Redirect MCP server stderr to /dev/null instead of the terminal
+        # where it would overwrite prompt_toolkit's input area.
+        mcp_stderr = open(os.devnull, "w")
+        self._mcp_stderr = mcp_stderr
+        stdio_ctx = mcp_stdio.stdio_client(params, errlog=mcp_stderr)
         read, write = await stdio_ctx.__aenter__()
         self._read_stream = read
         self._write_stream = write
@@ -182,6 +189,9 @@ class McpConnection:
         self._read_stream = None
         self._write_stream = None
         self._connected = False
+        if hasattr(self, "_mcp_stderr") and self._mcp_stderr is not None:
+            self._mcp_stderr.close()
+            self._mcp_stderr = None
         logger.info("MCP server {!r} disconnected", self._server_name)
 
     async def __aenter__(self) -> McpConnection:
