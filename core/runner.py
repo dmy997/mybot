@@ -715,7 +715,7 @@ class AgentCore:
         step_count: int = 0,
     ) -> LLMResponse:
         """Append a safety-compliance hint to the system prompt and retry."""
-        hint = "请确保所有回复内容安全合规，避免任何违反内容政策的表述。"
+        hint = "Ensure all responses comply with safety and content policy guidelines."
         modified = list(messages)
         for i, msg in enumerate(modified):
             if msg.get("role") == "system":

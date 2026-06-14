@@ -281,11 +281,16 @@ class CompactionService:
         # Persist
         self._write_history(session_key, len(to_compress), summary)
 
-        # Advance cursor under lock (session.messages is NOT modified)
+        # Advance cursor under lock (session.messages is NOT modified).
+        # Use absolute position: `cursor + len(to_compress)` would be wrong
+        # when history was capped by max_history_messages (the common case).
+        # ``len(session.messages) - len(to_keep)`` correctly computes the
+        # start of the un-compressed tail regardless of truncation offset.
         async with self.session.lock_session(session_key):
             session = self.session.get_session(session_key)
-            cursor = session.consolidated_cursor
-            session.consolidated_cursor = cursor + len(to_compress)
+            old_cursor = session.consolidated_cursor
+            new_cursor = len(session.messages) - len(to_keep)
+            session.consolidated_cursor = new_cursor
             session.updated_at = datetime.now()
             self.session.save_session(session)
 
@@ -293,8 +298,8 @@ class CompactionService:
             "auto_compact {!r}: {} messages summarised, cursor {} → {}",
             session_key,
             len(to_compress),
-            cursor,
-            session.consolidated_cursor,
+            old_cursor,
+            new_cursor,
         )
 
         # Reset circuit breaker on success
@@ -348,8 +353,9 @@ class CompactionService:
 
         async with self.session.lock_session(session_key):
             session = self.session.get_session(session_key)
-            cursor = session.consolidated_cursor
-            session.consolidated_cursor = cursor + len(to_compress)
+            old_cursor = session.consolidated_cursor
+            new_cursor = len(session.messages) - len(to_keep)
+            session.consolidated_cursor = new_cursor
             session.updated_at = datetime.now()
             self.session.save_session(session)
 

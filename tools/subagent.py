@@ -66,10 +66,10 @@ class SubAgentTool(Tool):
     _parallel = True    # independent sub-agents can run concurrently
     capabilities = {Capability.DELEGATE}
     description = (
-        "将子任务委托给一个独立的子 Agent 执行。子 Agent 拥有独立的执行上下文"
-        "和受限的工具集，完成后返回结果。\n\n"
-        "适用场景：需要跨多个文件搜索、分析项目结构、执行独立的调查或分析子任务。\n"
-        "不适用：简单的单步操作（如「读取一个已知文件」）。"
+        "Delegate a sub-task to an independent sub-agent for execution. "
+        "The sub-agent has its own execution context and a restricted tool set. "
+        "Use for: cross-file searches, project structure analysis, or independent "
+        "research sub-tasks. NOT for simple single-step operations."
     )
     parameters: dict[str, Any] = {
         "type": "object",
@@ -77,8 +77,8 @@ class SubAgentTool(Tool):
             "task": {
                 "type": "string",
                 "description": (
-                    "子 Agent 需要完成的具体任务描述。越具体越好，包括期望的"
-                    "输出格式和搜索/操作范围。"
+                    "Detailed description of the sub-task to complete. Include "
+                    "expected output format and search/operation scope."
                 ),
             },
         },

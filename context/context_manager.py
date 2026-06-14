@@ -51,6 +51,16 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
+# Default base system prompt — always included unless overridden by caller
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SYSTEM_PROMPT = (
+    "Reply in the same language the user is using. "
+    "If the user writes in Chinese, reply in Chinese. "
+    "If the user writes in English, reply in English."
+)
+
+# ---------------------------------------------------------------------------
 # Module-level helpers (kept here — used by build_messages and runner.py)
 # ---------------------------------------------------------------------------
 
@@ -634,6 +644,8 @@ class ContextManager:
 
         if self.system_prompt:
             parts.append(self.system_prompt)
+        else:
+            parts.append(_DEFAULT_SYSTEM_PROMPT)
 
         autoload_skills = self.skills_loader.build_skills_summary()
         explicit_skills = self.skills_loader.load_skills_for_context(skills or [])
