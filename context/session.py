@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +41,7 @@ class SessionManager:
         self.sessions = sessions or {}
         self.sessions_dir = self.workspace / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self._write_locks: dict[str, asyncio.Lock] = {}
 
     # -- retrieve ----------------------------------------------------------------
 
@@ -86,6 +89,29 @@ class SessionManager:
         session = self.get_session(key)
         session.consolidated_cursor = cursor
         self.save_session(session)
+
+    # -- concurrency -------------------------------------------------------------
+
+    def _get_write_lock(self, key: str) -> asyncio.Lock:
+        """Return the per-session write lock, creating it lazily."""
+        if key not in self._write_locks:
+            self._write_locks[key] = asyncio.Lock()
+        return self._write_locks[key]
+
+    @asynccontextmanager
+    async def lock_session(self, key: str):
+        """Async context manager that holds the write lock for *key*.
+
+        Usage::
+
+            async with session_mgr.lock_session(key):
+                session = session_mgr.get_session(key)
+                session.messages.append(msg)
+                session_mgr.save_session(session)
+        """
+        lock = self._get_write_lock(key)
+        async with lock:
+            yield
 
     # -- persistence -------------------------------------------------------------
 

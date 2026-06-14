@@ -1,13 +1,20 @@
 """Streaming renderer for CLI output.
 
-Uses Rich Live with ``transient=True`` for in-place markdown updates during
-streaming.  After the live display stops, a final clean render is printed
-so the content persists on screen.
+Uses Rich for Markdown rendering with a throttled update strategy:
+during streaming the buffer is accumulated and the Rich Live display is
+updated at most every ~80ms (12 FPS).  This prevents the asyncio hot path
+from being blocked by excessive Markdown object creation and Live update
+overhead — the common streaming bottleneck in WSL2 terminals.
+
+Flow per round:
+  spinner → first delta → header + throttled Rich Live updates →
+  on_end → stop Live (content stays on screen) + stop spinner
 """
 
 from __future__ import annotations
 
 import sys
+import time
 from contextlib import contextmanager, nullcontext
 
 from rich.console import Console
@@ -67,15 +74,16 @@ class ThinkingSpinner:
 
 
 class StreamRenderer:
-    """Streaming renderer with Rich Live for in-place updates.
+    """Progressive Markdown renderer with throttled Rich Live updates.
 
-    During streaming: updates content in-place via Rich Live.
-    On end: stops Live (transient=True erases it), then prints final render.
-
-    Flow per round:
-      spinner → first delta → header + Live updates →
-      on_end → stop Live + final render
+    Tokens are accumulated into ``_buf`` as they arrive, but the Rich Live
+    display is only updated every ``_UPDATE_INTERVAL`` seconds.  The refresh
+    thread (``auto_refresh=True``) handles actual terminal output off the
+    asyncio event loop, so the only asyncio cost per delta is a string
+    concatenation.
     """
+
+    _UPDATE_INTERVAL = 0.08  # throttle to ~12 FPS
 
     def __init__(
         self,
@@ -92,17 +100,13 @@ class StreamRenderer:
         self._live: Live | None = None
         self._spinner: ThinkingSpinner | None = None
         self._header_printed = False
+        self._last_update = 0.0
         self._start_spinner()
 
     def _renderable(self):
         if self._md and self._buf:
             return Markdown(self._buf)
         return Text(self._buf or "")
-
-    def _render_str(self) -> str:
-        with self._console.capture() as cap:
-            self._console.print(self._renderable())
-        return cap.get()
 
     def _start_spinner(self) -> None:
         if self._show_spinner:
@@ -114,6 +118,29 @@ class StreamRenderer:
             self._spinner.__exit__(None, None, None)
             self._spinner = None
 
+    def _ensure_header(self) -> None:
+        """Stop spinner and print the assistant header once."""
+        self._stop_spinner()
+        if self._header_printed:
+            return
+        self._console.print()
+        self._console.print(f"[cyan]{self._bot_name}[/cyan]")
+        self._header_printed = True
+
+    def _start_live(self) -> None:
+        self._live = Live(
+            self._renderable(),
+            console=self._console,
+            screen=False,
+            auto_refresh=True,
+            refresh_per_second=10,
+            transient=False,
+        )
+        self._live.start()
+        self._last_update = 0.0  # first delta after creation triggers update immediately
+
+    # -- public properties / helpers ----------------------------------------
+
     @property
     def console(self) -> Console:
         return self._console
@@ -123,65 +150,7 @@ class StreamRenderer:
         return self._header_printed
 
     def ensure_header(self) -> None:
-        """Stop spinner and print the assistant header once."""
-        self._stop_spinner()
-        if self._header_printed:
-            return
-        self._console.print()
-        self._console.print(f"[cyan]{self._bot_name}[/cyan]")
-        self._header_printed = True
-
-    def pause_spinner(self):
-        """Context manager: temporarily stop transient output for clean trace lines."""
-        @contextmanager
-        def _pause():
-            live_was_active = self._live is not None
-            if self._live:
-                self._live.stop()
-                self._live = None
-            with self._spinner.pause() if self._spinner else nullcontext():
-                yield
-            if live_was_active:
-                return
-        return _pause()
-
-    async def on_delta(self, delta: str) -> None:
-        self.streamed = True
-        self._buf += delta
-        if self._live is None:
-            if not self._buf.strip():
-                return
-            self.ensure_header()
-            self._live = Live(
-                self._renderable(),
-                console=self._console,
-                auto_refresh=False,
-                transient=True,
-            )
-            self._live.start()
-        else:
-            self._live.update(self._renderable())
-        self._live.refresh()
-
-    async def on_end(self, *, resuming: bool = False) -> None:
-        if self._live:
-            self._live.refresh()
-            self._live.update(self._renderable())
-            self._live.refresh()
-            self._live.stop()
-            self._live = None
-        self._stop_spinner()
-        if self._buf.strip():
-            out = sys.stdout
-            out.write(self._render_str())
-            out.flush()
-        if resuming:
-            self._buf = ""
-            self._start_spinner()
-
-    def stop_for_input(self) -> None:
-        """Stop spinner before user input to avoid prompt_toolkit conflicts."""
-        self._stop_spinner()
+        self._ensure_header()
 
     def pause(self):
         """Context manager: pause spinner for external output."""
@@ -189,8 +158,56 @@ class StreamRenderer:
             return self._spinner.pause()
         return nullcontext()
 
+    def pause_spinner(self):
+        """Context manager: pause spinner for tool progress.
+
+        Does **not** stop the Live display.  Rich's ``Live.console.print()``
+        automatically suspends the live region while output is written
+        through the same Console instance, so printing a tool-progress
+        line via *self._console* is coordinated with the live display.
+        """
+        @contextmanager
+        def _pause():
+            with self._spinner.pause() if self._spinner else nullcontext():
+                yield
+        return _pause()
+
+    def stop_for_input(self) -> None:
+        """Stop spinner before user input to avoid prompt_toolkit conflicts."""
+        self._stop_spinner()
+
+    # -- streaming ----------------------------------------------------------
+
+    async def on_delta(self, delta: str) -> None:
+        """Accumulate delta and throttle Live updates."""
+        self.streamed = True
+        self._buf += delta
+        if self._live is None:
+            if not self._buf.strip():
+                return
+            self._ensure_header()
+            self._start_live()
+            return
+
+        now = time.monotonic()
+        if now - self._last_update >= self._UPDATE_INTERVAL:
+            self._live.update(self._renderable())
+            self._last_update = now
+
+    async def on_end(self, *, resuming: bool = False) -> None:
+        """Final update, stop Live, stop spinner."""
+        if self._live:
+            self._live.update(self._renderable())
+            self._live.refresh()
+            self._live.stop()
+            self._live = None
+        self._stop_spinner()
+        if resuming:
+            self._buf = ""
+            self._start_spinner()
+
     async def close(self) -> None:
-        """Stop spinner/live without rendering a final streamed round."""
+        """Stop spinner/live without a final render."""
         if self._live:
             self._live.stop()
             self._live = None

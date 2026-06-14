@@ -28,10 +28,13 @@ def show_banner(
     model: str,
     msg_count: int,
     agents: list[str],
+    *,
+    resumed: bool = False,
 ) -> None:
     """Render the startup banner as a styled Panel."""
+    mode = "[dim]continued[/dim]" if resumed else "[dim]new[/dim]"
     lines = [
-        f"[bold]session :[/bold] {session_key}",
+        f"[bold]session :[/bold] {session_key}  {mode}",
         f"[bold]model   :[/bold] {model}",
         f"[bold]history :[/bold] {msg_count} 条消息",
         f"[bold]agents  :[/bold] {', '.join(agents)}",
@@ -127,19 +130,24 @@ def render_content(content: str) -> None:
 
 def print_tool_progress_start(
     name: str, args: dict[str, Any] | None, index: int, total: int,
+    *,
+    _console: Console | None = None,
 ) -> None:
     """Print an inline tool-execution start line."""
+    c = _console or console
     args_str = _summarize_args_display(args, 50)
-    console.print(
+    c.print(
         f"  [dim cyan][{index}/{total}] {name}[/dim cyan] 执行中...  "
         f"[dim]{args_str}[/dim]",
         highlight=False,
     )
-    console.file.flush() if console.file else None
+    c.file.flush() if c.file else None
 
 
-def print_tool_progress_end(ev: dict[str, Any]) -> None:
-    """Print an inline tool-execution result line (overwrites start line)."""
+def print_tool_progress_end(ev: dict[str, Any], *,
+                            _console: Console | None = None) -> None:
+    """Print an inline tool-execution result line."""
+    c = _console or console
     name = ev.get("name", "?")
     ok = ev.get("status") == "ok"
     status = "[green]✓[/green]" if ok else "[red]✗[/red]"
@@ -147,12 +155,12 @@ def print_tool_progress_end(ev: dict[str, Any]) -> None:
     dur_str = f"{dur:.0f}ms" if isinstance(dur, (int, float)) and dur > 0 else "-"
     args = (ev.get("arguments") or "")[:50]
     detail = (ev.get("detail") or "")[:60].replace("\n", " ")
-    console.print(
+    c.print(
         f"  {status} [cyan]{name}[/cyan]  [dim]{dur_str}[/dim]  "
         f"[dim]{args}[/dim]  [dim]{detail}[/dim]",
         highlight=False,
     )
-    console.file.flush() if console.file else None
+    c.file.flush() if c.file else None
 
 
 def _summarize_args_display(args: dict[str, Any] | None, max_chars: int = 80) -> str:

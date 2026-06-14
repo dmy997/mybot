@@ -3,25 +3,37 @@
 Owns the full lifecycle of "what the LLM sees":
 1. Interrupted-session repair (unmatched tool calls, missing assistant responses)
 2. System prompt assembly (base + memory + skills + tools + history summaries)
-3. Unified compression (idle and token-budget share the same method)
-4. Session history loading (cursor-based, 100-message cap, turn-boundary-safe)
-5. Token-budget check with pre-emptive compression
-6. Memory read (context injection) and write (persisting exchange excerpts)
+3. Session history loading (cursor-based, capped, turn-boundary-safe)
+4. Token-budget check with multi-threshold compaction gating
+5. Memory read (context injection) and write (persisting exchange excerpts)
+
+Compression is delegated to :class:`CompactionService` (three-layer pyramid).
+Thresholds are read from :class:`TokenBudget` (single configuration source).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
 if TYPE_CHECKING:
     pass
 
+from context.compaction import (
+    CompactionResult,
+    CompactionService,
+    _count_tokens,
+    _estimate_message_tokens,
+)
+from context.memory_service import MemoryService
+from context.session_memory import SessionMemory
+from context.token_budget import TokenBudget
 from memory import MemoryManager
 from memory.store import MemoryStore
 from tools import ToolRegistry
@@ -29,75 +41,95 @@ from utils import render_template
 
 from .session import SessionManager
 
-# ---------------------------------------------------------------------------
-# Token estimation (lightweight, no network call)
-# ---------------------------------------------------------------------------
-
-try:
-    import tiktoken
-
-    _ENC = tiktoken.get_encoding("cl100k_base")
-
-    def _count_tokens(text: str) -> int:
-        try:
-            return len(_ENC.encode(text))
-        except Exception:
-            return len(text) // 4
-except ImportError:
-    def _count_tokens(text: str) -> int:
-        return len(text) // 4
-
-
-def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
-    """Rough token count for a list of chat messages."""
-    total = 0
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total += _count_tokens(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and "text" in part:
-                    total += _count_tokens(part["text"])
-        if "tool_calls" in msg:
-            total += _count_tokens(str(msg["tool_calls"]))
-        total += 4
-    return total
-
-
-def _estimate_message_chars(messages: list[dict[str, Any]]) -> int:
-    """Character count for a list of chat messages (fallback metric)."""
-    total = 0
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total += len(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    total += len(str(part))
-        if "tool_calls" in msg:
-            total += len(str(msg["tool_calls"]))
-    return total
-
+# Re-export for backward compatibility (used by core/runner.py)
+__all__ = [
+    "ContextManager",
+    "_estimate_message_tokens",
+    "CompactionResult",
+    "CompactionService",
+    "TokenBudget",
+]
 
 # ---------------------------------------------------------------------------
-# Constants
+# Module-level helpers (kept here — used by build_messages and runner.py)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MAX_CONTEXT_TOKENS = 200_000
-_DEFAULT_IDLE_COMPRESS_SECONDS = 300
-_COMPRESS_RECENT_RATIO = 0.5
-_MAX_HISTORY_MESSAGES = 100
-_SUMMARY_MAX_WORDS = 200
-_CONTENT_TRUNCATE_LENGTH = 2000
-_DEHYDRATE_MAX_CONTENT_CHARS = 3000
+
+def _truncate_tool_results(
+    messages: list[dict[str, Any]], max_chars: int,
+) -> list[dict[str, Any]]:
+    """Cap ``content`` of tool-result messages to *max_chars*."""
+    return [
+        {
+            **m,
+            "content": (
+                m["content"][:max_chars] + "\n... (truncated)"
+                if isinstance(m.get("content"), str)
+                and len(m["content"]) > max_chars
+                else m.get("content", "")
+            ),
+        }
+        if m.get("role") == "tool"
+        else m
+        for m in messages
+    ]
+
+
+def _truncate_tool_call_args(
+    messages: list[dict[str, Any]], max_arg_chars: int,
+) -> list[dict[str, Any]]:
+    """Cap per-value string sizes inside ``tool_calls[].function.arguments``."""
+    import json as _json_local
+
+    result: list[dict[str, Any]] = []
+    for m in messages:
+        if m.get("role") != "assistant":
+            result.append(m)
+            continue
+        tcs = m.get("tool_calls")
+        if not tcs or not isinstance(tcs, list):
+            result.append(m)
+            continue
+
+        trimmed: list[dict[str, Any]] = []
+        for tc in tcs:
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else None
+            if fn is None:
+                trimmed.append(tc)
+                continue
+            raw_args = fn.get("arguments", "")
+            if not isinstance(raw_args, str) or len(raw_args) <= max_arg_chars:
+                trimmed.append(tc)
+                continue
+
+            try:
+                args_obj = _json_local.loads(raw_args)
+                if isinstance(args_obj, dict):
+                    for k in list(args_obj.keys()):
+                        v = args_obj[k]
+                        if isinstance(v, str) and len(v) > max_arg_chars:
+                            args_obj[k] = v[:max_arg_chars] + "\n... [truncated]"
+                    new_args = _json_local.dumps(args_obj, ensure_ascii=False)
+                else:
+                    new_args = raw_args[:max_arg_chars] + "\n... [truncated]"
+            except (_json_local.JSONDecodeError, TypeError):
+                new_args = raw_args[:max_arg_chars] + "\n... [truncated]"
+
+            trimmed.append({
+                **tc,
+                "function": {**fn, "arguments": new_args},
+            })
+
+        result.append({**m, "tool_calls": trimmed})
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Constants (session repair)
+# ---------------------------------------------------------------------------
+
 _INTERRUPT_MESSAGE = "Error: Task interrupted before a response was generated."
 _INTERRUPT_TOOL_RESULT = "Error: Tool execution interrupted."
-
-# Patterns for dehydration
-_DATA_URI_RE = re.compile(r"data:[^;\"\s]*;base64,[A-Za-z0-9+/=]+", re.IGNORECASE)
-_IMAGE_EXT_RE = re.compile(r"\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)(\s|$)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -114,17 +146,15 @@ class ContextManager:
         Root directory for sessions/ and memory/ storage.
     provider:
         Optional LLM provider for summarisation-based compression.
-        When ``None``, compression falls back to simple truncation.
     system_prompt:
         Base system prompt prepended to every request.
     max_context_tokens:
-        Soft token budget. When exceeded, unsummarised messages are compressed.
+        Soft token budget (used to initialise :class:`TokenBudget`).
     idle_compress_seconds:
         When a session has been idle longer than this, summarise older
         messages on the next access.  Set to ``0`` to disable.
     compress_model:
-        Optional model override for compression calls (defaults to provider
-        default — set this to a cheap model like ``"gpt-4o-mini"``).
+        Optional model override for compression calls.
     compress_ratio:
         Fraction of ``max_context_tokens`` to reserve for recent messages
         during token-budget compression.
@@ -136,25 +166,126 @@ class ContextManager:
         *,
         provider: Any | None = None,
         system_prompt: str = "",
-        max_context_tokens: int = _DEFAULT_MAX_CONTEXT_TOKENS,
-        idle_compress_seconds: int = _DEFAULT_IDLE_COMPRESS_SECONDS,
+        max_context_tokens: int = 200_000,
+        idle_compress_seconds: int = 300,
         compress_model: str | None = None,
-        compress_ratio: float = _COMPRESS_RECENT_RATIO,
+        compress_ratio: float = 0.5,
         disabled_skills: list[str] | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
-        self.provider = provider
         self.system_prompt = system_prompt
-        self.max_context_tokens = max_context_tokens
-        self.idle_compress_seconds = idle_compress_seconds
-        self.compress_model = compress_model
-        self.compress_ratio = compress_ratio
 
         from core.skills import SkillsLoader as _SkillsLoader
 
         self.session = SessionManager(self.workspace)
-        self.memory = MemoryManager(MemoryStore(self.workspace))
+        memory_store = MemoryStore(self.workspace)
+        self.memory = MemoryManager(memory_store)
         self.skills_loader = _SkillsLoader(self.workspace, disabled_skills=disabled_skills)
+
+        # Unified token budget (must be first — used by memory_service below)
+        self.token_budget = TokenBudget(
+            context_window=max_context_tokens,
+            compress_ratio=compress_ratio,
+            idle_compress_seconds=idle_compress_seconds,
+        )
+
+        # Enhanced memory service (relevance filtering + index truncation)
+        self.memory_service = MemoryService(
+            self.memory,
+            provider=None,
+            max_index_lines=self.token_budget.max_memory_index_lines,
+        )
+
+        # Unified compaction service (three-layer pyramid)
+        self.compaction = CompactionService(
+            provider=None,
+            token_budget=self.token_budget,
+            workspace=self.workspace,
+            session_manager=self.session,
+            compress_model=compress_model,
+        )
+
+        # Session-memory cache (lazy-init per session key)
+        self._session_memories: dict[str, SessionMemory] = {}
+
+        # Three-layer partitioned prompt cache:
+        #
+        # Layer 1 — static: base prompt + skills + tools.
+        #   Rebuilt once on first use; invalidated only when tools change.
+        #
+        # Layer 2 — memory context: SOUL, USER, MEMORY index, relevant entries.
+        #   Keyed by (session, query_bucket) so similar queries reuse results.
+        #   Invalidated on remember() / forget().
+        #
+        # Layer 3 — history summaries: compression archives.
+        #   Keyed by session_key; invalidated after auto/full compact.
+        #
+        # Dynamic parts (session notes, file context) are never cached and
+        # always computed fresh.
+        self._static_prompt: str | None = None
+        self._memory_cache: dict[str, str] = {}    # key: "session:query_bucket"
+        self._memory_cache_max = 50
+        self._history_cache: dict[str, str] = {}   # key: session_key
+        self._history_cache_max = 50
+
+        # Set via property to sync provider to compaction + memory_service
+        self.provider = provider
+
+    # -- backward-compat internal wrappers (delegate to compaction) ---------
+
+    def _write_history(
+        self, session_key: str, compressed_count: int, summary: str,
+    ) -> None:
+        """Delegate to CompactionService._write_history."""
+        self.compaction._write_history(session_key, compressed_count, summary)
+
+    def _history_path(self, session_key: str) -> Path:
+        """Delegate to CompactionService._history_path."""
+        return self.compaction._history_path(session_key)
+
+    # -- backward-compat properties (sync with token_budget / compaction) ---
+
+    @property
+    def provider(self) -> Any | None:
+        return self.compaction.provider
+
+    @provider.setter
+    def provider(self, value: Any | None) -> None:
+        self.compaction.provider = value
+        self.memory_service.provider = value
+        self._provider = value
+
+    @property
+    def max_context_tokens(self) -> int:
+        return self.token_budget.context_window
+
+    @max_context_tokens.setter
+    def max_context_tokens(self, value: int) -> None:
+        self.token_budget.context_window = value
+
+    @property
+    def compress_ratio(self) -> float:
+        return self.token_budget.compress_ratio
+
+    @compress_ratio.setter
+    def compress_ratio(self, value: float) -> None:
+        self.token_budget.compress_ratio = value
+
+    @property
+    def idle_compress_seconds(self) -> int:
+        return self.token_budget.idle_compress_seconds
+
+    @idle_compress_seconds.setter
+    def idle_compress_seconds(self, value: int) -> None:
+        self.token_budget.idle_compress_seconds = value
+
+    @property
+    def compress_model(self) -> str | None:
+        return self.compaction.compress_model
+
+    @compress_model.setter
+    def compress_model(self, value: str | None) -> None:
+        self.compaction.compress_model = value
 
     # ========================================================================
     # Public API
@@ -174,68 +305,108 @@ class ContextManager:
 
         Composition order:
         1. Repair interrupted session
-        2. System prompt (base + memory + skills + tools + history summaries)
-        3. Session history from ``consolidated_cursor`` onwards (max 100)
-        4. Current user input
-        5. Token-budget check → compress if over budget → rebuild
+        2. Micro-compact old tool results (Layer 1 — rule-based, no LLM)
+        3. System prompt (base + memory + skills + tools + history summaries)
+        4. Session history from ``consolidated_cursor`` onwards (capped)
+        5. Current user input
+        6. Multi-threshold token-budget check:
+           - > block_threshold → force auto_compact
+           - > auto_compact_threshold → auto_compact (with circuit breaker)
+           - > warning_threshold → logger warning
 
         Returns a list ready for ``AgentInput.init_messages``.
         """
-        self._repair_session(session_key)
-
         session = self.session.get_session(session_key)
         cursor = session.consolidated_cursor
 
-        # 1. System prompt (includes history.jsonl summaries)
-        system_content = self._build_system_prompt(
-            session_key, tools=tools, skills=skills,
+        # 1. Load raw history (non-destructive repair — does NOT modify stored session)
+        raw_history, _ = self._repair_messages(session.messages)
+        raw_history = raw_history[cursor:]
+        raw_history = raw_history[-self.token_budget.max_history_messages:]
+
+        # 2. Micro-compact: clear old tool results (Layer 1)
+        history = self.compaction.micro_compact(
+            raw_history,
+            keep_recent_turns=self.token_budget.micro_compact_keep_turns,
+            placeholder=self.token_budget.micro_compact_placeholder,
         )
 
-        # 2. Load unsummarised history (cursor → end, capped at 100)
-        raw_history = session.messages[cursor:]
-        raw_history = raw_history[-_MAX_HISTORY_MESSAGES:]
+        # 3. Filter out system messages
+        history = [m for m in history if m.get("role") != "system"]
 
-        # 3. Filter out system messages from history
-        history: list[dict[str, Any]] = [
-            m for m in raw_history if m.get("role") != "system"
-        ]
+        # 4. Cap tool-result / tool-arg sizes in history
+        history = _truncate_tool_results(
+            history, self.token_budget.history_tool_result_max_chars,
+        )
+        history = _truncate_tool_call_args(
+            history, self.token_budget.tool_call_args_max_chars,
+        )
 
-        # 4. Assemble preliminary list and check budget
+        # 5. Build system prompt (includes capped history summaries + memory relevance)
+        system_content = await self._build_system_prompt(
+            session_key, tools=tools, skills=skills, query=current_input,
+            messages=history,
+        )
+
+        # 6. Assemble preliminary list
         preliminary: list[dict[str, Any]] = [
             {"role": "system", "content": system_content},
         ] + history + [
             {"role": "user", "content": current_input},
         ]
 
-        if self.max_context_tokens > 0:
-            total = _estimate_message_tokens(preliminary)
-            if total > self.max_context_tokens:
-                # Compress unsummarised messages to free budget
-                sys_tokens = _estimate_message_tokens([preliminary[0]])
-                user_tokens = _estimate_message_tokens([preliminary[-1]])
-                history_budget = (
-                    int(self.max_context_tokens * self.compress_ratio)
-                    - sys_tokens - user_tokens
+        # 7. Multi-threshold token-budget check
+        budget = self.token_budget
+        if budget.context_window <= 0:
+            return preliminary
+
+        total = _estimate_message_tokens(preliminary)
+
+        # Block threshold: force compaction
+        if total > budget.block_threshold:
+            logger.warning(
+                "Context at {} tokens exceeds block threshold ({}), forcing compaction",
+                total, budget.block_threshold,
+            )
+            result = await self.compaction.auto_compact(
+                session_key, history,
+                budget_tokens=int(budget.effective_window * budget.compress_ratio),
+                session_memory=self._get_session_memory(session_key),
+            )
+            if result.compressed_count > 0:
+                self._invalidate_history_cache(session_key)
+                return await self._rebuild_after_compact(
+                    session_key, current_input, tools, skills,
                 )
-                if history_budget > 0:
-                    await self.compress(session_key, budget_tokens=history_budget)
 
-                # Rebuild after compression
-                session = self.session.get_session(session_key)
-                cursor = session.consolidated_cursor
-                raw_history = session.messages[cursor:]
-                raw_history = raw_history[-_MAX_HISTORY_MESSAGES:]
-                history = [m for m in raw_history if m.get("role") != "system"]
+        # Auto-compact threshold
+        elif total > budget.auto_compact_threshold:
+            if self.compaction.can_auto_compact():
+                logger.info(
+                    "Context at {} tokens exceeds auto-compact threshold ({}), compacting",
+                    total, budget.auto_compact_threshold,
+                )
+                result = await self.compaction.auto_compact(
+                    session_key, history,
+                    budget_tokens=int(budget.effective_window * budget.compress_ratio),
+                    session_memory=self._get_session_memory(session_key),
+                )
+                if result.compressed_count > 0:
+                    self._invalidate_history_cache(session_key)
+                    return await self._rebuild_after_compact(
+                        session_key, current_input, tools, skills,
+                    )
 
-                preliminary = [
-                    {"role": "system", "content": system_content},
-                ] + history + [
-                    {"role": "user", "content": current_input},
-                ]
+        # Warning threshold
+        elif total > budget.warning_threshold:
+            logger.warning(
+                "Context at {} tokens ({}% of window), consider compacting",
+                total, total / budget.effective_window * 100,
+            )
 
         return preliminary
 
-    # -- unified compression --------------------------------------------------
+    # -- unified compression (thin wrapper, backward-compatible) ---------------
 
     async def compress(
         self,
@@ -244,111 +415,95 @@ class ContextManager:
         keep_recent: int | None = None,
         budget_tokens: int | None = None,
     ) -> int:
-        """Compress unsummarised messages (those after ``consolidated_cursor``).
+        """Compress unsummarised messages (delegates to :class:`CompactionService`).
 
-        Exactly one of *keep_recent* or *budget_tokens* must be provided:
-
-        - **keep_recent**: keep this many most-recent messages (idle compression)
-        - **budget_tokens**: keep as many recent messages as fit within this
-          token budget (token-budget compression)
-
-        The split point is adjusted to preserve user/assistant turn boundaries.
-
-        Original ``session.messages`` are **never modified** — only
-        ``consolidated_cursor`` is advanced and the summary is appended to
-        ``history.jsonl``.
+        Exactly one of *keep_recent* or *budget_tokens* must be provided.
 
         Returns the number of messages compressed (0 if nothing was done).
         """
-        if keep_recent is None and budget_tokens is None:
-            raise ValueError("One of keep_recent or budget_tokens is required")
-        if keep_recent is not None and budget_tokens is not None:
-            raise ValueError("Only one of keep_recent or budget_tokens allowed")
-
-        if self.idle_compress_seconds <= 0 and budget_tokens is not None:
-            pass  # budget compression is always allowed
-        elif self.idle_compress_seconds <= 0:
-            return 0
-
         session = self.session.get_session(session_key)
         cursor = session.consolidated_cursor
         unsummarised = session.messages[cursor:]
 
-        if len(unsummarised) <= 1:
-            return 0
-
-        # Determine how many recent messages to keep
-        if keep_recent is not None:
-            keep_count = keep_recent
-        else:
-            keep_count = self._fit_in_budget(unsummarised, budget_tokens)
-
-        if keep_count >= len(unsummarised):
-            return 0
-
-        to_compress = list(unsummarised[:-keep_count])
-        to_keep = list(unsummarised[-keep_count:])
-
-        # Adjust split to preserve turn boundaries
-        self._adjust_split(to_compress, to_keep)
-
-        if not to_compress:
-            return 0
-
-        # Dehydrate + summarise
-        dehydrated = self._dehydrate_messages(to_compress)
-        summary = await self._summarise(dehydrated)
-
-        # Persist summary to history.jsonl
-        self._write_history(session_key, len(to_compress), summary)
-
-        # Advance cursor (session.messages is NOT modified)
-        session.consolidated_cursor = cursor + len(to_compress)
-        session.updated_at = datetime.now()
-        self.session.save_session(session)
-
-        logger.debug(
-            "Compression for {!r}: {} messages summarised, cursor {} → {}",
-            session_key,
-            len(to_compress),
-            cursor,
-            session.consolidated_cursor,
+        result = await self.compaction.auto_compact(
+            session_key, unsummarised,
+            budget_tokens=budget_tokens,
+            keep_recent=keep_recent,
+            session_memory=self._get_session_memory(session_key),
         )
-        return len(to_compress)
+        if result.compressed_count > 0:
+            self._invalidate_history_cache(session_key)
+        return result.compressed_count
 
     # -- session lifecycle ----------------------------------------------------
 
-    def save_exchange(
+    async def save_exchange(
         self,
         session_key: str,
         user_input: str,
         assistant_messages: list[dict[str, Any]],
+        *,
+        tools_used: list[str] | None = None,
+        errors: list[str] | None = None,
     ) -> None:
         """Append a user+assistant exchange to the session log.
 
-        Unlike :meth:`save_session` which replaces the entire message list,
-        this appends only the new exchange, preserving the raw conversation
-        log and keeping ``consolidated_cursor`` meaningful.
+        Also updates the session notes file for better compression quality.
         """
-        session = self.session.get_session(session_key)
-        session.messages.append({"role": "user", "content": user_input})
-        for msg in assistant_messages:
-            session.messages.append(msg)
-        session.updated_at = datetime.now()
-        self.session.save_session(session)
+        async with self.session.lock_session(session_key):
+            session = self.session.get_session(session_key)
+            session.messages.append({"role": "user", "content": user_input})
+            for msg in assistant_messages:
+                session.messages.append(msg)
+            session.updated_at = datetime.now()
+            self.session.save_session(session)
 
-    def save_session(
+        # Update structured session notes (outside lock — notes are per-session, not shared)
+        if tools_used or assistant_messages:
+            assistant_content = ""
+            for m in assistant_messages:
+                if m.get("role") == "assistant" and m.get("content"):
+                    assistant_content = str(m["content"])
+                    break
+            notes = self._get_session_memory(session_key)
+
+            # 1. Rule-based update (always runs, synchronous)
+            notes.update(
+                user_input=user_input,
+                assistant_content=assistant_content,
+                tools_used=tools_used,
+                errors=errors,
+            )
+
+            # 2. Fork-agent update (fire-and-forget background task)
+            if self.provider is not None:
+                try:
+                    _ = asyncio.create_task(
+                        notes.update_async(
+                            self.provider,
+                            user_input,
+                            assistant_content,
+                            tools_used=tools_used,
+                            errors=errors,
+                            model=self.compress_model,
+                        ),
+                        name=f"fork-agent-{session_key}",
+                    )
+                except RuntimeError:
+                    # No running event loop (e.g. sync test)
+                    pass
+
+    async def save_session(
         self,
         session_key: str,
         messages: list[dict[str, Any]],
     ) -> None:
         """Persist the full message list after an agent run.
 
-        Prefer :meth:`save_exchange` for normal use — it preserves the
-        raw message log and cursor integrity.  Use this method only when
-        you need to replace the entire session.
+        Prefer :meth:`save_exchange` for normal use.
         """
-        self.session.set_messages(session_key, messages)
+        async with self.session.lock_session(session_key):
+            self.session.set_messages(session_key, messages)
 
     def get_history(self, session_key: str) -> list[dict[str, Any]]:
         """Return session messages without the system prompt."""
@@ -364,34 +519,122 @@ class ContextManager:
         return self.session.list_sessions()
 
     # ========================================================================
+    # Session memory (per-conversation structured notes)
+    # ========================================================================
+
+    def _get_session_memory(self, session_key: str) -> SessionMemory:
+        """Get or create the :class:`SessionMemory` for *session_key*."""
+        if session_key not in self._session_memories:
+            notes_path = self.workspace / "sessions" / f"{session_key}_notes.md"
+            self._session_memories[session_key] = SessionMemory(session_key, notes_path)
+        return self._session_memories[session_key]
+
+    # ========================================================================
     # System prompt assembly
     # ========================================================================
 
-    def _build_system_prompt(
+    async def _build_system_prompt(
         self,
         session_key: str = "",
         tools: ToolRegistry | None = None,
         skills: list[str] | None = None,
+        query: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> str:
-        """Assemble the full system prompt from all configured sources."""
+        """Assemble the full system prompt from cached + dynamic layers.
+
+        Cache strategy (three partitioned layers):
+          - **Static**: base prompt + skills + tools (rebuilt once).
+          - **Memory context**: per (session, query_bucket) — survives across
+            exchanges, invalidated on remember/forget.
+          - **History summaries**: per session — invalidated after compaction.
+          - **Dynamic**: session notes + file context — always fresh.
+
+        A query bucket (hash mod 20) groups similar queries together so
+        the LLM relevance-filtering result is reused across exchanges.
+        """
         parts: list[str] = []
 
-        # 0. Base system prompt
-        if self.system_prompt:
-            parts.append(self.system_prompt)
+        # -- Layer 1: Static (base + skills + tools) --------------------------
 
-        # 1. Memory context (SOUL.md, USER.md, long-term memory)
-        memory_ctx = self.memory.build_memory_context()
+        static = await self._build_static_prompt(tools, skills)
+        if static:
+            parts.append(static)
+
+        # -- Layer 2: Memory context (cached per session:query_bucket) --------
+
+        mem_key = (
+            f"{session_key or 'default'}:{hash(query or '') % 20}"
+        )
+        if mem_key not in self._memory_cache:
+            self._memory_cache[mem_key] = (
+                await self.memory_service.build_memory_context(query=query)
+            )
+            # Evict oldest if at capacity
+            if len(self._memory_cache) > self._memory_cache_max:
+                oldest = next(iter(self._memory_cache))
+                self._memory_cache.pop(oldest)
+        memory_ctx = self._memory_cache[mem_key]
         if memory_ctx.strip():
             parts.append(memory_ctx)
 
-        # 2. History summaries from previous compressions
+        # -- Layer 3: History summaries (cached per session) ------------------
+
         if session_key:
-            history_ctx = self._read_history_summaries(session_key)
+            if session_key not in self._history_cache:
+                self._history_cache[session_key] = (
+                    self.compaction.read_history_summaries(
+                        session_key,
+                        max_entries=self.token_budget.max_history_summaries,
+                        max_chars_per_entry=self.token_budget.max_history_summary_chars,
+                    )
+                )
+                if len(self._history_cache) > self._history_cache_max:
+                    oldest = next(iter(self._history_cache))
+                    self._history_cache.pop(oldest)
+            history_ctx = self._history_cache[session_key]
             if history_ctx:
                 parts.append(history_ctx)
 
-        # 3. Skills
+        # -- Layer 4: Dynamic (never cached) ----------------------------------
+
+        # 4a. Session notes — only inject structured digest (no raw Work Log)
+        #     truncate_for_context() returned up to 48K chars including the
+        #     full exchange log, which duplicated the messages array.
+        #     get_compact_summary() is capped at 2K chars and only contains
+        #     distilled sections: Current Task, Key Decisions, Files, Errors.
+        if session_key:
+            notes = self._get_session_memory(session_key)
+            notes_ctx = notes.get_compact_summary()
+            if notes_ctx.strip():
+                parts.append(notes_ctx)
+
+        # 4b. File context recovery
+        if messages:
+            file_ctx = self._extract_file_context(messages)
+            if file_ctx:
+                parts.append(file_ctx)
+
+        return "\n\n".join(parts)
+
+    async def _build_static_prompt(
+        self,
+        tools: ToolRegistry | None = None,
+        skills: list[str] | None = None,
+    ) -> str:
+        """Build the static portion of the system prompt (base + skills + tools).
+
+        Cached indefinitely — only invalidated when tools are registered or
+        unregistered (:meth:`_invalidate_static`).
+        """
+        if self._static_prompt is not None:
+            return self._static_prompt
+
+        parts: list[str] = []
+
+        if self.system_prompt:
+            parts.append(self.system_prompt)
+
         autoload_skills = self.skills_loader.build_skills_summary()
         explicit_skills = self.skills_loader.load_skills_for_context(skills or [])
         if not explicit_skills and skills:
@@ -402,9 +645,10 @@ class ContextManager:
             s for s in (autoload_skills, explicit_skills) if s
         )
         if skills_content:
-            parts.append(render_template("agent/skills_section.md", skills_summary=skills_content))
+            parts.append(
+                render_template("agent/skills_section.md", skills_summary=skills_content)
+            )
 
-        # 4. Tools
         if tools is not None:
             tool_defs = tools.get_definitions()
             if tool_defs:
@@ -414,42 +658,68 @@ class ContextManager:
                 )
                 parts.append(f"# Available Tools\n\n{tool_lines}")
 
-        return "\n\n".join(parts)
+        self._static_prompt = "\n\n".join(parts) if parts else ""
+        return self._static_prompt
+
+    # ========================================================================
+    # Rebuild after compaction (fixes stale system prompt — P0 fix)
+    # ========================================================================
+
+    async def _rebuild_after_compact(
+        self,
+        session_key: str,
+        current_input: str,
+        tools: ToolRegistry | None = None,
+        skills: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Rebuild the message list after compaction.
+
+        Key fix: the system prompt is **rebuilt** to include newly-written
+        history.jsonl summaries.  Previously the old ``system_content``
+        was reused, causing summaries to be one turn stale.
+        """
+        session = self.session.get_session(session_key)
+        cursor = session.consolidated_cursor
+
+        # Non-destructive repair + slice from cursor
+        raw_history, _ = self._repair_messages(session.messages)
+        raw_history = raw_history[cursor:]
+        raw_history = raw_history[-self.token_budget.max_history_messages:]
+
+        history = self.compaction.micro_compact(
+            raw_history,
+            keep_recent_turns=self.token_budget.micro_compact_keep_turns,
+            placeholder=self.token_budget.micro_compact_placeholder,
+        )
+        history = [m for m in history if m.get("role") != "system"]
+        history = _truncate_tool_results(
+            history, self.token_budget.history_tool_result_max_chars,
+        )
+        history = _truncate_tool_call_args(
+            history, self.token_budget.tool_call_args_max_chars,
+        )
+
+        # Rebuild system prompt (includes new history summaries + memory relevance)
+        system_content = await self._build_system_prompt(
+            session_key, tools=tools, skills=skills, query=current_input,
+            messages=history,
+        )
+
+        return [
+            {"role": "system", "content": system_content},
+        ] + history + [
+            {"role": "user", "content": current_input},
+        ]
 
     # ========================================================================
     # Interrupt repair
     # ========================================================================
 
-    def _repair_session(self, session_key: str) -> None:
-        """Check and repair unmatched message pairs caused by interrupts.
-
-        Detects three interruption patterns:
-        1. Assistant message with ``tool_calls`` but no matching tool results
-        2. Last message is a ``user`` message with no assistant response
-        3. Last message is a ``tool`` result with no assistant response
-        """
-        session = self.session.get_session(session_key)
-        if not session.messages:
-            return
-
-        repaired, fixed_count = self._repair_messages(session.messages)
-        if fixed_count > 0:
-            session.messages = repaired
-            session.updated_at = datetime.now()
-            self.session.save_session(session)
-            logger.debug(
-                "Session {!r} repaired: {} unmatched pairs fixed",
-                session_key, fixed_count,
-            )
-
     @staticmethod
     def _repair_messages(
         messages: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], int]:
-        """Return *messages* with unmatched pairs repaired.
-
-        Returns ``(repaired_messages, fixed_count)``.
-        """
+        """Return *messages* with unmatched pairs repaired."""
         if not messages:
             return messages, 0
 
@@ -492,242 +762,57 @@ class ContextManager:
         return repaired, fixed_count
 
     # ========================================================================
-    # History summaries (read/write)
+    # File context recovery (post-compaction — mitigates P2 #8)
     # ========================================================================
 
-    def _history_path(self, session_key: str) -> Path:
-        return self.workspace / "sessions" / f"{session_key}_history.jsonl"
+    _FILE_PATH_RE = re.compile(
+        r'(?:^|[\s`"''(])'
+        r'(/?[\w.-]+(?:/[\w.-]+)+\.\w{1,10}'
+        r'|~?/\w+(?:/[\w.-]+)+\.?\w*)'
+        r'|@[\w./-]+\.\w+',
+    )
 
-    def _write_history(
-        self, session_key: str, compressed_count: int, summary: str,
-    ) -> None:
-        """Append a compression record to history.jsonl."""
-        path = self._history_path(session_key)
-        record = _json.dumps({
-            "timestamp": datetime.now().isoformat(),
-            "compressed_count": compressed_count,
-            "summary": summary,
-        }, ensure_ascii=False)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(record + "\n")
-        except OSError:
-            logger.opt(exception=True).warning(
-                "Failed to write history.jsonl for {!r}", session_key,
-            )
-
-    def _read_history_summaries(self, session_key: str) -> str:
-        """Read history.jsonl and format summaries for the system prompt."""
-        path = self._history_path(session_key)
-        if not path.exists():
-            return ""
-
-        parts: list[str] = []
-        try:
-            for line in path.read_text(encoding="utf-8").strip().split("\n"):
-                if not line.strip():
-                    continue
-                record = _json.loads(line)
-                ts = record.get("timestamp", "")[:19]
-                summary = record.get("summary", "")
-                compressed = record.get("compressed_count", 0)
-                if summary:
-                    parts.append(
-                        f"## Historical Summary ({ts}, {compressed} messages)\n\n{summary}"
-                    )
-        except (_json.JSONDecodeError, OSError):
-            return ""
-
-        if not parts:
-            return ""
-
-        return (
-            "# Previous Conversation Summaries\n\n"
-            "The following summaries capture earlier parts of this conversation "
-            "that have been archived:\n\n" + "\n\n".join(parts)
-        )
-
-    # ========================================================================
-    # Compression helpers
-    # ========================================================================
-
-    @staticmethod
-    def _fit_in_budget(
-        messages: list[dict[str, Any]], budget_tokens: int,
-    ) -> int:
-        """Count how many messages from the end fit within *budget_tokens*."""
-        count = 0
-        tokens = 0
-        for msg in reversed(messages):
-            t = _estimate_message_tokens([msg])
-            if tokens + t > budget_tokens:
-                break
-            count += 1
-            tokens += t
-        # Ensure at least 1 message is kept
-        return max(count, 1)
-
-    @staticmethod
-    def _adjust_split(
-        to_compress: list[dict[str, Any]],
-        to_keep: list[dict[str, Any]],
-    ) -> None:
-        """Move messages from *to_compress* to *to_keep* to avoid splitting turns.
-
-        Adjusts so that *to_keep* starts on a clean boundary:
-        - "user" → safe (start of a new exchange)
-        - "assistant" with tool_calls → safe (tool results follow in to_keep)
-        - "assistant" without tool_calls → move preceding "user" into to_keep
-        - "tool" → move preceding "assistant" (with tool_calls) into to_keep
-        """
-        while to_compress and to_keep:
-            first_keep = to_keep[0]
-            role = first_keep.get("role", "")
-
-            if role == "tool":
-                # Need the preceding assistant (with tool_calls)
-                prev = to_compress[-1]
-                if prev.get("role") == "assistant" and prev.get("tool_calls"):
-                    to_keep.insert(0, to_compress.pop())
-                else:
-                    break
-            elif role == "assistant" and not first_keep.get("tool_calls"):
-                # Need the preceding user message
-                prev = to_compress[-1]
-                if prev.get("role") == "user":
-                    to_keep.insert(0, to_compress.pop())
-                else:
-                    break
-            else:
-                # "user" or "assistant" with tool_calls → safe
-                break
-
-    @staticmethod
-    def _dehydrate_messages(
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Strip non-critical payload before sending to the summarisation API.
-
-        - Truncates content strings to ``_DEHYDRATE_MAX_CONTENT_CHARS``
-        - Replaces base64 data URIs with ``[binary: ...]`` placeholders
-        - Drops tool call arguments (keeps function names only)
-        """
-        dehydrated: list[dict[str, Any]] = []
-        for msg in messages:
-            d: dict[str, Any] = {}
-            for k, v in msg.items():
-                if k == "content" and isinstance(v, str):
-                    # Strip data URIs
-                    v = _DATA_URI_RE.sub("[binary data removed]", v)
-                    # Truncate oversized content
-                    if len(v) > _DEHYDRATE_MAX_CONTENT_CHARS:
-                        v = v[:_DEHYDRATE_MAX_CONTENT_CHARS] + (
-                            f"\n[... {len(v) - _DEHYDRATE_MAX_CONTENT_CHARS} "
-                            f"more chars truncated]"
-                        )
-                    d[k] = v
-                elif k == "tool_calls" and isinstance(v, list):
-                    # Keep only function names to prevent OOM from huge arguments
-                    slim_calls = []
-                    for tc in v:
-                        fn = tc.get("function", {})
-                        slim_calls.append({
-                            "id": tc.get("id", ""),
-                            "type": "function",
-                            "function": {"name": fn.get("name", "?"), "arguments": "{...}"},
-                        })
-                    d[k] = slim_calls
-                else:
-                    d[k] = v
-            dehydrated.append(d)
-        return dehydrated
-
-    # ========================================================================
-    # Summarisation (shared by compress → idle and budget paths)
-    # ========================================================================
-
-    async def _summarise(self, messages: list[dict[str, Any]]) -> str:
-        """Summarise *messages* via LLM, falling back to hard truncation."""
-        if self.provider is None:
-            return self._truncate_summary(messages)
-        try:
-            return await self._llm_summarise(messages)
-        except Exception:
-            logger.opt(exception=True).warning(
-                "LLM summarisation failed, falling back to truncation"
-            )
-            return self._truncate_summary(messages)
-
-    @staticmethod
-    def _truncate_summary(
-        messages: list[dict[str, Any]], *, max_chars: int = 2000,
+    @classmethod
+    def _extract_file_context(
+        cls, messages: list[dict[str, Any]], *, max_files: int = 5,
     ) -> str:
-        """Hard-truncation fallback: concatenate truncated messages.
+        """Scan recent user/assistant messages for file-path references.
 
-        Each message is capped at 150 chars; the total summary is capped at
-        *max_chars*.  This is a last-resort fallback when the LLM summarisation
-        API is unavailable.
+        After compression, older messages are summarised and their file
+        references are lost.  This method recovers recently mentioned file
+        paths so the model retains awareness of what files are in play.
+
+        Returns an empty string when no paths are found.
         """
         if not messages:
-            return "(empty context)"
+            return ""
 
-        parts: list[str] = []
-        total = 0
-        for msg in messages:
-            role = msg.get("role", "?")
+        seen: set[str] = set()
+        # Scan from newest to oldest — recent files are more relevant
+        for msg in reversed(messages):
+            if msg.get("role") not in ("user", "assistant"):
+                continue
             content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    p.get("text", "") for p in content if isinstance(p, dict)
-                )
-            content = str(content)
-            # First/last message keep more detail; middle messages get shorter
-            is_edge = (msg is messages[0] or msg is messages[-1])
-            limit = 300 if is_edge else 150
-            if len(content) > limit:
-                content = content[:limit] + "..."
-            line = f"[{role}] {content}" if content.strip() else f"[{role}] (no content)"
-            if total + len(line) > max_chars:
-                parts.append(f"[+{len(messages) - len(parts)} more messages truncated]")
+            if not isinstance(content, str):
+                continue
+            for m in cls._FILE_PATH_RE.finditer(content):
+                path = m.group().strip().lstrip("(`\"'")
+                if path and len(path) > 1 and path not in seen:
+                    seen.add(path)
+                    if len(seen) >= max_files:
+                        break
+            if len(seen) >= max_files:
                 break
-            parts.append(line)
-            total += len(line)
 
-        return "\n".join(parts) if parts else "(empty context)"
+        if not seen:
+            return ""
 
-    async def _llm_summarise(self, messages: list[dict[str, Any]]) -> str:
-        """Use a lightweight LLM call to summarise messages.
-
-        Messages should already be dehydrated before calling this method.
-        """
-        slim: list[dict[str, Any]] = [
-            {**m, "content": (
-                m.get("content", "")[:_CONTENT_TRUNCATE_LENGTH] + "..."
-                if isinstance(m.get("content", ""), str)
-                and len(m.get("content", "")) > _CONTENT_TRUNCATE_LENGTH
-                else m.get("content", "")
-            )}
-            for m in messages
-            if m.get("role") in ("user", "assistant")
-        ]
-
-        if not slim:
-            return "(empty context)"
-
-        summary_prompt = render_template(
-            "context/summary.md", max_words=_SUMMARY_MAX_WORDS, strip=True,
+        lines = [f"- `{p}`" for p in sorted(seen)]
+        return (
+            "# Files in Context\n\n"
+            "The following files have been mentioned in recent conversation:\n\n"
+            + "\n".join(lines)
         )
-        slim.append({"role": "user", "content": summary_prompt})
-
-        response = await self.provider.chat_with_retry(
-            messages=slim,
-            tools=[],
-            model=self.compress_model,
-            max_tokens=300,
-            temperature=0.0,
-        )
-        return response.content or "(summarisation produced no output)"
 
     # ========================================================================
     # Memory access (long-term user/feedback/project/reference)
@@ -743,11 +828,51 @@ class ContextManager:
     ) -> None:
         """Create or update a long-term memory entry."""
         self.memory.remember(name, content, mem_type=mem_type, description=description)
+        self._invalidate_memory_cache()
 
     def forget(self, name: str) -> bool:
         """Delete a long-term memory entry."""
-        return self.memory.forget(name)
+        result = self.memory.forget(name)
+        if result:
+            self._invalidate_memory_cache()
+        return result
 
     def recall(self, query: str, *, top_n: int = 10) -> list[Any]:
         """Search long-term memories by keyword."""
         return self.memory.recall(query, top_n=top_n)
+
+    # ========================================================================
+    # Prompt cache
+    # ========================================================================
+
+    # ========================================================================
+    # Cache invalidation
+    # ========================================================================
+
+    def _invalidate_static(self) -> None:
+        """Invalidate the static prompt layer (base + skills + tools)."""
+        self._static_prompt = None
+
+    def _invalidate_memory_cache(self, session_key: str | None = None) -> None:
+        """Invalidate the memory-context cache layer.
+
+        Called on remember() / forget().  If *session_key* is None, clears
+        all memory caches.
+        """
+        if session_key is None:
+            self._memory_cache.clear()
+        else:
+            prefix = f"{session_key}:"
+            keys = [k for k in self._memory_cache if k.startswith(prefix)]
+            for k in keys:
+                self._memory_cache.pop(k, None)
+
+    def _invalidate_history_cache(self, session_key: str | None = None) -> None:
+        """Invalidate the history-summary cache layer.
+
+        Called after compression writes new history.jsonl entries.
+        """
+        if session_key is None:
+            self._history_cache.clear()
+        else:
+            self._history_cache.pop(session_key, None)

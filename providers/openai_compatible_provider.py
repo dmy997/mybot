@@ -656,6 +656,15 @@ class OpenAICompatibleProvider(LLMProvider):
                                 }
                             })
 
+                # Yield to the event loop so outbound consumers can render
+                # each token before the next SSE chunk arrives.  Without this,
+                # asyncio keeps executing chat_stream in a tight loop (every
+                # await resolves immediately — queue.put never blocks) and
+                # the renderer task starves, producing "pseudo-streaming"
+                # where content arrives in large bursts.
+                if c or r or tc_list:
+                    await asyncio.sleep(0)
+
             llm_response = self._parse_chunks(chunks)
             llm_response.latency_s = time.time() - start
             return llm_response

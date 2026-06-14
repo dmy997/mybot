@@ -79,6 +79,41 @@ _SSRF_BLOCKED_CIDRS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
     ipaddress.ip_network("fc00::/7"),
 ]
 
+def _strip_quoted_heredocs(command: str) -> str:
+    """Remove bodies of quoted heredocs from *command*.
+
+    A heredoc with a quoted delimiter (``<< 'EOF'`` or ``<< "EOF"``)
+    disables **all** shell expansion — no parameter substitution, no
+    command substitution, no backtick evaluation.  The body is literal
+    text, so it cannot carry an injection payload.  We replace it with
+    a placeholder so downstream injection regexes don't produce false
+    positives on harmless content like Markdown backticks.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(command):
+        m = re.search(r"<<-?\s*(['\"])(\w+)\1", command[i:])
+        if not m:
+            result.append(command[i:])
+            break
+        result.append(command[i:i + m.start()])
+        result.append(m.group(0))
+        delimiter = m.group(2)
+        i = i + m.end()
+        remaining = command[i:]
+        end_pat = re.compile(
+            rf"^[ \t]*{re.escape(delimiter)}\s*$", re.MULTILINE,
+        )
+        end_m = end_pat.search(remaining)
+        if end_m:
+            result.append(" [quoted heredoc body omitted] ")
+            i = i + end_m.end()
+        else:
+            result.append(remaining)
+            break
+    return "".join(result)
+
+
 # Complements the patterns already in BashTool._DANGEROUS_PATTERNS
 _EXTRA_INJECTION_PATTERNS: list[str] = [
     r"\$\(.*\)",               # $() command substitution
@@ -231,6 +266,10 @@ class ToolGuard:
         command = arguments.get("command", "")
         if not command or not isinstance(command, str):
             return None
+
+        # Quoted heredocs disable shell expansion — strip their bodies
+        # before checking so Markdown backticks etc. don't false-positive.
+        command = _strip_quoted_heredocs(command)
 
         for pattern in _EXTRA_INJECTION_PATTERNS:
             if re.search(pattern, command, re.IGNORECASE):

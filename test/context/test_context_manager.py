@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from context.compaction import CompactionService
 from context.context_manager import (
     _INTERRUPT_MESSAGE,
     _INTERRUPT_TOOL_RESULT,
@@ -233,7 +234,7 @@ class TestSessionLifecycle:
         session.messages = [{"role": "user", "content": "old"}]
         ctx.session.save_session(session)
 
-        ctx.save_exchange("se1", "new q", [
+        await ctx.save_exchange("se1", "new q", [
             {"role": "assistant", "content": "new a"},
         ])
         session_after = ctx.session.get_session("se1")
@@ -247,18 +248,18 @@ class TestSessionLifecycle:
         session.consolidated_cursor = 1
         ctx.session.save_session(session)
 
-        ctx.save_exchange("se2", "q2", [
+        await ctx.save_exchange("se2", "q2", [
             {"role": "assistant", "content": "a2"},
         ])
         session_after = ctx.session.get_session("se2")
         assert session_after.consolidated_cursor == 1
 
     async def test_delete_session(self, ctx):
-        ctx.save_exchange("del", "hi", [{"role": "assistant", "content": "hey"}])
+        await ctx.save_exchange("del", "hi", [{"role": "assistant", "content": "hey"}])
         assert ctx.delete_session("del") is True
 
     async def test_list_sessions(self, ctx):
-        ctx.save_exchange("lst", "hi", [{"role": "assistant", "content": "hey"}])
+        await ctx.save_exchange("lst", "hi", [{"role": "assistant", "content": "hey"}])
         sessions = ctx.list_sessions()
         assert any(s["key"] == "lst" for s in sessions)
 
@@ -477,15 +478,17 @@ class TestAdjustSplit:
 
 
 class TestDehydrate:
+    """Tests for CompactionService._dehydrate_messages (moved from ContextManager)."""
+
     def test_strips_data_uris(self):
         msgs = [{"role": "user", "content": "Look: data:image/png;base64,iVBORw0KGgoAAAANS"}]
-        dehydrated = ContextManager._dehydrate_messages(msgs)
+        dehydrated = CompactionService._dehydrate_messages_static(msgs)
         assert "data:image/png;base64" not in str(dehydrated[0]["content"])
         assert "binary data removed" in str(dehydrated[0]["content"])
 
     def test_truncates_long_content(self):
         msgs = [{"role": "user", "content": "x" * 5000}]
-        dehydrated = ContextManager._dehydrate_messages(msgs)
+        dehydrated = CompactionService._dehydrate_messages_static(msgs)
         content = dehydrated[0]["content"]
         assert len(content) < 4000  # 3000 + some overhead
         assert "truncated" in content
@@ -499,7 +502,7 @@ class TestDehydrate:
                 "function": {"name": "write_file", "arguments": '{"path":"/x","content":"' + "x" * 5000 + '}"'},
             }],
         }]
-        dehydrated = ContextManager._dehydrate_messages(msgs)
+        dehydrated = CompactionService._dehydrate_messages_static(msgs)
         tc = dehydrated[0]["tool_calls"][0]
         # Arguments replaced with placeholder
         assert tc["function"]["arguments"] == "{...}"
@@ -575,7 +578,7 @@ class TestMemoryDelegation:
 
     async def test_save_exchange_only_writes_to_session(self, ctx):
         """save_exchange appends to session.messages, NOT to memory history."""
-        ctx.save_exchange("mem-sess", "hello world", [
+        await ctx.save_exchange("mem-sess", "hello world", [
             {"role": "assistant", "content": "hi there"},
         ])
         # Session should have the exchange
@@ -657,15 +660,22 @@ class TestRepair:
         assert fixed_count == 0
         assert repaired == []
 
-    async def test_repair_session_integration(self, ctx):
-        """_repair_session saves repaired messages back."""
-        session = ctx.session.get_session("repair-int")
+    async def test_repair_messages_non_destructive(self, ctx):
+        """_repair_messages fixes unmatched pairs without modifying stored session."""
+        session = ctx.session.get_session("repair-nd")
         session.messages = [
             {"role": "user", "content": "unfinished"},
         ]
         ctx.session.save_session(session)
 
-        ctx._repair_session("repair-int")
-        session_after = ctx.session.get_session("repair-int")
-        assert len(session_after.messages) == 2
-        assert session_after.messages[-1]["role"] == "assistant"
+        # Repair is a pure transform — stored session is NOT modified
+        repaired, fixed = ContextManager._repair_messages(
+            ctx.session.get_session("repair-nd").messages,
+        )
+        assert fixed == 1
+        assert len(repaired) == 2
+        assert repaired[-1]["role"] == "assistant"
+
+        # Stored session is unchanged
+        session = ctx.session.get_session("repair-nd")
+        assert len(session.messages) == 1

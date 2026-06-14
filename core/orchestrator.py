@@ -298,7 +298,8 @@ class Orchestrator:
                         "role": "system",
                         "content": "[Session interrupted by user]",
                     })
-                    self.ctx.session.set_messages(session_key, partial)
+                    async with self.ctx.session.lock_session(session_key):
+                        self.ctx.session.set_messages(session_key, partial)
                     raise
                 except KeyboardInterrupt:
                     logger.warning("Session {!r} interrupted by user", session_key)
@@ -307,7 +308,8 @@ class Orchestrator:
                         "role": "system",
                         "content": "[Session interrupted by user]",
                     })
-                    self.ctx.session.set_messages(session_key, partial)
+                    async with self.ctx.session.lock_session(session_key):
+                        self.ctx.session.set_messages(session_key, partial)
                     raise
 
                 if on_thinking_done:
@@ -319,7 +321,7 @@ class Orchestrator:
 
                 # 6. Save session — append only the new exchange
                 assistant_msgs = output.messages[len(messages):]
-                self.ctx.save_exchange(session_key, user_input, assistant_msgs)
+                await self.ctx.save_exchange(session_key, user_input, assistant_msgs)
 
                 return OrchestratorResult(
                     content=output.content,
@@ -486,10 +488,12 @@ class Orchestrator:
     def register_tool(self, tool: Tool) -> None:
         """Register a tool for agent use."""
         self._tools.register(tool)
+        self.ctx._invalidate_static()
 
     def unregister_tool(self, name: str) -> None:
         """Remove a previously registered tool."""
         self._tools.unregister(name)
+        self.ctx._invalidate_static()
 
     @property
     def dispatcher(self) -> Dispatcher:
@@ -511,8 +515,10 @@ def main() -> None:
     import os
     import select
     import sys
-    import uuid
+    import time
     from contextlib import suppress
+    from datetime import datetime
+    from typing import Any
 
     from prompt_toolkit import PromptSession
     from prompt_toolkit.formatted_text import HTML
@@ -520,10 +526,12 @@ def main() -> None:
     from prompt_toolkit.patch_stdout import patch_stdout
 
     from config import Config
-    from core.message_bus import InboundMessage, MessageBus
     from observability.display import (
         console,
         print_error,
+        print_tool_progress_end,
+        print_tool_progress_start,
+        render_content,
         show_banner,
         show_history,
         show_llm_usage,
@@ -532,6 +540,8 @@ def main() -> None:
     from observability.stream_renderer import StreamRenderer
     from providers.openai_compatible_provider import OpenAICompatibleProvider
 
+    # -- CLI flags -----------------------------------------------------------
+    do_continue = "-c" in sys.argv or "--continue" in sys.argv
     console_level = "DEBUG" if "--debug" in sys.argv else "WARNING"
 
     provider = OpenAICompatibleProvider(
@@ -548,10 +558,26 @@ def main() -> None:
         log_config=LogConfig(level=console_level),
     )
 
-    bus_msg = MessageBus()
+    # -- session key ---------------------------------------------------------
+    last_session_file = orche.workspace / ".last_session"
+
+    if do_continue:
+        if last_session_file.exists():
+            session_key = last_session_file.read_text(encoding="utf-8").strip()
+            if not session_key or not orche.ctx.session.get_session(session_key).messages:
+                print("No previous session found or session is empty. Starting a new one.")
+                session_key = datetime.now().strftime("%Y%m%d-%H%M%S")
+        else:
+            print("No previous session found. Starting a new one.")
+            session_key = datetime.now().strftime("%Y%m%d-%H%M%S")
+    else:
+        session_key = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # Persist session key for future --continue
+    last_session_file.parent.mkdir(parents=True, exist_ok=True)
+    last_session_file.write_text(session_key, encoding="utf-8")
 
     # -- startup banner -------------------------------------------------------
-    session_key = "default"
     session = orche.ctx.session.get_session(session_key)
     model = Config.default_model
     show_banner(
@@ -559,6 +585,7 @@ def main() -> None:
         model=model or "(provider default)",
         msg_count=len(session.messages),
         agents=list(orche.dispatcher.agents.keys()),
+        resumed=do_continue and bool(session.messages),
     )
 
     # -- prompt_toolkit session -----------------------------------------------
@@ -566,9 +593,7 @@ def main() -> None:
 
     def _init_prompt_session() -> None:
         nonlocal _prompt_session
-        history_file = (
-            orche.workspace / ".cli_history"
-        )
+        history_file = orche.workspace / ".cli_history"
         history_file.parent.mkdir(parents=True, exist_ok=True)
         _prompt_session = PromptSession(
             history=FileHistory(str(history_file)),
@@ -608,93 +633,18 @@ def main() -> None:
         except EOFError:
             raise KeyboardInterrupt from None
 
-    # -- synchronization ------------------------------------------------------
     _last_paradigm: str = "react"
-    _processing_done = asyncio.Event()
-    _processing_done.set()
-
-    # -- CLI consumer ---------------------------------------------------------
-
-    async def _consume_outbound(renderer: StreamRenderer) -> None:
-        """Read outbound messages and route to StreamRenderer."""
-        while True:
-            raw = await bus_msg.outbound.get()
-            if raw is None:
-                break
-            out: OutboundMessage = raw
-
-            if out.msg_type == "thinking":
-                pass  # chain-of-thought reasoning, not for display
-
-            elif out.msg_type == "thinking_done":
-                pass
-
-            elif out.msg_type == "delta":
-                await renderer.on_delta(out.data)
-
-            elif out.msg_type == "tool_start":
-                with renderer.pause_spinner():
-                    renderer.ensure_header()
-                    renderer.console.print(
-                        f"  [dim cyan][tool:{out.data}][/dim cyan]",
-                        highlight=False,
-                    )
-
-            elif out.msg_type == "tool_exec_start":
-                d = out.data
-                with renderer.pause_spinner():
-                    renderer.ensure_header()
-                    from observability.display import print_tool_progress_start
-                    print_tool_progress_start(
-                        d["name"], d.get("args", {}),
-                        d.get("index", 1), d.get("total", 1),
-                    )
-
-            elif out.msg_type == "tool_exec_end":
-                with renderer.pause_spinner():
-                    renderer.ensure_header()
-                    from observability.display import print_tool_progress_end
-                    print_tool_progress_end(out.data)
-
-            elif out.msg_type == "tool_end":
-                pass  # already shown inline via tool_exec_start/end
-
-            elif out.msg_type == "final":
-                data = out.data or {}
-                content = data.get("content", "")
-                if renderer.streamed:
-                    await renderer.on_end()
-                else:
-                    # No streaming deltas — print content directly
-                    await renderer.close()
-                    if content:
-                        print()
-                        from observability.display import render_content
-                        render_content(content)
-                print()
-                show_llm_usage(data.get("usage", {}), data.get("elapsed_ms", 0), 0)
-                if data.get("paradigm"):
-                    _last_paradigm = data["paradigm"]
-                _processing_done.set()
-
-            elif out.msg_type == "error":
-                await renderer.close()
-                print()
-                print_error(out.data)
-                print()
-                _processing_done.set()
 
     # -- interactive loop -----------------------------------------------------
 
     async def _run() -> None:
-        nonlocal _prompt_session
+        nonlocal _prompt_session, _last_paradigm
 
         _init_prompt_session()
         await orche.start_mcp()
-        serve_task = asyncio.create_task(orche.serve(bus_msg, session_key))
+        await bus.publish(SessionCreated(session_key=session_key))
 
         renderer: StreamRenderer | None = None
-        consumer_task: asyncio.Task[None] | None = None
 
         try:
             while True:
@@ -738,37 +688,93 @@ def main() -> None:
                         show_sessions(orche.sessions)
                         continue
 
-                _processing_done.clear()
-                if consumer_task:
-                    consumer_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await consumer_task
-
                 renderer = StreamRenderer(bot_name="mybot")
-                consumer_task = asyncio.create_task(_consume_outbound(renderer))
 
-                await bus_msg.inbound(session_key).put(InboundMessage(
-                    session_key=session_key,
-                    content=user_input,
-                    source="cli",
-                    correlation_id=uuid.uuid4().hex,
-                ))
+                # Direct callbacks — bypass MessageBus queue so deltas are
+                # rendered synchronously in the chat_stream task without
+                # inter-task scheduling latency.  Every other path (HTTP/WS
+                # server) still uses the MessageBus; only CLI takes this
+                # fast path.
+                async def _on_delta(token: str) -> None:
+                    await renderer.on_delta(token)
 
-                await _processing_done.wait()
+                async def _on_thinking(token: str) -> None:
+                    pass  # spinner already visible
+
+                async def _on_thinking_done() -> None:
+                    pass
+
+                async def _on_tool_start(name: str) -> None:
+                    with renderer.pause_spinner():
+                        renderer.ensure_header()
+                        renderer.console.print(
+                            f"  [dim cyan][tool:{name}][/dim cyan]",
+                            highlight=False,
+                        )
+
+                async def _on_tool_exec_start(
+                    name: str, args: dict[str, Any], idx: int, total: int,
+                ) -> None:
+                    with renderer.pause_spinner():
+                        renderer.ensure_header()
+                        print_tool_progress_start(
+                            name, args, idx, total, _console=renderer.console,
+                        )
+
+                async def _on_tool_exec_end(ev: dict[str, Any]) -> None:
+                    with renderer.pause_spinner():
+                        renderer.ensure_header()
+                        print_tool_progress_end(ev, _console=renderer.console)
+
+                t_start = time.monotonic()
+                try:
+                    result = await orche.process_message(
+                        session_key=session_key,
+                        user_input=user_input,
+                        on_delta=_on_delta,
+                        on_thinking=_on_thinking,
+                        on_thinking_done=_on_thinking_done,
+                        on_tool_start=_on_tool_start,
+                        on_tool_execute_start=_on_tool_exec_start,
+                        on_tool_execute_end=_on_tool_exec_end,
+                    )
+                except Exception as exc:
+                    await renderer.close()
+                    renderer = None
+                    print()
+                    print_error(str(exc))
+                    print()
+                    continue
+
+                # Final render
+                if renderer.streamed:
+                    await renderer.on_end()
+                else:
+                    await renderer.close()
+                    if result.content:
+                        print()
+                        render_content(result.content)
+
+                if result.error:
+                    print()
+                    print_error(result.error)
+                    if result.stop_reason:
+                        console.print(f"(stop_reason: {result.stop_reason})", style="dim")
+
+                print()
+                show_llm_usage(
+                    result.usage,
+                    (time.monotonic() - t_start) * 1000,
+                    0,
+                )
+                if result.paradigm:
+                    _last_paradigm = result.paradigm
 
         except KeyboardInterrupt:
             print("\nInterrupted.")
         finally:
-            if consumer_task:
-                consumer_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await consumer_task
             if renderer:
                 await renderer.close()
-            await bus_msg.inbound(session_key).put(None)
-            serve_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await serve_task
             await orche.stop_mcp()
 
     try:

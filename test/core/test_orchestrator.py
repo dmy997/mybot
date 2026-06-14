@@ -357,8 +357,8 @@ class TestDelegation:
     def test_sessions(self, orchestrator):
         assert orchestrator.sessions == []
 
-    def test_delete_session(self, orchestrator):
-        orchestrator.context.save_session("del1", [{"role": "user", "content": "x"}])
+    async def test_delete_session(self, orchestrator):
+        await orchestrator.context.save_session("del1", [{"role": "user", "content": "x"}])
         assert orchestrator.delete_session("del1") is True
 
     def test_remember_and_recall(self, orchestrator):

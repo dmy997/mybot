@@ -8,6 +8,8 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -82,15 +84,15 @@ class AgentOutput:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MAX_ITERATIONS = 20
-_DEFAULT_MAX_TOOL_RESULT_CHARS = 16_000
+_DEFAULT_MAX_TOOL_RESULT_CHARS = 6_000
 _STALL_WARNING_STEPS = 50
 
-# Compaction (lightweight context management during agent execution)
-_RUNNER_MAX_CONTEXT_TOKENS = 128_000
-_COMPACT_TRIGGER_RATIO = 0.8
-_TOOL_SUMMARY_MAX_CHARS = 200
-_RECENT_TOOL_TURNS = 2
-_TOOL_RESULT_MAX_CHARS = 3000
+# Lightweight compaction (fallback when CompactionService is not injected)
+_LW_COMPACT_MAX_TOKENS = 128_000
+_LW_COMPACT_TRIGGER_RATIO = 0.8
+_LW_COMPACT_KEEP_TURNS = 2
+_LW_COMPACT_SUMMARY_CHARS = 200
+_LW_COMPACT_MAX_RESULT_CHARS = 3000
 
 
 def _summarize_args(args: dict[str, Any] | None, max_chars: int = 120) -> str:
@@ -101,6 +103,57 @@ def _summarize_args(args: dict[str, Any] | None, max_chars: int = 120) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars - 3] + "..."
+
+
+def _dump_llm_messages(
+    messages: list[dict[str, Any]],
+    *,
+    session_key: str,
+    step_count: int,
+    model: str,
+    tools_count: int,
+) -> None:
+    """Write the full LLM context window to disk when ``DUMP_LLM_MESSAGES`` is set.
+
+    Output path: ``{workspace}/debug/{session_key}__step{step_count:03d}__{ts}.json``
+    """
+    if not os.environ.get("DUMP_LLM_MESSAGES"):
+        return
+
+    workspace = os.environ.get("WORKSPACE", os.path.expanduser("~/.mybot/workspace"))
+    debug_dir = Path(workspace) / "debug"
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.opt(exception=True).warning("Cannot create debug dir {!s}", debug_dir)
+        return
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    filename = f"{session_key or 'default'}__step{step_count:03d}__{ts}.json"
+    filepath = debug_dir / filename
+
+    payload = {
+        "timestamp": ts,
+        "session_key": session_key,
+        "step": step_count,
+        "model": model,
+        "messages_count": len(messages),
+        "tools_count": tools_count,
+        "estimated_tokens": _estimate_message_tokens(messages),
+        "messages": messages,
+    }
+
+    try:
+        filepath.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        logger.info(
+            "Dumped LLM messages to {!s} ({:,} tokens est.)",
+            filepath, payload["estimated_tokens"],
+        )
+    except (OSError, TypeError, ValueError):
+        logger.opt(exception=True).warning("Failed to dump LLM messages to {!s}", filepath)
 
 
 class AgentCore:
@@ -118,13 +171,15 @@ class AgentCore:
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
         max_tool_result_chars: int = _DEFAULT_MAX_TOOL_RESULT_CHARS,
         middleware: MiddlewareChain | None = None,
-        max_context_tokens: int = _RUNNER_MAX_CONTEXT_TOKENS,
+        max_context_tokens: int = _LW_COMPACT_MAX_TOKENS,
+        compaction: Any | None = None,
     ) -> None:
         self.provider = provider
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
         self.middleware = middleware
         self.max_context_tokens = max_context_tokens
+        self.compaction = compaction  # optional CompactionService from context module
 
     # -- public entry point ----------------------------------------------------
 
@@ -201,8 +256,8 @@ class AgentCore:
                         ))
                         return output
 
-                # Compact context before LLM call (operates on a copy)
-                compacted = self._maybe_compact(messages, tool_defs)
+                # Compact context before LLM call (via CompactionService or lightweight fallback)
+                compacted = self._compact_for_llm(messages, tool_defs)
 
                 # LLM call (wrapped by middleware when present)
                 if mw:
@@ -213,13 +268,13 @@ class AgentCore:
                     ctx.tool_defs = tool_defs
 
                     async def _llm_handler(c: MiddlewareContext) -> LLMResponse:
-                        resp = await self._call_llm(spec, c.messages, c.tool_defs)
+                        resp = await self._call_llm(spec, c.messages, c.tool_defs, step_count=step_count)
                         c.llm_response = resp
                         return resp
 
                     response = await mw.run_llm_call(ctx, _llm_handler)
                 else:
-                    response = await self._call_llm(spec, compacted, tool_defs)
+                    response = await self._call_llm(spec, compacted, tool_defs, step_count=step_count)
 
                 # Accumulate token usage across all turns
                 for k, v in response.usage.items():
@@ -337,67 +392,59 @@ class AgentCore:
         messages.append({"role": "user", "content": f"[Goal]\n{goal}"})
         return messages
 
-    # -- compaction (lightweight context management on copies) -----------------
+    # -- compaction (delegated to CompactionService or lightweight fallback) ----
 
-    @staticmethod
-    def _remove_orphan_tool_results(
+    def _compact_for_llm(
+        self,
         messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Step 1: Remove tool results whose tool_call_id has no matching assistant tool_call."""
-        valid_ids: set[str] = set()
-        for msg in messages:
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    if isinstance(tc, dict) and "id" in tc:
-                        valid_ids.add(tc["id"])
-        return [
-            m for m in messages
-            if m.get("role") != "tool" or m.get("tool_call_id") in valid_ids
-        ]
+        """Compact messages before an LLM call.
 
-    @staticmethod
-    def _fill_missing_tool_results(
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Step 2: Insert placeholder for tool calls that have no result."""
-        tool_result_ids: set[str] = set()
-        for msg in messages:
-            if msg.get("role") == "tool":
-                tool_result_ids.add(msg.get("tool_call_id", ""))
-
-        result: list[dict[str, Any]] = []
-        for msg in messages:
-            result.append(msg)
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    tc_id = tc.get("id") if isinstance(tc, dict) else ""
-                    if tc_id and tc_id not in tool_result_ids:
-                        result.append({
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": "[Tool result unavailable — compacted]",
-                        })
-                        tool_result_ids.add(tc_id)
-        return result
-
-    @staticmethod
-    def _summarize_old_tool_results(
-        messages: list[dict[str, Any]],
-        recent_turns: int = _RECENT_TOOL_TURNS,
-    ) -> list[dict[str, Any]]:
-        """Step 3: Compress old tool results to one-line summaries.
-
-        Tool-calling turns are counted by assistant messages with tool_calls.
-        Results from the last *recent_turns* are kept intact; older ones are
-        replaced with ``[Compacted] {prefix}...``.
+        When a :class:`CompactionService` is injected, delegates to its
+        ``micro_compact`` (Layer 1 — rule-based, no LLM).  Otherwise falls
+        back to a lightweight 3-step summary compaction.
         """
+        # Use injected service when available
+        if self.compaction is not None:
+            return self.compaction.micro_compact(
+                messages,
+                keep_recent_turns=_LW_COMPACT_KEEP_TURNS,
+            )
+
+        # Lightweight fallback
+        return self._lightweight_compact(messages)
+
+    @staticmethod
+    def _lightweight_compact(
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int = _LW_COMPACT_MAX_TOKENS,
+        trigger_ratio: float = _LW_COMPACT_TRIGGER_RATIO,
+        keep_turns: int = _LW_COMPACT_KEEP_TURNS,
+        summary_chars: int = _LW_COMPACT_SUMMARY_CHARS,
+        max_result_chars: int = _LW_COMPACT_MAX_RESULT_CHARS,
+    ) -> list[dict[str, Any]]:
+        """Lightweight 3-step compaction — fallback when no CompactionService.
+
+        Returns a **new list** (original is never modified).
+
+        1. Summarise tool results older than *keep_turns* turns
+        2. Remove orphan tool results (no matching tool_call)
+        3. Fill missing tool results (tool_call with no result)
+        """
+        threshold = int(max_tokens * trigger_ratio)
+        if _estimate_message_tokens(messages) <= threshold:
+            return messages  # under budget: return original (not a copy)
+
+        # Step 1: Summarise old tool results
         total_turns = sum(
             1 for m in messages
             if m.get("role") == "assistant" and m.get("tool_calls")
         )
-        cutoff = max(0, total_turns - recent_turns)
+        cutoff = max(0, total_turns - keep_turns)
 
-        result: list[dict[str, Any]] = []
+        cleaned: list[dict[str, Any]] = []
         turn = 0
         for msg in messages:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
@@ -405,121 +452,68 @@ class AgentCore:
 
             if msg.get("role") == "tool" and turn <= cutoff:
                 content = msg.get("content", "")
-                if isinstance(content, str) and not content.startswith("[Compacted]"):
-                    summary = content[:_TOOL_SUMMARY_MAX_CHARS].replace("\n", " ")
-                    suffix = "..." if len(content) > _TOOL_SUMMARY_MAX_CHARS else ""
-                    result.append({
-                        **msg,
-                        "content": f"[Compacted] {summary}{suffix}",
-                    })
+                if isinstance(content, str):
+                    if not content.startswith("[Compacted]"):
+                        summary = content[:summary_chars].replace("\n", " ")
+                        suffix = "..." if len(content) > summary_chars else ""
+                        cleaned.append({
+                            **msg,
+                            "content": f"[Compacted] {summary}{suffix}",
+                        })
+                    else:
+                        cleaned.append(msg)
                 else:
-                    result.append(msg)
-            else:
-                result.append(msg)
-        return result
-
-    @staticmethod
-    def _truncate_long_tool_results(
-        messages: list[dict[str, Any]],
-        max_chars: int = _TOOL_RESULT_MAX_CHARS,
-    ) -> list[dict[str, Any]]:
-        """Step 4: Hard-truncate tool results that exceed *max_chars*.
-
-        Only applies to non-current-turn results (last assistant with
-        tool_calls marks the current turn).
-        """
-        # Find the last assistant-with-tool_calls index
-        last_tool_call_idx = -1
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                last_tool_call_idx = i
-
-        result: list[dict[str, Any]] = []
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "tool" and i < last_tool_call_idx:
+                    cleaned.append(msg)
+            elif msg.get("role") == "tool":
+                # Recent turn — hard-truncate if oversized
                 content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > max_chars:
-                    result.append({
+                if isinstance(content, str) and len(content) > max_result_chars:
+                    cleaned.append({
                         **msg,
-                        "content": content[:max_chars] + "\n... (truncated)",
+                        "content": content[:max_result_chars] + "\n... (truncated)",
                     })
                 else:
-                    result.append(msg)
+                    cleaned.append(msg)
             else:
-                result.append(msg)
-        return result
+                cleaned.append(msg)
 
-    @staticmethod
-    def _truncate_by_token_budget(
-        messages: list[dict[str, Any]],
-        max_tokens: int,
-        tool_defs: list[dict[str, Any]] | None,
-    ) -> list[dict[str, Any]]:
-        """Step 5: Drop oldest non-system messages until within token budget."""
-        reserve = 4096  # output + tool definition overhead
-        if tool_defs:
-            reserve += _estimate_message_tokens(
-                [{"role": "system", "content": str(tool_defs)}]
-            )
-        budget = max_tokens - reserve
+        # Step 2: Remove orphan tool results
+        valid_ids: set[str] = set()
+        for msg in cleaned:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and "id" in tc:
+                        valid_ids.add(tc["id"])
+        cleaned = [
+            m for m in cleaned
+            if m.get("role") != "tool" or m.get("tool_call_id") in valid_ids
+        ]
 
-        if _estimate_message_tokens(messages) <= budget:
-            return list(messages)
+        # Step 3: Fill missing tool results
+        result_ids: set[str] = set()
+        for msg in cleaned:
+            if msg.get("role") == "tool":
+                result_ids.add(msg.get("tool_call_id", ""))
 
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        other_msgs = [m for m in messages if m.get("role") != "system"]
+        final: list[dict[str, Any]] = []
+        for msg in cleaned:
+            final.append(msg)
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    tc_id = tc.get("id") if isinstance(tc, dict) else ""
+                    if tc_id and tc_id not in result_ids:
+                        final.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": "[Tool result unavailable — compacted]",
+                        })
+                        result_ids.add(tc_id)
 
-        while (
-            _estimate_message_tokens(system_msgs + other_msgs) > budget
-            and len(other_msgs) > 1
-        ):
-            other_msgs.pop(0)
-
-        return system_msgs + other_msgs
-
-    def _compact_context(
-        self,
-        messages: list[dict[str, Any]],
-        tool_defs: list[dict[str, Any]] | None,
-        max_tokens: int,
-    ) -> list[dict[str, Any]]:
-        """Run the full 7-step compaction pipeline on a copy.
-
-        The original *messages* list is never modified.
-        """
-        cleaned = list(messages)
-
-        # Step 1-2: Structural repair
-        cleaned = self._remove_orphan_tool_results(cleaned)
-        cleaned = self._fill_missing_tool_results(cleaned)
-
-        # Step 3-4: Content reduction (old tool results)
-        cleaned = self._summarize_old_tool_results(cleaned)
-        cleaned = self._truncate_long_tool_results(cleaned)
-
-        # Step 5: Token budget enforcement
-        cleaned = self._truncate_by_token_budget(cleaned, max_tokens, tool_defs)
-
-        # Step 6-7: Post-truncation repair
-        cleaned = self._remove_orphan_tool_results(cleaned)
-        cleaned = self._fill_missing_tool_results(cleaned)
-
-        return cleaned
-
-    def _maybe_compact(
-        self,
-        messages: list[dict[str, Any]],
-        tool_defs: list[dict[str, Any]] | None,
-    ) -> list[dict[str, Any]]:
-        """Return compacted copy if token budget is tight, else original."""
-        threshold = int(self.max_context_tokens * _COMPACT_TRIGGER_RATIO)
-        if _estimate_message_tokens(messages) <= threshold:
-            return messages
         logger.debug(
-            "Compacting context: {} tokens exceeds threshold {}",
-            _estimate_message_tokens(messages), threshold,
+            "Lightweight compaction: {} messages → {} messages",
+            len(messages), len(final),
         )
-        return self._compact_context(messages, tool_defs, self.max_context_tokens)
+        return final
 
     async def _call_llm(
         self,
@@ -528,6 +522,7 @@ class AgentCore:
         tool_defs: list[dict[str, Any]] | None,
         *,
         recovery_attempt: bool = False,
+        step_count: int = 0,
     ) -> LLMResponse:
         """Forward parameters to the provider, using retry-aware calls.
 
@@ -537,6 +532,15 @@ class AgentCore:
         """
         t_start = time.monotonic()
         model = spec.model or getattr(self.provider, "default_model", "unknown")
+
+        # Debug: write full context window to disk when DUMP_LLM_MESSAGES is set
+        _dump_llm_messages(
+            messages,
+            session_key=spec.session_key or "",
+            step_count=step_count,
+            model=model,
+            tools_count=len(tool_defs or []),
+        )
 
         with tracer.span("llm.chat", model=model, messages_count=len(messages),
                          tools_count=len(tool_defs or [])):
@@ -601,7 +605,7 @@ class AgentCore:
                         exc.info.error_type, exc.info.message,
                     )
                     return self._error_response(exc.info)
-                return await self._recover_and_retry(spec, messages, tool_defs, exc.info)
+                return await self._recover_and_retry(spec, messages, tool_defs, exc.info, step_count=step_count)
 
             except RetryableLLMError as exc:
                 logger.error("LLM call failed after all retries: {}", exc.info.message)
@@ -649,16 +653,18 @@ class AgentCore:
         messages: list[dict[str, Any]],
         tool_defs: list[dict[str, Any]] | None,
         info: Any,  # LLMErrorInfo
+        *,
+        step_count: int = 0,
     ) -> LLMResponse:
         """Attempt to mitigate a recoverable error and retry once."""
         error_type = info.error_type or "unknown"
         logger.info("Attempting recovery for error_type={!r}", error_type)
 
         if error_type == "context_length":
-            return await self._recover_context_length(spec, messages, tool_defs, info)
+            return await self._recover_context_length(spec, messages, tool_defs, info, step_count=step_count)
 
         if error_type == "content_filter":
-            return await self._recover_content_filter(spec, messages, tool_defs, info)
+            return await self._recover_content_filter(spec, messages, tool_defs, info, step_count=step_count)
 
         # Unknown recoverable type — treat as fatal
         return self._error_response(info)
@@ -669,17 +675,19 @@ class AgentCore:
         messages: list[dict[str, Any]],
         tool_defs: list[dict[str, Any]] | None,
         info: Any,
+        *,
+        step_count: int = 0,
     ) -> LLMResponse:
         """Compact context and retry; fall back to dropping if still too long."""
         # 1st attempt: compact with a tighter budget
         reduced_budget = int(self.max_context_tokens * 0.6)
-        compacted = self._compact_context(messages, tool_defs, reduced_budget)
-        if len(compacted) < len(messages):
+        compacted = self._lightweight_compact(messages, max_tokens=reduced_budget)
+        if _estimate_message_tokens(compacted) < _estimate_message_tokens(messages):
             logger.warning(
-                "Context-length recovery: {} messages → {} messages (compacted)",
-                len(messages), len(compacted),
+                "Context-length recovery: {} tokens → {} tokens (compacted)",
+                _estimate_message_tokens(messages), _estimate_message_tokens(compacted),
             )
-            return await self._call_llm(spec, compacted, tool_defs, recovery_attempt=True)
+            return await self._call_llm(spec, compacted, tool_defs, recovery_attempt=True, step_count=step_count)
 
         # 2nd attempt: drop oldest non-system messages
         system_msgs = [m for m in messages if m.get("role") == "system"]
@@ -695,7 +703,7 @@ class AgentCore:
             "Context-length recovery (fallback): {} messages → {} messages",
             len(messages), len(trimmed),
         )
-        return await self._call_llm(spec, trimmed, tool_defs, recovery_attempt=True)
+        return await self._call_llm(spec, trimmed, tool_defs, recovery_attempt=True, step_count=step_count)
 
     async def _recover_content_filter(
         self,
@@ -703,6 +711,8 @@ class AgentCore:
         messages: list[dict[str, Any]],
         tool_defs: list[dict[str, Any]] | None,
         info: Any,
+        *,
+        step_count: int = 0,
     ) -> LLMResponse:
         """Append a safety-compliance hint to the system prompt and retry."""
         hint = "请确保所有回复内容安全合规，避免任何违反内容政策的表述。"
@@ -718,7 +728,7 @@ class AgentCore:
             modified.insert(0, {"role": "system", "content": hint})
 
         logger.info("Content-filter recovery: appended compliance hint")
-        return await self._call_llm(spec, modified, tool_defs, recovery_attempt=True)
+        return await self._call_llm(spec, modified, tool_defs, recovery_attempt=True, step_count=step_count)
 
     # -- helpers ---------------------------------------------------------------
 
