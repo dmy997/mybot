@@ -4,7 +4,7 @@
 [![Tests](https://img.shields.io/badge/tests-711%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-A personal AI assistant framework inspired by **Claude Code**, **nanobot**, and **OpenClaw**. Designed for extensibility and observability — supports multiple provider backends, paradigm-style agent orchestration, long-term file-based memory, streaming with tool-use visualization, and OpenTelemetry-based trace export to Jaeger.
+A personal AI assistant framework inspired by **Claude Code**, **nanobot**, and **OpenClaw**. Highly readable, modular, and lightweight.
 
 **English** | [中文](./README_zh.md)
 
@@ -21,23 +21,6 @@ A personal AI assistant framework inspired by **Claude Code**, **nanobot**, and 
 - **13 built-in skills** — docx, pptx, pdf, xlsx, canvas-design, frontend-design, algorithmic-art, brand-guidelines, internal-comms, mcp-builder, skill-creator, slack-gif-creator, theme-factory, web-artifacts-builder, webapp-testing
 
 ## Architecture
-
-```
-mybot/
-  config/             # .env auto-loading, typed Config
-  core/               # Orchestrator, Dispatcher, AgentCore, Middleware, EventBus, MessageBus, Server
-  agents/             # Paradigm agents (ReAct, PlanSolve) — auto-discovered
-  context/            # ContextManager — session persistence, compression, repair
-  providers/          # LLMProvider abstraction + OpenAI-compatible implementation
-  tools/              # 10 tools (bash, file R/W, grep, webfetch, websearch, memory, subagent)
-  memory/             # Long-term file-based memory (store–manager–service)
-  observability/      # Logging (loguru), metrics (Counter/Gauge/Histogram), tracing, OTel bridge
-  skills/             # 13 built-in skills
-  utils/              # Jinja2 template rendering
-  prompt_templates/   # 14 agent prompt templates
-  server_web/         # Web chat UI
-  test/               # 711 tests
-```
 
 ### Request Flow
 
@@ -193,6 +176,7 @@ ruff check .                               # lint
 pytest                                     # all 711 tests
 pytest test/core/test_middleware.py -v     # single file
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
+bash scripts/loc.sh                        # line count by module 
 ```
 
 ## Roadmap

@@ -4,7 +4,7 @@
 [![Tests](https://img.shields.io/badge/tests-711%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-受 **Claude Code**、**nanobot**、**OpenClaw** 启发的个人 AI 助手框架。围绕可扩展性与可观测性设计——支持多种 LLM 后端、范式化 Agent 编排、基于文件的长期记忆、带工具调用可视化的流式输出，以及基于 OpenTelemetry 的 trace 导出到 Jaeger。
+受 **Claude Code**、**nanobot**、**OpenClaw** 启发的个人 AI 助手框架。可读性强，高度模块化，轻量无冗余。
 
 [**English**](./README.md) | **中文**
 
@@ -21,23 +21,6 @@
 - **13 个内置 Skill** — docx、pptx、pdf、xlsx、canvas-design、frontend-design、algorithmic-art、brand-guidelines、internal-comms、mcp-builder、skill-creator、slack-gif-creator、theme-factory、web-artifacts-builder、webapp-testing
 
 ## 架构
-
-```
-mybot/
-  config/             # .env 自动加载，类型化配置
-  core/               # Orchestrator、Dispatcher、AgentCore、Middleware、EventBus、MessageBus、Server
-  agents/             # 范式 Agent（ReAct、PlanSolve）——自动发现
-  context/            # ContextManager —— 会话持久化、压缩、修复
-  providers/          # LLMProvider 抽象 + OpenAI 兼容实现
-  tools/              # 10 个工具（bash、文件读写、grep、webfetch、websearch、memory、subagent）
-  memory/             # 长期记忆系统（store–manager–service 三层架构）
-  observability/      # 日志（loguru）、指标（Counter/Gauge/Histogram）、追踪、OTel 桥接
-  skills/             # 13 个内置 Skill
-  utils/              # Jinja2 模板渲染
-  prompt_templates/   # 14 个 Agent prompt 模板
-  server_web/         # 浏览器聊天界面
-  test/               # 711 个测试
-```
 
 ### 请求流程
 
@@ -193,6 +176,7 @@ ruff check .                               # lint
 pytest                                     # 全部 711 个测试
 pytest test/core/test_middleware.py -v     # 单个测试文件
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
+bash scripts/loc.sh                        # 按模块统计代码行数
 ```
 
 ## 路线图
