@@ -11,19 +11,11 @@ MEMORY_TYPES = ("user", "feedback", "project", "reference")
 
 # File names
 _MEMORY_INDEX = "MEMORY.md"
-_HISTORY_FILE = "history.jsonl"
-_CURSOR_FILE = ".cursor"
-_DREAM_CURSOR_FILE = ".dream_cursor"
 _SOUL_FILE = "SOUL.md"
 _USER_FILE = "USER.md"
 
-# Frontmatter delimiters
-_FM_DELIM = "---"
 _FM_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*", re.DOTALL)
 _NAMESPACE_KEYS = frozenset({"metadata"})
-
-# Link pattern: [[name]]
-_LINK_PATTERN = re.compile(r"\[\[([^\]]+)\]\]")
 
 
 @dataclass
@@ -154,11 +146,6 @@ def _cast_value(value: str) -> Any:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
         return value[1:-1]
     return value
-
-
-def extract_links(content: str) -> list[str]:
-    """Extract [[name]] references from content."""
-    return _LINK_PATTERN.findall(content)
 
 
 def format_memory_index(entries: list[MemoryEntry]) -> str:

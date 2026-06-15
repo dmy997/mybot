@@ -577,7 +577,7 @@ class TestMemoryDelegation:
         assert any(r.name == "recall-me" for r in results)
 
     async def test_save_exchange_only_writes_to_session(self, ctx):
-        """save_exchange appends to session.messages, NOT to memory history."""
+        """save_exchange appends to session.messages."""
         await ctx.save_exchange("mem-sess", "hello world", [
             {"role": "assistant", "content": "hi there"},
         ])
@@ -585,9 +585,6 @@ class TestMemoryDelegation:
         session = ctx.session.get_session("mem-sess")
         assert len(session.messages) == 2
         assert session.messages[0]["content"] == "hello world"
-        # memory history should NOT have this exchange
-        recent = ctx.memory.get_recent_history(10)
-        assert len(recent) == 0
 
 
 # ---------------------------------------------------------------------------

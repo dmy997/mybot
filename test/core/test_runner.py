@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from core.events import AgentStarted, bus
 from core.runner import AgentCore, AgentInput
 from providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from tools import Tool, ToolRegistry, ToolResult
@@ -651,3 +656,358 @@ class TestAgentCoreCompaction:
         result = await core.run(spec)
         assert result.content == "done"
         assert len(call_messages) >= 1
+
+
+# ---------------------------------------------------------------------------
+# AgentCore — checkpoint / resume
+# ---------------------------------------------------------------------------
+
+
+class TestAgentCoreCheckpoint:
+    """Tests for the checkpoint/resume mechanism."""
+
+    # -- fixtures ---------------------------------------------------------------
+
+    @pytest.fixture
+    def provider(self):
+        return MagicMock(spec=LLMProvider)
+
+    @pytest.fixture
+    def tools(self):
+        reg = ToolRegistry()
+        reg.register(EchoTool())
+        return reg
+
+    @pytest.fixture
+    def workspace(self, tmp_path):
+        return tmp_path / "workspace"
+
+    @pytest.fixture
+    def core(self, provider, workspace):
+        return AgentCore(provider, workspace=workspace)
+
+    # -- _checkpointing_enabled ------------------------------------------------
+
+    def test_checkpoint_enabled_by_env_var(self, core, monkeypatch):
+        monkeypatch.setenv("MYBOT_CHECKPOINT", "1")
+        spec = AgentInput(session_key="s1")
+        assert core._checkpointing_enabled(spec) is True
+
+    def test_checkpoint_enabled_by_spec_field(self, core):
+        spec = AgentInput(session_key="s1", checkpoint=True)
+        assert core._checkpointing_enabled(spec) is True
+
+    def test_checkpoint_disabled_when_session_key_empty(self, core, monkeypatch):
+        monkeypatch.setenv("MYBOT_CHECKPOINT", "1")
+        spec = AgentInput(session_key="")
+        assert core._checkpointing_enabled(spec) is False
+
+    def test_checkpoint_disabled_by_default(self, core):
+        spec = AgentInput(session_key="s1")
+        assert core._checkpointing_enabled(spec) is False
+
+    # -- _checkpoint_path ------------------------------------------------------
+
+    def test_checkpoint_path_uses_workspace(self, core, workspace):
+        spec = AgentInput(session_key="abc")
+        path = core._checkpoint_path(spec)
+        expected = workspace / "sessions" / "abc_checkpoint.json"
+        assert path == expected
+
+    # -- save / load / delete round-trip ---------------------------------------
+
+    def test_save_and_load_checkpoint(self, core, workspace):
+        spec = AgentInput(session_key="s1")
+        messages = [{"role": "user", "content": "hi"}]
+        core._save_checkpoint(spec, messages, step_count=3,
+                              tools_used=["echo"], tool_events=[{"name": "echo"}],
+                              total_usage={"prompt_tokens": 100})
+
+        data = core._load_checkpoint(spec)
+        assert data is not None
+        assert data["step_count"] == 3
+        assert data["messages"] == messages
+        assert data["tools_used"] == ["echo"]
+        assert data["total_usage"] == {"prompt_tokens": 100}
+
+    def test_delete_checkpoint(self, core, workspace):
+        spec = AgentInput(session_key="s1")
+        core._save_checkpoint(spec, [{"role": "user", "content": "x"}],
+                              step_count=1, tools_used=[], tool_events=[],
+                              total_usage={})
+        path = core._checkpoint_path(spec)
+        assert path.exists()
+
+        core._delete_checkpoint(spec)
+        assert not path.exists()
+
+    def test_delete_nonexistent_checkpoint_no_error(self, core):
+        spec = AgentInput(session_key="no-file")
+        core._delete_checkpoint(spec)  # should not raise
+
+    def test_load_nonexistent_returns_none(self, core):
+        spec = AgentInput(session_key="ghost")
+        assert core._load_checkpoint(spec) is None
+
+    def test_corrupt_checkpoint_discarded(self, core, workspace):
+        spec = AgentInput(session_key="s1")
+        path = core._checkpoint_path(spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not valid json {{{", encoding="utf-8")
+
+        data = core._load_checkpoint(spec)
+        assert data is None
+        assert not path.exists()  # corrupt file deleted
+
+    def test_version_mismatch_discarded(self, core, workspace):
+        spec = AgentInput(session_key="s1")
+        path = core._checkpoint_path(spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": 999,
+            "session_key": "s1",
+            "step_count": 1,
+            "messages": [],
+            "tools_used": [],
+            "tool_events": [],
+            "total_usage": {},
+        }), encoding="utf-8")
+
+        data = core._load_checkpoint(spec)
+        assert data is None
+        assert not path.exists()
+
+    def test_missing_fields_discarded(self, core, workspace):
+        spec = AgentInput(session_key="s1")
+        path = core._checkpoint_path(spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Missing "tool_events" field
+        path.write_text(json.dumps({
+            "version": 1,
+            "session_key": "s1",
+            "step_count": 1,
+            "messages": [],
+            "tools_used": [],
+            "total_usage": {},
+        }), encoding="utf-8")
+
+        data = core._load_checkpoint(spec)
+        assert data is None
+        assert not path.exists()
+
+    # -- integration: save after tool execution --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_save_after_tool_execution(self, core, provider, tools, workspace):
+        provider.chat_with_retry = AsyncMock(side_effect=[
+            _make_response(
+                tool_calls=[_make_tc("echo", {"message": "hello"})],
+                finish_reason="tool_calls",
+            ),
+            _make_response(content="Done."),
+        ])
+
+        spec = AgentInput(
+            session_key="int-save",
+            init_messages=[{"role": "user", "content": "go"}],
+            tools=tools,
+            checkpoint=True,
+        )
+        result = await core.run(spec)
+
+        assert result.content == "Done."
+        # Checkpoint should be deleted on success
+        assert not core._checkpoint_path(spec).exists()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_preserved_on_llm_error(self, core, provider, tools, workspace):
+        provider.chat_with_retry = AsyncMock(side_effect=[
+            _make_response(
+                tool_calls=[_make_tc("echo", {"message": "x"})],
+                finish_reason="tool_calls",
+            ),
+            _make_response(content="Error text", finish_reason="error"),
+        ])
+
+        spec = AgentInput(
+            session_key="int-err",
+            init_messages=[{"role": "user", "content": "go"}],
+            tools=tools,
+            checkpoint=True,
+        )
+        result = await core.run(spec)
+
+        assert result.stop_reason == "error"
+        # Checkpoint preserved on error
+        assert core._checkpoint_path(spec).exists()
+
+    @pytest.mark.asyncio
+    async def test_delete_on_max_iterations(self, core, provider, tools, workspace):
+        core.max_iterations = 2
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(
+            tool_calls=[_make_tc("echo", {"message": "loop"})],
+            finish_reason="tool_calls",
+        ))
+
+        spec = AgentInput(
+            session_key="int-max",
+            init_messages=[{"role": "user", "content": "loop"}],
+            tools=tools,
+            checkpoint=True,
+        )
+        result = await core.run(spec)
+
+        assert result.stop_reason == "max_iterations"
+        # Checkpoint deleted on terminal state
+        assert not core._checkpoint_path(spec).exists()
+
+    # -- integration: resume ---------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_resume_loads_checkpoint(self, core, provider, tools, workspace):
+        # Pre-write a checkpoint as if we crashed after step 2
+        spec = AgentInput(
+            session_key="int-resume",
+            init_messages=[{"role": "user", "content": "original"}],
+            tools=tools,
+            checkpoint=True,
+        )
+        saved_messages = [
+            {"role": "user", "content": "original"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "echo", "arguments": '{"message":"x"}'}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "echo: x"},
+        ]
+        core._save_checkpoint(spec, saved_messages, step_count=2,
+                              tools_used=["echo"],
+                              tool_events=[{"name": "echo", "status": "ok"}],
+                              total_usage={"prompt_tokens": 50, "completion_tokens": 10})
+
+        # Now "resume" — LLM should continue from checkpoint
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(content="Resumed answer."))
+
+        result = await core.run(spec)
+
+        assert result.content == "Resumed answer."
+        assert result.tools_used == ["echo"]  # carried forward
+        assert result.usage["prompt_tokens"] == 50  # carried forward
+        # Checkpoint deleted after successful completion
+        assert not core._checkpoint_path(spec).exists()
+
+    @pytest.mark.asyncio
+    async def test_resume_skips_agent_start_event(self, core, provider, tools, workspace):
+        spec = AgentInput(
+            session_key="int-skip-event",
+            init_messages=[{"role": "user", "content": "go"}],
+            tools=tools,
+            checkpoint=True,
+        )
+        # Pre-write a checkpoint
+        core._save_checkpoint(spec, [{"role": "user", "content": "go"}],
+                              step_count=1, tools_used=[], tool_events=[],
+                              total_usage={})
+
+        started_events: list[AgentStarted] = []
+
+        async def _on_started(event: AgentStarted):
+            started_events.append(event)
+
+        bus.subscribe(AgentStarted, _on_started)
+
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(content="Done."))
+
+        try:
+            await core.run(spec)
+        finally:
+            bus.unsubscribe(AgentStarted, _on_started)
+
+        # AgentStarted should NOT be published on resume
+        assert len(started_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_skips_middleware_on_agent_start(self, core, provider, tools, workspace):
+        from core.middleware import AgentMiddleware, MiddlewareChain, MiddlewareContext
+
+        spec = AgentInput(
+            session_key="int-skip-mw",
+            init_messages=[{"role": "user", "content": "go"}],
+            tools=tools,
+            checkpoint=True,
+        )
+        # Pre-write a checkpoint
+        core._save_checkpoint(spec, [{"role": "user", "content": "go"}],
+                              step_count=1, tools_used=[], tool_events=[],
+                              total_usage={})
+
+        class TrackStartMiddleware(AgentMiddleware):
+            def __init__(self):
+                super().__init__()
+                self.start_calls = 0
+
+            async def on_agent_start(self, ctx: MiddlewareContext):
+                self.start_calls += 1
+
+        mw = TrackStartMiddleware()
+        chain = MiddlewareChain([mw])
+        core.middleware = chain
+
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(content="Done."))
+        await core.run(spec)
+
+        assert mw.start_calls == 0  # skipped on resume
+
+    @pytest.mark.asyncio
+    async def test_resume_continues_from_correct_step(self, core, provider, tools, workspace):
+        spec = AgentInput(
+            session_key="int-step",
+            init_messages=[{"role": "user", "content": "go"}],
+            tools=tools,
+            checkpoint=True,
+        )
+        # Pre-write a checkpoint at step 5
+        core._save_checkpoint(spec, [{"role": "user", "content": "go"}],
+                              step_count=5, tools_used=["echo"],
+                              tool_events=[{"name": "echo"}],
+                              total_usage={"prompt_tokens": 200})
+
+        step_events: list[int] = []
+
+        async def _on_step(event):
+            step_events.append(event.step_count)
+
+        from core.events import AgentStepStarted
+        bus.subscribe(AgentStepStarted, _on_step)
+
+        provider.chat_with_retry = AsyncMock(return_value=_make_response(content="Done."))
+
+        try:
+            result = await core.run(spec)
+        finally:
+            bus.unsubscribe(AgentStepStarted, _on_step)
+
+        assert result.content == "Done."
+        # First step after resume should be 6
+        assert step_events[0] == 6
+
+    @pytest.mark.asyncio
+    async def test_no_checkpoint_when_disabled(self, core, provider, tools, workspace):
+        """Checkpoint file is never created when checkpointing is disabled."""
+        provider.chat_with_retry = AsyncMock(side_effect=[
+            _make_response(
+                tool_calls=[_make_tc("echo", {"message": "x"})],
+                finish_reason="tool_calls",
+            ),
+            _make_response(content="Done."),
+        ])
+
+        spec = AgentInput(
+            session_key="int-no-cp",
+            init_messages=[{"role": "user", "content": "go"}],
+            tools=tools,
+            checkpoint=False,
+        )
+        await core.run(spec)
+
+        assert not core._checkpoint_path(spec).exists()

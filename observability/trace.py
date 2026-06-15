@@ -17,7 +17,7 @@ from __future__ import annotations
 import contextvars
 import time
 import uuid
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -76,6 +76,10 @@ class Tracer:
         self._current_span: contextvars.ContextVar[Span | None] = (
             contextvars.ContextVar("_trace_current_span", default=None)
         )
+        self._on_span_start: list[Callable[[Span], None]] = []
+        """Callbacks invoked when a span starts (for external bridge integration)."""
+        self._on_span_end: list[Callable[[Span], None]] = []
+        """Callbacks invoked when a span ends (for external bridge integration)."""
 
     # -- span creation ---------------------------------------------------------
 
@@ -88,6 +92,8 @@ class Tracer:
         )
         span = Span(name=name, context=ctx, attributes=dict(attributes))
         self._current_span.set(span)
+        for hook in self._on_span_start:
+            hook(span)
         logger.debug("Trace  {}  started  name={!r}", ctx.trace_id, name)
         return span
 
@@ -107,6 +113,8 @@ class Tracer:
         )
         span = Span(name=name, context=ctx, attributes=dict(attributes), _parent=parent)
         self._current_span.set(span)
+        for hook in self._on_span_start:
+            hook(span)
         return span
 
     # -- span completion -------------------------------------------------------
@@ -119,7 +127,14 @@ class Tracer:
         # Restore parent as the current span
         self._current_span.set(span._parent)
 
-        # Emit structured log
+        # Notify external bridges (e.g. OpenTelemetry)
+        for hook in self._on_span_end:
+            hook(span)
+
+        # Emit structured log (dedupe attrs that collide with fixed fields)
+        _attrs = {k: v for k, v in span.attributes.items()
+                  if k not in ("latency_ms", "span_name", "status", "event_type",
+                               "trace_id", "span_id", "parent_span_id", "latency_ms")}
         logger.bind(
             event_type="Span",
             trace_id=span.context.trace_id,
@@ -128,7 +143,7 @@ class Tracer:
             span_name=span.name,
             latency_ms=round(span.latency_ms, 3),
             status=span.status,
-            **span.attributes,
+            **_attrs,
         ).info(
             f"Span {span.name!r} {span.status} ({span.latency_ms:.2f} ms)"
         )

@@ -1,12 +1,10 @@
 """MemoryManager — high-level API for the agent memory system.
 
 Wraps MemoryStore with convenience methods for CRUD operations,
-context injection, keyword search, and history recording.
+keyword search, and context injection.
 """
 
 from __future__ import annotations
-
-from typing import Any
 
 from loguru import logger
 
@@ -38,12 +36,6 @@ class MemoryManager:
         # Create/update a memory
         mgr.remember("user-role", "I'm a Python backend engineer.",
                       mem_type="user", description="User's role")
-
-        # Retrieve for context injection
-        context = mgr.build_memory_context()
-
-        # Record conversation
-        mgr.record("User asked about the memory system design.")
 
         # Simple keyword search
         results = mgr.recall("Python engineer")
@@ -125,77 +117,6 @@ class MemoryManager:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [entry for _, entry in scored[:top_n]]
 
-    def list_all(self) -> list[MemoryEntry]:
-        """List all memory entries."""
-        return self.store.list_memories()
-
-    def get(self, name: str) -> MemoryEntry | None:
-        """Get a single memory by name."""
-        return self.store.read_memory(name)
-
-    # -- context injection -----------------------------------------------------
-
-    def build_memory_context(self, *, query: str | None = None) -> str:
-        """Build the memory section for injection into the agent's system prompt.
-
-        Args:
-            query: Optional current conversation topic for relevance filtering.
-                   When provided, relevant memories are surfaced first.
-
-        Returns:
-            Formatted markdown string for the system prompt.
-        """
-        parts: list[str] = []
-
-        # Soul file (identity)
-        soul = self.store.read_soul()
-        if soul.strip():
-            parts.append(f"# Identity (SOUL.md)\n\n{soul}")
-
-        # User profile — skip if it looks like an unfilled template
-        user = self.store.read_user()
-        if user.strip() and not _is_template(user):
-            parts.append(f"# User Profile (USER.md)\n\n{user}")
-
-        # Memory index + full content of each memory
-        index = self.store.read_memory_index()
-        if index.strip():
-            parts.append(f"# Memory\n\n{index}")
-        for entry in self.store.list_memories():
-            if entry.content.strip():
-                parts.append(f"### {entry.name}\n\n{entry.content}")
-
-        return "\n\n---\n\n".join(parts)
-
-    def find_relevant(self, query: str, *, top_n: int = 5) -> list[MemoryEntry]:
-        """Find memories relevant to a query (alias for recall)."""
-        return self.recall(query, top_n=top_n)
-
-    # -- history ---------------------------------------------------------------
-
-    def record(self, content: str, *, max_chars: int | None = None) -> int:
-        """Record an entry in conversation history. Returns the cursor."""
-        return self.store.append_history(content, max_chars=max_chars)
-
-    def get_recent_history(self, count: int = 50) -> list[dict[str, Any]]:
-        """Get the most recent N history entries."""
-        cursor = self.store.get_last_cursor()
-        since = max(0, cursor - count)
-        return self.store.read_unprocessed_history(since)
-
-    def format_recent_history(self, count: int = 50,
-                              max_chars: int = 32_000) -> str:
-        """Format recent history entries as a markdown string.
-
-        Caps total output at max_chars.
-        """
-        entries = self.get_recent_history(count)
-        lines = [f"- [{e['timestamp']}] {e['content']}" for e in entries]
-        text = "\n".join(lines)
-        if len(text) > max_chars:
-            text = text[:max_chars] + "\n... (truncated)"
-        return text
-
     # -- maintenance -----------------------------------------------------------
 
     def sync_from_disk(self) -> list[str]:
@@ -212,16 +133,8 @@ class MemoryManager:
             self.store.rebuild_index()
         return changed
 
-    def compact(self) -> None:
-        """Compact history if it exceeds the max entries threshold."""
-        self.store.compact_history()
-
     # -- statistics ------------------------------------------------------------
 
     @property
     def memory_count(self) -> int:
         return len(self.store.list_memories())
-
-    @property
-    def history_count(self) -> int:
-        return len(self.store._read_entries())

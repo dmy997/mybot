@@ -68,6 +68,13 @@ class BaseAgent(ABC):
             model=overrides.get("model", spec.model),
             max_tokens=overrides.get("max_tokens", spec.max_tokens),
             temperature=overrides.get("temperature", spec.temperature),
+            session_key=overrides.get("session_key", spec.session_key),
+            paradigm=overrides.get("paradigm", spec.paradigm),
             on_content_delta=overrides.get("on_content_delta", spec.on_content_delta),
+            on_thinking_delta=overrides.get("on_thinking_delta", spec.on_thinking_delta),
             on_tool_call_delta=overrides.get("on_tool_call_delta", spec.on_tool_call_delta),
+            on_tool_execute_start=overrides.get("on_tool_execute_start", spec.on_tool_execute_start),
+            on_tool_execute_end=overrides.get("on_tool_execute_end", spec.on_tool_execute_end),
+            on_new_turn=overrides.get("on_new_turn", spec.on_new_turn),
+            checkpoint=overrides.get("checkpoint", spec.checkpoint),
         )

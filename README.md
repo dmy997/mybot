@@ -1,70 +1,95 @@
 # mybot
 
-A multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, and HTTP/WS API. Designed to work with any OpenAI-compatible API endpoint.
+[![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-711%20passed-green)](.)
+[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+
+A personal AI assistant framework inspired by **Claude Code**, **nanobot**, and **OpenClaw**. Designed for extensibility and observability — supports multiple provider backends, paradigm-style agent orchestration, long-term file-based memory, streaming with tool-use visualization, and OpenTelemetry-based trace export to Jaeger.
+
+**English** | [中文](./README_zh.md)
+
+## Highlights
+
+- **Multi-provider** — any OpenAI-compatible API endpoint (OpenRouter, DeepSeek, local models)
+- **Paradigm agents** — ReAct (single-pass), Plan-and-Solve (two-phase); auto-discovered via `discover_agents()`
+- **Streaming** — SSE, WebSocket, and Rich terminal UI with live tool-use rendering
+- **Pluggable middleware** — chain-of-responsibility hooks for LLM calls, tool execution, agent lifecycle
+- **Long-term memory** — file-based typed memory (user / feedback / project / reference) with keyword recall
+- **Context management** — non-destructive compression, session repair, idle auto-compaction
+- **Observability** — structured logging (loguru), custom metrics/tracing, and optional OpenTelemetry → Jaeger bridge
+- **Checkpoint/resume** — crash recovery for long-running agent tasks
+- **13 built-in skills** — docx, pptx, pdf, xlsx, canvas-design, frontend-design, algorithmic-art, brand-guidelines, internal-comms, mcp-builder, skill-creator, slack-gif-creator, theme-factory, web-artifacts-builder, webapp-testing
 
 ## Architecture
 
 ```
 mybot/
-  config/           # Config — .env auto-loading, typed configuration
-  core/             # Orchestrator, Dispatcher, AgentCore, Middleware, EventBus, MessageBus
-  agents/           # Paradigm agents (ReAct, PlanSolve) — auto-discovered
-  context/          # ContextManager — session persistence, compression, repair
-  providers/        # LLMProvider abstraction + OpenAI-compatible implementation
-  tools/            # 10 tools (bash, file R/W, grep, webfetch, websearch, memory, subagent)
-  memory/           # Long-term memory (file-based, LLM-callable CRUD)
-  observability/    # Logging (loguru), metrics, tracing, CLI streaming (Rich Live)
-  skills/           # 13 built-in skills (docx, pptx, pdf, canvas-design, etc.)
-  utils/            # Jinja2 template rendering
-  prompt_templates/ # 14 agent prompt templates
-  server_web/       # Web chat UI
-  test/             # 676 tests
+  config/             # .env auto-loading, typed Config
+  core/               # Orchestrator, Dispatcher, AgentCore, Middleware, EventBus, MessageBus, Server
+  agents/             # Paradigm agents (ReAct, PlanSolve) — auto-discovered
+  context/            # ContextManager — session persistence, compression, repair
+  providers/          # LLMProvider abstraction + OpenAI-compatible implementation
+  tools/              # 10 tools (bash, file R/W, grep, webfetch, websearch, memory, subagent)
+  memory/             # Long-term file-based memory (store–manager–service)
+  observability/      # Logging (loguru), metrics (Counter/Gauge/Histogram), tracing, OTel bridge
+  skills/             # 13 built-in skills
+  utils/              # Jinja2 template rendering
+  prompt_templates/   # 14 agent prompt templates
+  server_web/         # Web chat UI
+  test/               # 711 tests
 ```
 
 ### Request Flow
 
 ```
-HTTP/WS → Orchestrator → Dispatcher → Paradigm Agent → AgentCore → LLMProvider
-              ↑              ↑              ↑                ↑
-          Middleware      路由决策      多轮编排       Middleware
-          ContextManager                              (LLM/Tool)
-          (会话/压缩/修复)
+HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
+                                   ├─ repair interrupted session
+                                   ├─ assemble system prompt
+                                   ├─ load session history
+                                   └─ token-budget check → compress if needed
+                → Dispatcher.resolve()
+                    ├─ Layer 1: explicit commands (/react, /plan)
+                    ├─ Layer 2: keyword heuristics
+                    ├─ Layer 3: LLM classification (optional)
+                    └─ Layer 4: default (react)
+                → Agent.run(AgentInput) → AgentCore.run()
+                    └─ loop: LLM call → tool calls (parallel + serial) → feed results back
+                → ContextManager.save_exchange() → persist to disk
 ```
 
 ### Key Components
 
-- **Orchestrator** (`core/orchestrator.py`) — 顶层协调层，交互式 CLI (prompt_toolkit + Rich Live) + HTTP API，管理请求全生命周期
-- **MessageBus** (`core/message_bus.py`) — 双队列消息总线，解耦输入源（CLI/HTTP/WS）与输出消费者（流式渲染）
-- **EventBus** (`core/events.py`) — 异步发布/订阅事件总线，isinstance 匹配，Agent 生命周期/LLM/Tool 事件通知
-- **Server** (`core/server.py`) — Starlette HTTP API，SSE 流式 + WebSocket + Bearer 认证
-- **Web UI** (`server_web/index.html`) — 浏览器聊天界面，流式渲染、Markdown、会话管理
-- **Dispatcher** (`core/dispatcher.py`) — 四层路由：显式命令 → 关键词匹配 → LLM 分类 → 默认回退
-- **AgentCore** (`core/runner.py`) — 共享的 agent 执行循环，流式 + 非流式，工具并行/串行执行，上下文压缩，LLM 错误恢复
-- **Middleware** (`core/middleware.py`) — 可插拔的中间件链，拦截 LLM 调用、工具执行、agent 生命周期
-- **ContextManager** (`context/context_manager.py`) — 会话管理、空闲压缩、token 预算压缩、中断修复
-- **SkillsLoader** (`core/skills.py`) — 基于文件的 skill 发现（YAML 语法），自动注入系统 prompt
-- **StreamRenderer** (`observability/stream_renderer.py`) — Rich Live 流式渲染器，支持原地更新 Markdown + ThinkingSpinner
-- **Config** (`config/config.py`) — `.env` 自动加载，类型化配置
+| Component | File | Role |
+|-----------|------|------|
+| Orchestrator | `core/orchestrator.py` | Top-level coordinator — CLI loop, HTTP API, request lifecycle |
+| Dispatcher | `core/dispatcher.py` | Four-layer routing: commands → heuristics → LLM classify → default |
+| AgentCore | `core/runner.py` | Shared execution loop — streaming, tool exec, compaction, error recovery |
+| Middleware | `core/middleware.py` | Pluggable chain — intercepts LLM calls, tool exec, agent lifecycle |
+| EventBus | `core/events.py` | Async pub/sub — Agent/LLM/Tool lifecycle events |
+| MessageBus | `core/message_bus.py` | Dual-queue bus — decouples input sources from output consumers |
+| ContextManager | `context/context_manager.py` | Session persistence, idle compaction, token-budget compression, interruption repair |
+| MemoryStore | `memory/store.py` | File I/O for typed long-term memories |
+| StreamRenderer | `observability/stream_renderer.py` | Rich Live terminal streaming with Markdown + ThinkingSpinner |
+| SkillsLoader | `core/skills.py` | File-based skill discovery (YAML), auto-injected into system prompt |
 
 ### Agent Paradigms
 
-| Paradigm | 说明 |
-|----------|------|
-| `react` | 单轮推理+行动循环 |
-| `plan_solve` | 先规划再执行，两阶段 |
-
-Agents 通过 `agents/__init__.py` 的 `discover_agents()` 自动扫描发现。
+| Paradigm | Description |
+|----------|-------------|
+| `react` | Single-pass reasoning + action loop |
+| `plan_solve` | Plan first, then execute — two-phase |
 
 ## Installation
 
 ```bash
 pip install -e ".[dev,server]"
+cp .env.example .env   # then fill in your API keys
 ```
 
-Copy `.env` and fill in your keys:
+Optional dependencies:
 
 ```bash
-cp .env.example .env
+pip install -e ".[otel]"   # OpenTelemetry → Jaeger bridge
 ```
 
 ## Quick Start
@@ -77,9 +102,11 @@ mybot
 mybot-server
 # Then open http://127.0.0.1:8080 in browser
 
-# WebSocket (CLI client)
+# WebSocket
 websocat ws://127.0.0.1:8080/ws/default
 ```
+
+### Programmatic Usage
 
 ```python
 import asyncio
@@ -95,20 +122,13 @@ provider = OpenAICompatibleProvider(
     default_model=Config.default_model,
 )
 
-# Optional middleware
-class AuditMiddleware(AgentMiddleware):
-    async def on_tool_execute(self, ctx, call_next):
-        print(f"tool: {ctx.tool_name}")
-        return await call_next(ctx)
-
 orche = Orchestrator(
     workspace=Config.workspace,
     provider=provider,
     compress_model=Config.light_model,
-    middleware=MiddlewareChain([AuditMiddleware()]),
 )
 
-# Single message (streaming callbacks available)
+# Single message
 result = await orche.process_message("default", "你好")
 print(result.content)
 
@@ -118,73 +138,93 @@ await orche.run("default")
 
 ## Configuration
 
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `OPENAI_API_KEY` | — | API 密钥 |
-| `OPENAI_API_BASE` | — | API 地址 |
-| `PROVIDER_NAME` | `openrouter` | provider 标识 |
-| `LLM_MODEL_ID` | `deepseek/deepseek-v4-flash` | 默认模型 |
-| `LIGHT_MODEL_NAME` | 同 `LLM_MODEL_ID` | 压缩/分类用小模型 |
-| `LLM_TIMEOUT` | `60` | 请求超时(秒) |
-| `WORKSPACE` | `~/.mybot/workspace` | 工作目录 |
-| `MYBOT_API_KEY` | — | HTTP API Bearer 认证密钥（不设则不校验） |
-| `MYBOT_HOST` | `127.0.0.1` | 服务绑定地址 |
-| `MYBOT_PORT` | `8080` | 服务端口 |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OPENAI_API_KEY` | — | API key |
+| `OPENAI_API_BASE` | — | API base URL |
+| `PROVIDER_NAME` | `openrouter` | Provider identifier |
+| `LLM_MODEL_ID` | `deepseek/deepseek-v4-flash` | Default model |
+| `LIGHT_MODEL_NAME` | same as above | Cheap model for compression/classification |
+| `LLM_TIMEOUT` | `60` | Request timeout (seconds) |
+| `WORKSPACE` | `~/.mybot/workspace` | Sessions + memory storage |
+| `MYBOT_API_KEY` | — | Bearer auth for HTTP/WS (disabled when unset) |
+| `MYBOT_HOST` | `127.0.0.1` | Server bind address |
+| `MYBOT_PORT` | `8080` | Server port |
+| `MYBOT_CHECKPOINT` | — | Enable checkpoint/resume for long tasks |
+| `MYBOT_OTEL_ENABLED` | — | Enable OpenTelemetry bridge |
+| `MYBOT_OTEL_ENDPOINT` | `http://localhost:4318/v1/traces` | OTLP HTTP endpoint |
+
+## Observability
+
+mybot provides two complementary observability approaches.
+
+### 1. Built-in Observability (zero-dependency)
+
+Works out of the box with no external services:
+
+- **Structured logging** (`observability/log.py`) — loguru-based, all events carry typed fields (`event_type`, `trace_id`, `span_id`, `latency_ms`)
+- **Metrics** (`observability/metrics.py`) — in-memory `Counter` / `Gauge` / `Histogram` with a global `REGISTRY` singleton; snapshot via `REGISTRY.collect_all()`
+- **Tracing** (`observability/trace.py`) — `contextvars`-based span propagation, `with tracer.span("llm.chat", model="gpt-4"): ...`, emitted as structured log events
+- **Event bus subscribers** (`observability/subscribers.py`) — bridge agent/LLM/tool lifecycle events to metrics and logs
+
+### 2. Visual Dashboard (OpenTelemetry → Jaeger)
+
+Enable a full trace visualization pipeline with one environment variable:
+
+```bash
+# 1. Install OTel dependencies
+pip install "mybot[otel]"
+
+# 2. Start Jaeger (one docker command)
+docker run -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one
+
+# 3. Run mybot with OTel enabled
+MYBOT_OTEL_ENABLED=1 mybot
+
+# 4. Open http://localhost:16686 → Search → Service: mybot → Find Traces
+```
+
+Each trace shows the full call tree (`agent.run → llm.chat → tool.execute`) with span attributes including model name, token counts (`tokens_in` / `tokens_out` / `tokens_total`), message count, and tool names. The `OTelBridge` (`observability/otel_bridge.py`) mirrors custom tracer spans to the OTel SDK and exports via OTLP HTTP — no changes to business code required.
 
 ## Development
 
 ```bash
-# Lint
-ruff check .
-
-# Tests
-pytest -q
-
-# Single test file
-pytest test/core/test_middleware.py -v
+ruff check .                               # lint
+pytest                                     # all 711 tests
+pytest test/core/test_middleware.py -v     # single file
+pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 ```
 
-## Requirements
+## Roadmap
 
-- Python 3.10+
-- Dependencies: `openai`, `loguru`, `json-repair`, `rich`, `httpx`, `jinja2`, `python-dotenv`, `pyyaml`, `prompt_toolkit`
-- Optional (server): `starlette`, `uvicorn`
+### Completed
 
-## Roadmap / TODO
+- CLI UX overhaul with Rich Live streaming
+- Unified prompt templates (Jinja2)
+- Sub-agent delegation (`SubAgentTool`)
+- Provider API error handling with retry and recovery
+- Tool security boundary (`ToolGuard`, scopes, capability checks)
+- HTTP API + WebSocket + SSE streaming + Web UI
+- Pluggable middleware chain (agent / LLM / tool hooks)
+- EventBus (async pub/sub) + MessageBus (dual-queue I/O)
+- 13 built-in skills
+- Context management subsystem (compression, repair, idle auto-compaction)
+- Long-term file-based memory system (store–manager–service, typed entries)
+- Session history persistence with cursor-based loading
+- Checkpoint/resume for long-running agent tasks
+- OpenTelemetry bridge → Jaeger trace visualization
+- MCP (Model Context Protocol) integration — connect to external tool servers
 
-已完成的标记为 ✅，未完成的按功能完整性优先级排序。
+### P2 — Quality & Reliability
 
-1. ~~**命令行交互 UX 优化**~~ ✅
-2. ~~**Prompt 模板统一管理**~~ ✅
-3. ~~**子 Agent 模块**~~ ✅
-4. ~~**Provider API 错误处理与重试**~~ ✅
-5. ~~**工具系统安全边界**~~ ✅
-6. ~~**P0 问题修复**~~ ✅ — `mybot`/`mybot-server` CLI 入口点，依赖声明补全
-7. ~~**HTTP API + WebSocket + Web UI**~~ ✅ — SSE 流式、WebSocket 双向通信、Bearer 认证、浏览器聊天界面
-8. ~~**中间件/Hook 系统**~~ ✅ — 可插拔中间件链，拦截 LLM 调用、工具执行、agent 生命周期，支持前置修改、后置修改、短路跳过
+- **Agent evaluation benchmarks** — standard task set with automated metrics (completion rate, step efficiency, tool selection accuracy), supporting regression testing and paradigm comparison
+- **Memory Dream system** — use idle time to review, summarize, and cross-link historical sessions, refining fragmented memories into structured knowledge
 
----
+### P3 — Extensibility
 
-### P1 — Agent 系统核心能力缺口
-
-9. ~~**内置 Skills**~~ ✅ — 13 个内置 skill（docx, pptx, pdf, xlsx, canvas-design, frontend-design, algorithmic-art, brand-guidelines, internal-comms, mcp-builder, skill-creator, slack-gif-creator, theme-factory, web-artifacts-builder, webapp-testing）
-10. ~~**EventBus / MessageBus**~~ ✅ — `core/events.py` 异步发布/订阅事件总线，`core/message_bus.py` 双队列消息总线，解耦输入输出
-
-### P1 — Agent 系统核心能力缺口（续）
-
-11. **MCP（Model Context Protocol）集成** — 作为 MCP client 连接外部工具服务器，接入业界标准的工具生态
-
-### P2 — 质量与可靠性
-
-12. **智能体性能评估系统** — 建立 Agent 性能基准测试框架，包含标准任务集、自动化评测指标（任务完成率、步骤效率、工具选择准确率），支持回归测试和范式对比
-13. **长任务断点恢复** — AgentCore 无检查点机制，长任务崩溃后无法续跑，需要状态快照和恢复能力
-14. **Memory Dream 系统** — 利用空闲时间对历史会话进行回顾、总结和关联发现，将碎片记忆提炼为结构化知识
-
-### P3 — 扩展能力
-
-15. **多模态输入扩展** — 支持图片、音频等非文本输入，通过 provider 的多模态 API 传入 LLM
-16. **更多 LLM Provider** — Anthropic 直连、Ollama 本地模型等
-17. **多消息频道** — 微信、Telegram 等外部频道接入
+- **Multimodal input** — image, audio, and other non-text inputs via provider multimodal APIs
+- **Additional LLM providers** — Anthropic direct, Ollama local models
+- **External chat channels** — WeChat, Telegram, Discord integration
 
 ## License
 

@@ -6,19 +6,9 @@ Claude Code-compatible memory file conventions.
 
 from __future__ import annotations
 
-import json
-import os
-from contextlib import suppress
-from datetime import datetime
 from pathlib import Path
-from typing import Any
-
-from loguru import logger
 
 from .types import (
-    _CURSOR_FILE,
-    _DREAM_CURSOR_FILE,
-    _HISTORY_FILE,
     _MEMORY_INDEX,
     _SOUL_FILE,
     _USER_FILE,
@@ -30,7 +20,7 @@ from .types import (
 
 
 class MemoryStore:
-    """Pure file I/O for memory files: MEMORY.md, individual .md files, history.jsonl.
+    """Pure file I/O for memory files: MEMORY.md, individual .md files.
 
     Directory layout::
 
@@ -45,26 +35,16 @@ class MemoryStore:
             │   └── <name>.md
             ├── project/
             │   └── <name>.md
-            ├── reference/
-            │   └── <name>.md
-            ├── history.jsonl          # append-only conversation log
-            ├── .cursor                # last history cursor
-            └── .dream_cursor          # last dream cursor (reserved)
+            └── reference/
+                └── <name>.md
     """
 
-    _DEFAULT_MAX_HISTORY = 1000
-
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(self, workspace: Path):
         self.workspace = Path(workspace).expanduser().resolve()
-        self.max_history_entries = max_history_entries
         self.memory_dir = self.workspace / "memory"
         self._index_file = self.memory_dir / _MEMORY_INDEX
-        self._history_file = self.memory_dir / _HISTORY_FILE
-        self._cursor_file = self.memory_dir / _CURSOR_FILE
-        self._dream_cursor_file = self.memory_dir / _DREAM_CURSOR_FILE
         self._soul_file = self.workspace / _SOUL_FILE
         self._user_file = self.workspace / _USER_FILE
-        self._oversize_logged = False
         self._ensure_dirs()
 
     # -- init helpers ----------------------------------------------------------
@@ -112,17 +92,6 @@ class MemoryStore:
     def write_memory_index(self, content: str) -> None:
         """Overwrite MEMORY.md."""
         self._write_file(self._index_file, content)
-
-    def parse_index_entries(self) -> list[dict[str, str]]:
-        """Parse MEMORY.md into a list of {name, path, description} dicts."""
-        content = self.read_memory_index()
-        entries: list[dict[str, str]] = []
-        for line in content.splitlines():
-            parsed = parse_memory_index_line(line)
-            if parsed:
-                name, path, desc = parsed
-                entries.append({"name": name, "path": path, "description": desc})
-        return entries
 
     def rebuild_index(self) -> str:
         """Rebuild MEMORY.md from individual memory files on disk.
@@ -175,10 +144,6 @@ class MemoryStore:
     def list_memories(self) -> list[MemoryEntry]:
         """List all memory entries from disk (not from index)."""
         return self._scan_memory_files()
-
-    def find_memory(self, name: str) -> MemoryEntry | None:
-        """Find a memory by name (alias for read_memory)."""
-        return self.read_memory(name)
 
     def _scan_memory_files(self) -> list[MemoryEntry]:
         """Scan all type subdirectories and parse memory files."""
@@ -243,163 +208,3 @@ class MemoryStore:
         ]
         self.write_memory_index("\n".join(lines) + "\n")
 
-    # -- memory context for system prompt --------------------------------------
-
-    def get_memory_context(self) -> str:
-        """Build memory context text for injection into system prompt.
-
-        Includes the full MEMORY.md content, referencing individual files.
-        """
-        index = self.read_memory_index()
-        if not index.strip():
-            return ""
-
-        # Include full content of each memory file
-        parts: list[str] = []
-        for entry in self.list_memories():
-            parts.append(f"## {entry.name}\n\n{entry.content}")
-
-        index_section = f"## Memory Index\n\n{index}"
-        if parts:
-            return index_section + "\n" + "\n\n".join(parts)
-        return index_section
-
-    # -- history.jsonl — append-only, JSONL ------------------------------------
-
-    def append_history(self, content: str, *, max_chars: int | None = None) -> int:
-        """Append an entry to history.jsonl and return its cursor.
-
-        Args:
-            content: The history entry text.
-            max_chars: Optional character cap (default 16000).
-        """
-        limit = max_chars if max_chars is not None else 16_000
-        cursor = self._next_cursor()
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        text = content.rstrip()
-        if len(text) > limit:
-            if not self._oversize_logged:
-                self._oversize_logged = True
-                logger.warning(
-                    "history entry exceeds {} chars ({}); truncating",
-                    limit, len(text),
-                )
-            text = text[:limit] + "\n... (truncated)"
-
-        record = {"cursor": cursor, "timestamp": ts, "content": text}
-        with open(self._history_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self._cursor_file.write_text(str(cursor), encoding="utf-8")
-        return cursor
-
-    def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
-        """Return history entries with cursor > since_cursor."""
-        result: list[dict[str, Any]] = []
-        for entry in self._read_entries():
-            raw = entry.get("cursor")
-            if raw is None:
-                continue
-            try:
-                cursor = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if cursor > since_cursor:
-                result.append(entry)
-        return result
-
-    def compact_history(self) -> None:
-        """Drop oldest entries if the file exceeds max_history_entries."""
-        if self.max_history_entries <= 0:
-            return
-        entries = self._read_entries()
-        if len(entries) <= self.max_history_entries:
-            return
-        kept = entries[-self.max_history_entries:]
-        self._write_entries(kept)
-
-    def get_last_cursor(self) -> int:
-        """Return the last written history cursor."""
-        if self._cursor_file.exists():
-            with suppress(ValueError, OSError):
-                return int(self._cursor_file.read_text(encoding="utf-8").strip())
-        last = self._read_last_entry()
-        if last:
-            with suppress(ValueError, TypeError):
-                return int(last.get("cursor", 0))
-        return 0
-
-    # -- dream cursor (reserved) -----------------------------------------------
-
-    def get_last_dream_cursor(self) -> int:
-        if self._dream_cursor_file.exists():
-            with suppress(ValueError, OSError):
-                return int(self._dream_cursor_file.read_text(encoding="utf-8").strip())
-        return 0
-
-    def set_last_dream_cursor(self, cursor: int) -> None:
-        self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
-
-    # -- JSONL helpers ---------------------------------------------------------
-
-    def _next_cursor(self) -> int:
-        """Return the next cursor value."""
-        if self._cursor_file.exists():
-            with suppress(ValueError, OSError):
-                return int(self._cursor_file.read_text(encoding="utf-8").strip()) + 1
-        last = self._read_last_entry()
-        if last:
-            with suppress(ValueError, TypeError):
-                return int(last.get("cursor", 0)) + 1
-        return 1
-
-    def _read_entries(self) -> list[dict[str, Any]]:
-        """Read all entries from history.jsonl."""
-        entries: list[dict[str, Any]] = []
-        with suppress(FileNotFoundError):
-            with open(self._history_file, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            entries.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-        return entries
-
-    def _read_last_entry(self) -> dict[str, Any] | None:
-        """Efficiently read the last entry from history.jsonl."""
-        try:
-            with open(self._history_file, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                if size == 0:
-                    return None
-                read_size = min(size, 4096)
-                f.seek(size - read_size)
-                data = f.read().decode("utf-8")
-                lines = [line for line in data.split("\n") if line.strip()]
-                if not lines:
-                    return None
-                return json.loads(lines[-1])
-        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
-            return None
-
-    def _write_entries(self, entries: list[dict[str, Any]]) -> None:
-        """Overwrite history.jsonl with the given entries (atomic write)."""
-        tmp_path = self._history_file.with_suffix(self._history_file.suffix + ".tmp")
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                for entry in entries:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, self._history_file)
-            with suppress(PermissionError):
-                fd = os.open(str(self._history_file.parent), os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise

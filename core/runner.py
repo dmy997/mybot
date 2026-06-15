@@ -64,6 +64,8 @@ class AgentInput:
     """Async callback invoked after each tool completes with the tool event dict."""
     on_new_turn: Callable[[], Awaitable[None]] | None = None
     """Async callback invoked at the start of each new LLM turn (after the first)."""
+    checkpoint: bool = False
+    """Enable checkpointing for this run.  Also controlled by ``MYBOT_CHECKPOINT`` env var."""
 
 
 @dataclass
@@ -86,6 +88,7 @@ class AgentOutput:
 _DEFAULT_MAX_ITERATIONS = 20
 _DEFAULT_MAX_TOOL_RESULT_CHARS = 6_000
 _STALL_WARNING_STEPS = 50
+_CHECKPOINT_VERSION = 1
 
 # Lightweight compaction (fallback when CompactionService is not injected)
 _LW_COMPACT_MAX_TOKENS = 128_000
@@ -173,6 +176,7 @@ class AgentCore:
         middleware: MiddlewareChain | None = None,
         max_context_tokens: int = _LW_COMPACT_MAX_TOKENS,
         compaction: Any | None = None,
+        workspace: str | Path | None = None,
     ) -> None:
         self.provider = provider
         self.max_iterations = max_iterations
@@ -180,35 +184,50 @@ class AgentCore:
         self.middleware = middleware
         self.max_context_tokens = max_context_tokens
         self.compaction = compaction  # optional CompactionService from context module
+        self._workspace = Path(workspace).expanduser().resolve() if workspace else None
 
     # -- public entry point ----------------------------------------------------
 
     async def run(self, spec: AgentInput) -> AgentOutput:
         """Execute the agent loop and return the final output."""
-        messages = list(spec.init_messages)
-        if spec.goal:
-            messages = self._inject_goal(messages, spec.goal)
-        tools_used: list[str] = []
-        tool_events: list[dict[str, str]] = []
-        total_usage: dict[str, int] = {}
-        step_count = 0
+        # -- checkpoint: resume -------------------------------------------------
+        _cp_enabled = self._checkpointing_enabled(spec)
+        _checkpoint = self._load_checkpoint(spec) if _cp_enabled else None
+
+        if _checkpoint is not None:
+            messages = list(_checkpoint["messages"])
+            step_count = int(_checkpoint["step_count"])
+            tools_used = list(_checkpoint["tools_used"])
+            tool_events = list(_checkpoint["tool_events"])
+            total_usage = dict(_checkpoint["total_usage"])
+        else:
+            messages = list(spec.init_messages)
+            if spec.goal:
+                messages = self._inject_goal(messages, spec.goal)
+            tools_used: list[str] = []
+            tool_events: list[dict[str, str]] = []
+            total_usage: dict[str, int] = {}
+            step_count = 0
 
         tool_defs = spec.tools.get_definitions() if spec.tools else None
 
-        # Middleware: agent start
+        # Middleware: agent start (skipped on resume)
         mw = self.middleware
         ctx = None
         if mw:
             from core.middleware import MiddlewareContext
             ctx = MiddlewareContext(messages=messages, step_count=step_count)
-            await mw.run_agent_start(ctx)
+            if _checkpoint is None:
+                await mw.run_agent_start(ctx)
 
-        await bus.publish(AgentStarted(
-            session_key=spec.session_key,
-            paradigm=spec.paradigm,
-            messages_count=len(messages),
-            tools_count=len(tool_defs or []),
-        ))
+        # Publish AgentStarted (skipped on resume)
+        if _checkpoint is None:
+            await bus.publish(AgentStarted(
+                session_key=spec.session_key,
+                paradigm=spec.paradigm,
+                messages_count=len(messages),
+                tools_count=len(tool_defs or []),
+            ))
 
         try:
             for _ in range(self.max_iterations):
@@ -317,6 +336,13 @@ class AgentCore:
                         response.tool_calls, spec, tools_used, tool_events, messages, mw, ctx,
                     )
 
+                    # Checkpoint: save after each tool execution batch
+                    if _cp_enabled:
+                        self._save_checkpoint(
+                            spec, messages, step_count,
+                            tools_used, tool_events, total_usage,
+                        )
+
                     continue  # feed tool results back to LLM
 
                 # --- stop / final-content path ---
@@ -337,6 +363,9 @@ class AgentCore:
                     paradigm=spec.paradigm, steps=step_count,
                     stop_reason=response.finish_reason,
                 ))
+                # Checkpoint: delete on successful completion
+                if _cp_enabled:
+                    self._delete_checkpoint(spec)
                 return output
 
             # --- exhausted iteration budget ---
@@ -358,12 +387,127 @@ class AgentCore:
                 paradigm=spec.paradigm, steps=step_count,
                 stop_reason="max_iterations",
             ))
+            # Checkpoint: delete on terminal state
+            if _cp_enabled:
+                self._delete_checkpoint(spec)
             return output
 
         except Exception:
+            # Checkpoint preserved on exception — caller can resume
             if mw:
                 await mw.run_agent_end(ctx, None)
             raise
+
+    # -- checkpoint ------------------------------------------------------------
+
+    @staticmethod
+    def _checkpointing_enabled(spec: AgentInput) -> bool:
+        """Return True when checkpointing is active for *spec*.
+
+        Enabled when ``spec.checkpoint`` is True OR ``MYBOT_CHECKPOINT``
+        is set to ``1``/``true``.  Disabled when session_key is empty.
+        """
+        if not spec.session_key:
+            return False
+        if spec.checkpoint:
+            return True
+        env = os.environ.get("MYBOT_CHECKPOINT", "").strip().lower()
+        return env in ("1", "true", "yes")
+
+    def _checkpoint_path(self, spec: AgentInput) -> Path:
+        """Return the checkpoint file path for *spec*."""
+        if self._workspace:
+            base = self._workspace
+        else:
+            base = Path(os.environ.get("WORKSPACE", "~/.mybot/workspace")).expanduser().resolve()
+        return base / "sessions" / f"{spec.session_key}_checkpoint.json"
+
+    def _save_checkpoint(
+        self,
+        spec: AgentInput,
+        messages: list[dict[str, Any]],
+        step_count: int,
+        tools_used: list[str],
+        tool_events: list[dict[str, Any]],
+        total_usage: dict[str, int],
+    ) -> None:
+        """Atomically write a checkpoint file."""
+        path = self._checkpoint_path(spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "version": _CHECKPOINT_VERSION,
+            "session_key": spec.session_key,
+            "paradigm": spec.paradigm,
+            "step_count": step_count,
+            "messages": messages,
+            "tools_used": tools_used,
+            "tool_events": tool_events,
+            "total_usage": total_usage,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError:
+            logger.opt(exception=True).warning("Failed to write checkpoint {!s}", path)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _load_checkpoint(self, spec: AgentInput) -> dict[str, Any] | None:
+        """Load and validate a checkpoint file.
+
+        Returns ``None`` (and deletes the corrupt file) when the file is
+        missing, unparseable, or has mismatched version / missing fields.
+        """
+        path = self._checkpoint_path(spec)
+        if not path.exists():
+            return None
+
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Checkpoint {!s} unreadable ({}), discarding", path, exc)
+            path.unlink(missing_ok=True)
+            return None
+
+        if data.get("version") != _CHECKPOINT_VERSION:
+            logger.warning(
+                "Checkpoint version {} != expected {}, discarding",
+                data.get("version"), _CHECKPOINT_VERSION,
+            )
+            path.unlink(missing_ok=True)
+            return None
+
+        required = ["messages", "step_count", "tools_used", "tool_events", "total_usage"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            logger.warning("Checkpoint missing fields {}, discarding", missing)
+            path.unlink(missing_ok=True)
+            return None
+
+        logger.info(
+            "Resumed agent run from checkpoint: step={}, messages={}, session_key={!r}",
+            data["step_count"], len(data["messages"]), spec.session_key,
+        )
+        return data
+
+    def _delete_checkpoint(self, spec: AgentInput) -> None:
+        """Remove the checkpoint file (idempotent)."""
+        path = self._checkpoint_path(spec)
+        try:
+            if path.exists():
+                path.unlink()
+                logger.debug("Deleted checkpoint {!s}", path)
+        except OSError:
+            logger.opt(exception=True).warning("Failed to delete checkpoint {!s}", path)
 
     # -- helpers ---------------------------------------------------------------
 
@@ -531,7 +675,7 @@ class AgentCore:
         exhausted :class:`RetryableLLMError` are returned as error responses.
         """
         t_start = time.monotonic()
-        model = spec.model or getattr(self.provider, "default_model", "unknown")
+        model = spec.model or getattr(self.provider, "_default_model", None) or "unknown"
 
         # Debug: write full context window to disk when DUMP_LLM_MESSAGES is set
         _dump_llm_messages(
@@ -572,6 +716,13 @@ class AgentCore:
                 tokens_in = usage.get("prompt_tokens", 0)
                 tokens_out = usage.get("completion_tokens", 0)
                 tokens_total = usage.get("total_tokens", tokens_in + tokens_out)
+
+                # Attach token counts to current span for OTel export
+                span = tracer.current_span()
+                if span is not None:
+                    span.attributes["tokens_in"] = tokens_in
+                    span.attributes["tokens_out"] = tokens_out
+                    span.attributes["tokens_total"] = tokens_total
 
                 await bus.publish(LLMResponseReady(
                     session_key=spec.session_key,

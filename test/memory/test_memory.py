@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from memory import MemoryEntry, MemoryManager, MemoryStore, extract_links, parse_frontmatter
+from memory import MemoryEntry, MemoryManager, MemoryStore, parse_frontmatter
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -69,26 +69,6 @@ class TestParseFrontmatter:
 
 
 # ---------------------------------------------------------------------------
-# extract_links
-# ---------------------------------------------------------------------------
-
-
-class TestExtractLinks:
-    def test_single_link(self):
-        assert extract_links("See [[other-memory]] for context.") == ["other-memory"]
-
-    def test_multiple_links(self):
-        result = extract_links("[[a]] and [[b]] and [[c]]")
-        assert result == ["a", "b", "c"]
-
-    def test_no_links(self):
-        assert extract_links("No links here.") == []
-
-    def test_underscored_links(self):
-        assert extract_links("[[user_role]] and [[project_context]]") == ["user_role", "project_context"]
-
-
-# ---------------------------------------------------------------------------
 # MemoryEntry
 # ---------------------------------------------------------------------------
 
@@ -143,13 +123,6 @@ class TestMemoryStoreInit:
         assert (store.memory_dir / "feedback").exists()
         assert (store.memory_dir / "project").exists()
         assert (store.memory_dir / "reference").exists()
-
-    def test_default_max_history(self, store):
-        assert store.max_history_entries == 1000
-
-    def test_custom_max_history(self, workspace):
-        store = MemoryStore(workspace, max_history_entries=500)
-        assert store.max_history_entries == 500
 
 
 class TestSoulAndUser:
@@ -209,10 +182,8 @@ class TestMemoryCRUD:
         names = {e.name for e in entries}
         assert names == {"a", "b"}
 
-    def test_find_memory(self, store):
-        store.write_memory(MemoryEntry(name="find-me", type="reference", description="Ref.", content="data"))
-        assert store.find_memory("find-me") is not None
-        assert store.find_memory("nope") is None
+    def test_read_nonexistent_memory(self, store):
+        assert store.read_memory("nope") is None
 
     def test_overwrite_existing(self, store):
         e1 = MemoryEntry(name="overwrite", type="user", description="v1", content="old")
@@ -235,15 +206,6 @@ class TestMemoryIndex:
         assert "y" in index
         assert "X marks" in index
         assert "Y not" in index
-
-    def test_parse_index_entries(self, store):
-        store.write_memory(MemoryEntry(name="p1", type="user", description="First", content=""))
-        store.write_memory(MemoryEntry(name="p2", type="feedback", description="Second", content=""))
-        entries = store.parse_index_entries()
-        assert len(entries) == 2
-        names = {e["name"] for e in entries}
-        assert names == {"p1", "p2"}
-
 
 class TestReverseSync:
     def test_no_changes_on_fresh_store(self, store):
@@ -268,82 +230,6 @@ class TestReverseSync:
 
 
 # ---------------------------------------------------------------------------
-# MemoryStore — history
-# ---------------------------------------------------------------------------
-
-
-class TestHistory:
-    def test_append_and_read(self, store):
-        c1 = store.append_history("First entry")
-        c2 = store.append_history("Second entry")
-        assert c2 > c1
-
-        entries = store.read_unprocessed_history(0)
-        assert len(entries) >= 2
-
-    def test_read_since_cursor(self, store):
-        store.append_history("old")
-        store.append_history("middle")
-        c3 = store.append_history("new")
-        entries = store.read_unprocessed_history(c3 - 1)
-        assert len(entries) == 1
-        assert entries[0]["content"] == "new"
-
-    def test_compact(self, store):
-        store.max_history_entries = 3
-        for i in range(10):
-            store.append_history(f"entry {i}")
-        store.compact_history()
-        entries = store._read_entries()
-        assert len(entries) <= 3
-        # Should keep the newest
-        assert "entry 9" in entries[-1]["content"]
-
-    def test_compact_no_limit(self, store):
-        store.max_history_entries = 0
-        for i in range(5):
-            store.append_history(f"entry {i}")
-        store.compact_history()
-        assert len(store._read_entries()) == 5
-
-    def test_get_last_cursor(self, store):
-        assert store.get_last_cursor() == 0
-        c = store.append_history("test")
-        assert store.get_last_cursor() == c
-
-    def test_truncation(self, store):
-        c = store.append_history("x" * 20_000, max_chars=100)
-        entries = store.read_unprocessed_history(c - 1)
-        assert len(entries[0]["content"]) <= 150  # 100 + truncation suffix
-
-
-class TestDreamCursor:
-    def test_default(self, store):
-        assert store.get_last_dream_cursor() == 0
-
-    def test_set_and_get(self, store):
-        store.set_last_dream_cursor(42)
-        assert store.get_last_dream_cursor() == 42
-
-
-class TestMemoryContext:
-    def test_empty(self, store):
-        assert store.get_memory_context() == ""
-
-    def test_with_entries(self, store):
-        store.write_memory(MemoryEntry(
-            name="ctx-test",
-            type="user",
-            description="Context test entry.",
-            content="Body for context injection.",
-        ))
-        ctx = store.get_memory_context()
-        assert "Memory Index" in ctx
-        assert "ctx-test" in ctx
-        assert "Body for context injection." in ctx
-
-
-# ---------------------------------------------------------------------------
 # MemoryManager
 # ---------------------------------------------------------------------------
 
@@ -357,7 +243,7 @@ class TestManagerCRUD:
     def test_remember_update_existing(self, manager):
         manager.remember("update-me", "v1", mem_type="user", description="First")
         manager.remember("update-me", "v2", mem_type="user", description="Second")
-        entry = manager.get("update-me")
+        entry = manager.store.read_memory("update-me")
         assert entry.content == "v2"
         assert entry.description == "Second"
 
@@ -368,22 +254,15 @@ class TestManagerCRUD:
     def test_forget(self, manager):
         manager.remember("bye", "gone", mem_type="feedback", description="Temporary")
         assert manager.forget("bye") is True
-        assert manager.get("bye") is None
+        assert manager.store.read_memory("bye") is None
 
     def test_forget_nonexistent(self, manager):
         assert manager.forget("ghost") is False
 
-    def test_list_all(self, manager):
+    def test_memory_count(self, manager):
         manager.remember("a", "A", mem_type="user", description="first")
         manager.remember("b", "B", mem_type="project", description="second")
         assert manager.memory_count == 2
-
-    def test_get(self, manager):
-        manager.remember("get-me", "value", mem_type="reference", description="desc")
-        entry = manager.get("get-me")
-        assert entry is not None
-        assert entry.content == "value"
-        assert manager.get("nope") is None
 
 
 class TestManagerRecall:
@@ -419,73 +298,8 @@ class TestManagerRecall:
             assert results[0].name in ("match-name", "other")
 
 
-class TestManagerContext:
-    def test_empty(self, manager):
-        ctx = manager.build_memory_context()
-        assert ctx == ""
-
-    def test_with_soul(self, manager):
-        manager.store.write_soul("I am helpful.")
-        ctx = manager.build_memory_context()
-        assert "SOUL.md" in ctx
-        assert "I am helpful." in ctx
-
-    def test_with_user(self, manager):
-        manager.store.write_user("Python engineer.")
-        ctx = manager.build_memory_context()
-        assert "USER.md" in ctx
-        assert "Python engineer." in ctx
-
-    def test_with_memories(self, manager):
-        manager.remember("test", "body", mem_type="user", description="Test memory")
-        ctx = manager.build_memory_context()
-        assert "# Memory" in ctx
-        assert "test" in ctx
-
-    def test_full_context(self, manager):
-        manager.store.write_soul("AI assistant.")
-        manager.store.write_user("Developer user.")
-        manager.remember("pref", "Dark mode preferred.", mem_type="feedback", description="UI preferences")
-        ctx = manager.build_memory_context()
-        assert "SOUL.md" in ctx
-        assert "USER.md" in ctx
-        assert "# Memory" in ctx
-        assert "pref" in ctx
-        assert "Dark mode preferred." in ctx
-
-
-class TestManagerHistory:
-    def test_record(self, manager):
-        c = manager.record("User said hello.")
-        assert c > 0
-        assert manager.history_count >= 1
-
-    def test_get_recent(self, manager):
-        for i in range(10):
-            manager.record(f"entry {i}")
-        recent = manager.get_recent_history(5)
-        assert len(recent) == 5
-
-    def test_format_recent(self, manager):
-        manager.record("Test entry for formatting.")
-        text = manager.format_recent_history(50)
-        assert "Test entry for formatting." in text
-
-    def test_format_recent_truncation(self, manager):
-        manager.record("A" * 500)
-        text = manager.format_recent_history(50, max_chars=100)
-        assert len(text) <= 200  # 100 + "... (truncated)" + newlines
-
-
 class TestManagerSync:
     def test_sync_no_changes(self, manager):
         manager.remember("sync-test", "ok", mem_type="user", description="test")
         changed = manager.sync_from_disk()
         assert isinstance(changed, list)
-
-    def test_compact(self, manager):
-        manager.store.max_history_entries = 5
-        for i in range(20):
-            manager.record(f"entry {i}")
-        manager.compact()
-        assert manager.history_count <= 5

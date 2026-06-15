@@ -27,6 +27,7 @@ from .metrics import (
     MetricsRegistry,
     MetricsRegistrySnapshot,
 )
+from .otel_bridge import OTelBridge, auto_install, otel_available
 from .trace import Span, SpanContext, Tracer, tracer
 
 __all__ = [
@@ -50,6 +51,10 @@ __all__ = [
     "MetricsRegistry",
     "MetricsRegistrySnapshot",
     "REGISTRY",
+    # otel bridge
+    "OTelBridge",
+    "auto_install",
+    "otel_available",
     # display
     "show_banner",
     "show_tool_results",

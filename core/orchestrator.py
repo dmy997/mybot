@@ -24,6 +24,7 @@ from context.context_manager import ContextManager
 from core.events import SessionCreated, SessionDeleted, bus
 from core.message_bus import InboundMessage, MessageBus, OutboundMessage
 from observability import LogConfig, init_logging
+from observability.otel_bridge import auto_install as auto_install_otel
 from observability.subscribers import install as install_subscribers
 from observability.trace import tracer
 from tools import ToolRegistry
@@ -92,10 +93,13 @@ class Orchestrator:
     ) -> None:
         self._running = False
         self.workspace = Path(workspace).expanduser().resolve()
+        self._compress_idle_seconds = idle_compress_seconds
+        self._compressing_sessions: set[str] = set()
 
         # Observability — configure loguru + event bus subscribers once
         init_logging(log_config)
         install_subscribers(debug=(log_config is not None and log_config.level == "DEBUG"))
+        auto_install_otel(tracer)
 
         # Context (idle compression is handled by ContextManager)
         self.ctx = ContextManager(
@@ -349,6 +353,78 @@ class Orchestrator:
                     error=str(exc),
                 )
 
+    # -- idle compression -------------------------------------------------------
+
+    async def _compress_idle_sessions(self, active_session_key: str) -> None:
+        """Scan all sessions and compress those that have been idle too long.
+
+        Only sessions whose last update exceeds ``_compress_idle_seconds``
+        are compressed.  The active session and sessions already being
+        compressed are skipped.
+        """
+        idle_seconds = self._compress_idle_seconds
+        if idle_seconds <= 0:
+            return
+
+        try:
+            now = time.time()
+            for sess in self.ctx.list_sessions():
+                key = sess.get("key", "")
+                if not key:
+                    continue
+                if key == active_session_key:
+                    continue
+                if key in self._compressing_sessions:
+                    continue
+
+                updated_str = sess.get("updated_at", "")
+                if not updated_str:
+                    continue
+                try:
+                    from datetime import datetime
+                    updated_at = datetime.fromisoformat(updated_str)
+                    updated_ts = updated_at.timestamp()
+                except (ValueError, TypeError, OSError):
+                    continue
+
+                if now - updated_ts <= idle_seconds:
+                    continue
+
+                self._compressing_sessions.add(key)
+                asyncio.create_task(
+                    self._compress_stale_session(key),
+                    name=f"idle-compress-{key}",
+                )
+        except Exception:
+            logger.opt(exception=True).debug("Idle compression scan failed")
+
+    async def _compress_stale_session(self, session_key: str) -> None:
+        """Compress a stale session: keep the 10 most recent messages, summarise the rest."""
+        try:
+            # Load the full session to check message count
+            session = self.ctx.session.get_session(session_key)
+            cursor = session.consolidated_cursor
+            unsummarised = len(session.messages) - cursor
+            if unsummarised <= 10:
+                return  # nothing to compress
+
+            logger.info(
+                "Idle compression: {!r} has {} unsummarised messages, compressing...",
+                session_key, unsummarised,
+            )
+            n = await self.ctx.compress(session_key, keep_recent=10)
+            if n > 0:
+                logger.info(
+                    "Idle compression: {!r} compressed {} messages (kept last 10)",
+                    session_key, n,
+                )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Idle compression failed for {!r}", session_key,
+            )
+        finally:
+            self._compressing_sessions.discard(session_key)
+
     # -- MessageBus-based serving ---------------------------------------------
 
     async def serve(self, bus_msg: MessageBus, session_key: str) -> None:
@@ -371,7 +447,12 @@ class Orchestrator:
 
         try:
             while self._running:
-                raw = await queue.get()
+                try:
+                    raw = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    await self._compress_idle_sessions(session_key)
+                    continue
+
                 if raw is None:  # sentinel
                     break
 
