@@ -4,7 +4,7 @@
 [![Tests](https://img.shields.io/badge/tests-711%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-受 **Claude Code**、**nanobot**、**OpenClaw** 启发的个人 AI 助手框架。可读性强，高度模块化，轻量无冗余。
+受 **Claude Code**、**nanobot**、**OpenClaw** 启发，通过 Claude Code vibe coding 开发的个人 AI 助手框架。可读性强，高度模块化，轻量无冗余。
 
 **中文** | [English](./README_en.md)
 

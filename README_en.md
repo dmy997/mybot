@@ -4,7 +4,7 @@
 [![Tests](https://img.shields.io/badge/tests-711%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-A personal AI assistant framework inspired by **Claude Code**, **nanobot**, and **OpenClaw**. Highly readable, modular, and lightweight.
+A personal AI assistant framework inspired by **Claude Code**, **nanobot**, and **OpenClaw**, built with Claude Code vibe coding. Highly readable, modular, and lightweight.
 
 **English** | [中文](./README.md)
 
