@@ -94,11 +94,11 @@ def _resolve_safe(workspace: Path, file_path: str) -> Path | None:
 
 
 class ReadTool(Tool):
-    """Read a file (or list a directory) within the workspace.
+    """Read a file or list a directory within the workspace.
 
-    Returns content with 1-indexed line numbers.  Directories are listed
-    rather than read.  Binary files and files exceeding the size cap are
-    rejected.
+    If *path* is a directory the contents are listed (sorted, dirs first).
+    When *path* is a file the content is returned with 1-indexed line numbers.
+    Binary files and files exceeding the size cap are rejected.
     """
 
     name = "read"
@@ -106,16 +106,17 @@ class ReadTool(Tool):
     _parallel = True
     capabilities = {Capability.FILE_READ}
     description = (
-        "Read a file from the workspace. Returns file contents with line "
-        "numbers like 'cat -n'. Directories are listed. Binary files and "
-        "files larger than 1 MB are rejected."
+        "Read a file or list a directory within the workspace. "
+        "If path is a directory, entries are listed (dirs first, sorted by name). "
+        "If path is a file, returns content with line numbers like 'cat -n'. "
+        "Binary files and files larger than 1 MB are rejected."
     )
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "file_path": {
+            "path": {
                 "type": "string",
-                "description": "Relative path to the file/directory within the workspace.",
+                "description": "Path to the file or directory to read/list.",
             },
             "offset": {
                 "type": "integer",
@@ -126,7 +127,7 @@ class ReadTool(Tool):
                 "description": "Max lines to return (default: all lines up to the size cap).",
             },
         },
-        "required": ["file_path"],
+        "required": ["path"],
         "additionalProperties": False,
     }
 
@@ -135,15 +136,17 @@ class ReadTool(Tool):
 
     async def execute(
         self,
-        file_path: str,
+        path: str = "",
         offset: int | None = None,
         limit: int | None = None,
-        **_: Any,
+        **kwargs: Any,
     ) -> ToolResult:
-        p = _resolve_safe(self.workspace, file_path)
+        # Accept both new "path" and legacy "file_path" parameter names
+        actual_path = path or kwargs.get("file_path", "")
+        p = _resolve_safe(self.workspace, actual_path)
         if p is None:
             return ToolResult(
-                success=False, content="", error=f"Invalid or unsafe path: {file_path!r}"
+                success=False, content="", error=f"Invalid or unsafe path: {actual_path!r}"
             )
 
         # --- directory --------------------------------------------------------
@@ -153,14 +156,14 @@ class ReadTool(Tool):
         # --- existence & type ------------------------------------------------
         if not p.exists():
             return ToolResult(
-                success=False, content="", error=f"File not found: {file_path!r}"
+                success=False, content="", error=f"File not found: {actual_path!r}"
             )
 
         if not p.is_file():
             return ToolResult(
                 success=False,
                 content="",
-                error=f"Not a regular file: {file_path!r}",
+                error=f"Not a regular file: {actual_path!r}",
             )
 
         # --- size ------------------------------------------------------------
@@ -194,7 +197,7 @@ class ReadTool(Tool):
             return ToolResult(
                 success=False,
                 content="",
-                error=f"File appears to be binary: {file_path!r}",
+                error=f"File appears to be binary: {actual_path!r}",
             )
 
         # --- format output ---------------------------------------------------
@@ -266,7 +269,7 @@ class WriteTool(Tool):
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "file_path": {
+            "path": {
                 "type": "string",
                 "description": "Relative path to the file to write/create.",
             },
@@ -275,18 +278,20 @@ class WriteTool(Tool):
                 "description": "The exact text content to write.",
             },
         },
-        "required": ["file_path", "content"],
+        "required": ["path", "content"],
         "additionalProperties": False,
     }
 
     def __init__(self, workspace: str | Path) -> None:
         self.workspace = Path(workspace).resolve()
 
-    async def execute(self, file_path: str, content: str, **_: Any) -> ToolResult:
-        p = _resolve_safe(self.workspace, file_path)
+    async def execute(self, path: str = "", content: str = "", **kwargs: Any) -> ToolResult:
+        # Accept both new "path" and legacy "file_path" parameter names
+        actual_path = path or kwargs.get("file_path", "")
+        p = _resolve_safe(self.workspace, actual_path)
         if p is None:
             return ToolResult(
-                success=False, content="", error=f"Invalid or unsafe path: {file_path!r}"
+                success=False, content="", error=f"Invalid or unsafe path: {actual_path!r}"
             )
 
         if len(content) > MAX_WRITE_BYTES:
@@ -301,7 +306,7 @@ class WriteTool(Tool):
 
         if p.is_dir():
             return ToolResult(
-                success=False, content="", error=f"Path is a directory: {file_path!r}"
+                success=False, content="", error=f"Path is a directory: {actual_path!r}"
             )
 
         # Create parent directories
@@ -319,4 +324,136 @@ class WriteTool(Tool):
                 success=False, content="", error=f"Cannot write file: {exc}"
             )
 
-        return ToolResult(success=True, content=f"Wrote {len(content)} bytes to {file_path!r}")
+        return ToolResult(success=True, content=f"Wrote {len(content)} bytes to {actual_path!r}")
+
+
+# ---------------------------------------------------------------------------
+# ListDirTool (ls)
+# ---------------------------------------------------------------------------
+
+
+class ListDirTool(Tool):
+    """List files and subdirectories in a directory within the workspace.
+
+    This is the **primary tool for exploring directory contents**. Prefer this
+    over running ``find`` or ``ls`` via bash — it is faster, safer, and
+    respects workspace boundaries automatically.
+
+    Entries are sorted with directories first, then by name.  Supports
+    recursive listing up to a configurable depth.  Capped at 200 entries.
+    """
+
+    name = "ls"
+    _scopes = {"core", "subagent", "memory"}
+    _parallel = True
+    capabilities = {Capability.FILE_READ}
+    description = (
+        "List files and subdirectories in a directory — use this instead of "
+        "running 'find' or 'ls' via bash. "
+        "Returns entries sorted with directories first, then alphabetically. "
+        "Set recursive=true to list subdirectories recursively (depth limit 3). "
+        "Capped at 200 entries. "
+        "Use this whenever you need to explore a directory or find files by name pattern."
+    )
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "dir_path": {
+                "type": "string",
+                "description": "Path to the directory to list (use '.' for the workspace root).",
+            },
+            "recursive": {
+                "type": "boolean",
+                "description": "List subdirectories recursively (default: false, max depth: 3).",
+            },
+            "glob": {
+                "type": "string",
+                "description": "Optional filename pattern, e.g. '*.py' or 'test_*.py' (default: all files).",
+            },
+        },
+        "required": ["dir_path"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, workspace: str | Path) -> None:
+        self.workspace = Path(workspace).resolve()
+
+    async def execute(
+        self,
+        dir_path: str,
+        recursive: bool = False,
+        glob: str = "",
+        **kwargs: Any,
+    ) -> ToolResult:
+        p = _resolve_safe(self.workspace, dir_path)
+        if p is None:
+            return ToolResult(
+                success=False, content="", error=f"Invalid or unsafe path: {dir_path!r}"
+            )
+
+        if not p.is_dir():
+            return ToolResult(
+                success=False, content="",
+                error=f"Not a directory: {dir_path!r}. Use 'read' to read files.",
+            )
+
+        max_depth = 3 if recursive else 1
+        return self._list_dir(p, max_depth=max_depth, glob_pattern=glob)
+
+    def _list_dir(self, path: Path, max_depth: int = 1, glob_pattern: str = "") -> ToolResult:
+        from fnmatch import fnmatch
+
+        entries: list[Path] = []
+        try:
+            for entry in sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+                entries.append(entry)
+        except PermissionError:
+            return ToolResult(
+                success=False, content="", error=f"Permission denied: {path}"
+            )
+
+        if max_depth > 1:
+            subdirs = [e for e in entries if e.is_dir()]
+            for sub in subdirs:
+                try:
+                    for entry in sorted(sub.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+                        entries.append(entry)
+                except PermissionError:
+                    pass
+
+        if not entries:
+            return ToolResult(success=True, content="(empty directory)")
+
+        # Apply glob filter
+        if glob_pattern:
+            entries = [e for e in entries if fnmatch(e.name, glob_pattern)]
+
+        if not entries:
+            return ToolResult(success=True, content=f"(no entries matching {glob_pattern!r})")
+
+        if len(entries) > MAX_DIR_LIST_ENTRIES:
+            entries = entries[:MAX_DIR_LIST_ENTRIES]
+            truncated = True
+        else:
+            truncated = False
+
+        lines = []
+        for entry in entries:
+            try:
+                suffix = "/" if entry.is_dir() else ""
+                # Show relative path for recursive listings
+                if max_depth > 1:
+                    try:
+                        rel = entry.relative_to(path.parent)
+                        lines.append(f"  {rel}{suffix}")
+                    except ValueError:
+                        lines.append(f"  {entry.name}{suffix}")
+                else:
+                    lines.append(f"  {entry.name}{suffix}")
+            except OSError:
+                lines.append(f"  {entry.name}")
+
+        if truncated:
+            lines.append(f"  ... ({MAX_DIR_LIST_ENTRIES} entries shown)")
+
+        return ToolResult(success=True, content="\n".join(lines))

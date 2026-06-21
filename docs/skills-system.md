@@ -40,7 +40,7 @@ class SkillsLoader:
 name: frontend-design
 description: 创建高质量前端界面
 metadata:
-  nanobot:
+  mybot:
     always: true
 requires:
   bins: []
@@ -56,15 +56,15 @@ requires:
 YAML frontmatter 字段:
 - **name**: Skill 标识（目录名）
 - **description**: 简短描述
-- **metadata**: 嵌套元数据（支持 nanobot/openclaw 格式的 JSON 或 YAML 字典）
+- **metadata**: 嵌套元数据（支持 YAML 字典或 JSON 字符串格式）
 - **requires.bins**: 需要系统中有哪些 CLI 命令
 - **requires.env**: 需要设置哪些环境变量
 
-### 元数据解析（兼容 nanobot/openclaw）
+### 元数据解析
 
 ```python
-def _parse_nanobot_metadata(self, raw: object) -> dict:
-    """提取 nanobot/openclaw 元数据。
+def _parse_skill_metadata(self, raw: object) -> dict:
+    """提取 skill 元数据。
     支持 dict（已由 yaml.safe_load 解析）和 JSON 字符串两种格式。
     """
     if isinstance(raw, dict):
@@ -76,7 +76,7 @@ def _parse_nanobot_metadata(self, raw: object) -> dict:
             return {}
     else:
         return {}
-    payload = data.get("nanobot", data.get("openclaw", {}))
+    payload = data.get("mybot", data.get("nanobot", data.get("openclaw", {})))
     return payload if isinstance(payload, dict) else {}
 ```
 
@@ -130,7 +130,7 @@ def get_always_skills(self) -> list[str]:
         for entry in self.list_skills(filter_unavailable=True)
         if (meta := self.get_skill_metadata(entry["name"]) or {})
         and (
-            self._parse_nanobot_metadata(meta.get("metadata")).get("always")
+            self._parse_skill_metadata(meta.get("metadata")).get("always")
             or meta.get("always")
         )
     ]
@@ -189,5 +189,5 @@ ContextManager(workspace=..., disabled_skills=["slack-gif-creator"])
 - **渐进加载**: 系统提示词中只有摘要（名称+描述+路径），Agent 按需用 read_file 加载完整 Skill
 - **用户覆盖**: workspace/skills/ 中的 Skill 优先于内置
 - **依赖感知**: 缺少 CLI 工具或环境变量的 Skill 自动标记为不可用，不污染 Agent 选择
-- **兼容性**: 兼容 nanobot/openclaw 的 metadata 格式（`metadata.nanobot` 或 `metadata.openclaw`），支持 dict 和 JSON 字符串
+- **兼容性**: 支持 `metadata.mybot`（以及旧版 `metadata.nanobot`/`metadata.openclaw`），支持 dict 和 JSON 字符串
 - **always 机制**: 标记为 always 的 Skill 自动注入，无需显式调用

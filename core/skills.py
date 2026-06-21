@@ -167,8 +167,8 @@ class SkillsLoader:
             return content[match.end():].strip()
         return content
 
-    def _parse_nanobot_metadata(self, raw: object) -> dict:
-        """Extract nanobot/openclaw metadata from a frontmatter field.
+    def _parse_skill_metadata(self, raw: object) -> dict:
+        """Extract skill metadata from a frontmatter field.
 
         ``raw`` may be a dict (already parsed by yaml.safe_load) or a JSON str.
         """
@@ -183,7 +183,7 @@ class SkillsLoader:
             return {}
         if not isinstance(data, dict):
             return {}
-        payload = data.get("nanobot", data.get("openclaw", {}))
+        payload = data.get("mybot", data.get("nanobot", data.get("openclaw", {})))
         return payload if isinstance(payload, dict) else {}
 
     def _check_requirements(self, skill_meta: dict) -> bool:
@@ -196,9 +196,9 @@ class SkillsLoader:
         )
 
     def _get_skill_meta(self, name: str) -> dict:
-        """Get nanobot metadata for a skill (cached in frontmatter)."""
+        """Get skill metadata (cached in frontmatter)."""
         raw_meta = self.get_skill_metadata(name) or {}
-        return self._parse_nanobot_metadata(raw_meta.get("metadata"))
+        return self._parse_skill_metadata(raw_meta.get("metadata"))
 
     def get_always_skills(self) -> list[str]:
         """Get skills marked as always=true that meet requirements."""
@@ -207,7 +207,7 @@ class SkillsLoader:
             for entry in self.list_skills(filter_unavailable=True)
             if (meta := self.get_skill_metadata(entry["name"]) or {})
             and (
-                self._parse_nanobot_metadata(meta.get("metadata")).get("always")
+                self._parse_skill_metadata(meta.get("metadata")).get("always")
                 or meta.get("always")
             )
         ]

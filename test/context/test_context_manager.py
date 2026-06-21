@@ -8,15 +8,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from context.compaction import CompactionService
+from context.compaction import _count_tokens
 from context.context_manager import (
     _INTERRUPT_MESSAGE,
     _INTERRUPT_TOOL_RESULT,
     ContextManager,
-    _count_tokens,
     _estimate_message_tokens,
 )
-from providers.base import LLMProvider, LLMResponse
+from providers.base import LLMProvider
 from tools import ToolRegistry
 
 # ---------------------------------------------------------------------------
@@ -37,11 +36,7 @@ def ctx(workspace):
 
 @pytest.fixture
 def provider():
-    p = MagicMock(spec=LLMProvider)
-    p.chat_with_retry = AsyncMock(
-        return_value=LLMResponse(content="Summarised.", finish_reason="stop")
-    )
-    return p
+    return MagicMock(spec=LLMProvider)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +90,7 @@ class TestInit:
 
     async def test_creates_sub_managers(self, ctx):
         assert ctx.session is not None
-        assert ctx.memory is not None
+        assert ctx.store is not None
         assert ctx.skills_loader is not None
 
 
@@ -209,18 +204,6 @@ class TestSystemPromptAssembly:
         msgs = await cm.build_messages("sp5", "query")
         assert msgs[0]["role"] == "system"
 
-    async def test_history_summaries_injected(self, ctx, provider):
-        """When history.jsonl exists, its summaries appear in system prompt."""
-        ctx.provider = provider
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="A summary."))
-
-        # Manually write a history record
-        ctx._write_history("sp6", 5, "Past conversation summary.")
-
-        msgs = await ctx.build_messages("sp6", "hello")
-        assert "Previous Conversation Summaries" in msgs[0]["content"]
-        assert "Past conversation summary" in msgs[0]["content"]
-
 
 # ---------------------------------------------------------------------------
 # Session lifecycle
@@ -282,11 +265,8 @@ class TestCompressKeepRecent:
         session_after = ctx.session.get_session("cr1")
         assert len(session_after.messages) == 5
 
-    async def test_compresses_older_messages(self, ctx, provider):
-        """keep_recent=10 with 20 messages → 10 compressed."""
-        ctx.provider = provider
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Summary."))
-
+    async def test_compresses_older_messages(self, ctx):
+        """keep_recent=10 with 20 messages → 10 compressed (cursor advanced)."""
         session = ctx.session.get_session("cr2")
         session.messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
         ctx.session.save_session(session)
@@ -294,19 +274,12 @@ class TestCompressKeepRecent:
         n = await ctx.compress("cr2", keep_recent=10)
         assert n == 10
 
-        # Provider called
-        provider.chat_with_retry.assert_called_once()
-
         # Session messages UNCHANGED
         session_after = ctx.session.get_session("cr2")
         assert len(session_after.messages) == 20
 
         # Cursor advanced
         assert session_after.consolidated_cursor == 10
-
-        # history.jsonl written
-        history_path = ctx._history_path("cr2")
-        assert history_path.exists()
 
     async def test_disabled_when_idle_zero(self, ctx):
         """idle_compress_seconds=0 disables idle compression."""
@@ -319,7 +292,7 @@ class TestCompressKeepRecent:
         assert n == 0
 
     async def test_truncation_fallback_no_provider(self, ctx):
-        """Without provider, falls back to truncation."""
+        """Without provider, cursor advancement still works."""
         session = ctx.session.get_session("cr4")
         session.messages = [{"role": "user", "content": f"m{i}"} for i in range(15)]
         ctx.session.save_session(session)
@@ -329,24 +302,8 @@ class TestCompressKeepRecent:
         session_after = ctx.session.get_session("cr4")
         assert session_after.consolidated_cursor == 5
 
-    async def test_handles_summarise_failure(self, ctx):
-        """LLM failure → falls back to truncation."""
-        ctx.provider = MagicMock(spec=LLMProvider)
-        ctx.provider.chat_with_retry = AsyncMock(side_effect=RuntimeError("LLM down"))
-
-        session = ctx.session.get_session("cr5")
-        session.messages = [{"role": "user", "content": f"m{i}"} for i in range(12)]
-        ctx.session.save_session(session)
-
-        n = await ctx.compress("cr5", keep_recent=10)
-        assert n == 2
-        session_after = ctx.session.get_session("cr5")
-        assert session_after.consolidated_cursor == 2
-
-    async def test_messages_not_modified(self, ctx, provider):
+    async def test_messages_not_modified(self, ctx):
         """Compression never modifies session.messages content."""
-        ctx.provider = provider
-
         session = ctx.session.get_session("cr6")
         original = [{"role": "user", "content": f"msg{i}"} for i in range(15)]
         session.messages = list(original)
@@ -365,11 +322,8 @@ class TestCompressKeepRecent:
 
 
 class TestCompressBudgetTokens:
-    async def test_keeps_messages_within_budget(self, ctx, provider):
+    async def test_keeps_messages_within_budget(self, ctx):
         """budget_tokens controls how many recent messages are kept."""
-        ctx.provider = provider
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Summary."))
-
         session = ctx.session.get_session("cb1")
         session.messages = [{"role": "user", "content": "x" * 500}] * 30
         ctx.session.save_session(session)
@@ -396,12 +350,9 @@ class TestCompressBudgetTokens:
 
 
 class TestAdjustSplit:
-    async def test_does_not_split_user_assistant_pair(self, ctx, provider):
+    async def test_does_not_split_user_assistant_pair(self, ctx):
         """A user message kept without its assistant response would violate turn
         integrity.  _adjust_split moves the preceding user into to_keep."""
-        ctx.provider = provider
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Summary."))
-
         session = ctx.session.get_session("as1")
         session.messages = [
             {"role": "user", "content": "q1"},
@@ -423,11 +374,8 @@ class TestAdjustSplit:
         assert n == 8  # 10 - 2 = 8 compressed
         # But cursor=8 means build_messages sees [q5, a5] — intact turn
 
-    async def test_adjusts_when_assistant_first_in_keep(self, ctx, provider):
+    async def test_adjusts_when_assistant_first_in_keep(self, ctx):
         """If to_keep starts with 'assistant', the preceding 'user' is moved."""
-        ctx.provider = provider
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Summary."))
-
         session = ctx.session.get_session("as2")
         session.messages = [
             {"role": "user", "content": "q1"},
@@ -447,12 +395,9 @@ class TestAdjustSplit:
         assert session_after.consolidated_cursor == 4
         # build_messages would see [q3, a3] — complete turn
 
-    async def test_adjusts_when_tool_first_in_keep(self, ctx, provider):
+    async def test_adjusts_when_tool_first_in_keep(self, ctx):
         """If to_keep starts with 'tool', the preceding assistant (with
         tool_calls) is moved."""
-        ctx.provider = provider
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Summary."))
-
         session = ctx.session.get_session("as3")
         session.messages = [
             {"role": "user", "content": "q1"},
@@ -473,53 +418,15 @@ class TestAdjustSplit:
 
 
 # ---------------------------------------------------------------------------
-# Dehydration
-# ---------------------------------------------------------------------------
-
-
-class TestDehydrate:
-    """Tests for CompactionService._dehydrate_messages (moved from ContextManager)."""
-
-    def test_strips_data_uris(self):
-        msgs = [{"role": "user", "content": "Look: data:image/png;base64,iVBORw0KGgoAAAANS"}]
-        dehydrated = CompactionService._dehydrate_messages_static(msgs)
-        assert "data:image/png;base64" not in str(dehydrated[0]["content"])
-        assert "binary data removed" in str(dehydrated[0]["content"])
-
-    def test_truncates_long_content(self):
-        msgs = [{"role": "user", "content": "x" * 5000}]
-        dehydrated = CompactionService._dehydrate_messages_static(msgs)
-        content = dehydrated[0]["content"]
-        assert len(content) < 4000  # 3000 + some overhead
-        assert "truncated" in content
-
-    def test_slims_tool_calls(self):
-        msgs = [{
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "c1",
-                "function": {"name": "write_file", "arguments": '{"path":"/x","content":"' + "x" * 5000 + '}"'},
-            }],
-        }]
-        dehydrated = CompactionService._dehydrate_messages_static(msgs)
-        tc = dehydrated[0]["tool_calls"][0]
-        # Arguments replaced with placeholder
-        assert tc["function"]["arguments"] == "{...}"
-
-
-# ---------------------------------------------------------------------------
 # Token-budget compression via build_messages
 # ---------------------------------------------------------------------------
 
 
 class TestBudgetCompressionIntegration:
-    async def test_build_messages_triggers_compress_when_over_budget(self, ctx, provider):
+    async def test_build_messages_triggers_compress_when_over_budget(self, ctx):
         """When assembled context exceeds max_context_tokens, compress() is called."""
-        ctx.provider = provider
         ctx.max_context_tokens = 4000
         ctx.compress_ratio = 0.5
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Summary."))
 
         session = ctx.session.get_session("bi1")
         # Varied text to avoid tiktoken compression of repeated chars.
@@ -532,8 +439,7 @@ class TestBudgetCompressionIntegration:
         ctx.session.save_session(session)
 
         msgs = await ctx.build_messages("bi1", "hello")
-        # Should have triggered compression
-        assert provider.chat_with_retry.called
+        # Should have triggered compression (cursor advanced)
 
         # Cursor should have advanced
         session_after = ctx.session.get_session("bi1")
@@ -543,17 +449,16 @@ class TestBudgetCompressionIntegration:
         assert msgs[0]["role"] == "system"
         assert msgs[-1]["role"] == "user"
 
-    async def test_no_compression_when_under_budget(self, ctx, provider):
+    async def test_no_compression_when_under_budget(self, ctx):
         """Context fits in budget → no compression."""
-        ctx.provider = provider
         ctx.max_context_tokens = 1_000_000  # huge budget
 
         session = ctx.session.get_session("bi2")
         session.messages = [{"role": "user", "content": "hi"}] * 5
         ctx.session.save_session(session)
 
-        await ctx.build_messages("bi2", "hello")
-        assert not provider.chat_with_retry.called
+        msgs = await ctx.build_messages("bi2", "hello")
+        assert msgs[0]["role"] == "system"
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +479,7 @@ class TestMemoryDelegation:
     async def test_recall(self, ctx):
         ctx.remember("recall-me", "some content")
         results = ctx.recall("recall")
-        assert any(r.name == "recall-me" for r in results)
+        assert any(r.get("name") == "recall-me" for r in results)
 
     async def test_save_exchange_only_writes_to_session(self, ctx):
         """save_exchange appends to session.messages."""

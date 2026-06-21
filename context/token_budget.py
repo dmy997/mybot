@@ -64,22 +64,8 @@ class TokenBudget:
     history_tool_result_max_chars: int = 4_000
     """Cap for tool results loaded from session history (ContextManager)."""
 
-    compact_tool_result_max_chars: int = 3_000
-    """Cap for tool results during compaction (CompactionService)."""
-
     tool_call_args_max_chars: int = 10_000
     """Per-value cap inside ``tool_calls[].function.arguments``."""
-
-    # -- summarisation ---------------------------------------------------------
-
-    summary_max_words: int = 200
-    """Target word count for LLM-generated summaries."""
-
-    content_truncate_length: int = 2_000
-    """Max chars per message when sending to the summarisation LLM."""
-
-    dehydrate_max_content_chars: int = 3_000
-    """Max chars per content field after dehydration."""
 
     # -- micro-compact ---------------------------------------------------------
 
@@ -87,24 +73,6 @@ class TokenBudget:
     """Number of recent tool-calling turns to keep intact."""
 
     micro_compact_placeholder: str = "[Old tool result cleared]"
-
-    # -- history summaries (prevents unbounded system-prompt growth) -----------
-
-    max_history_summaries: int = 10
-    """Max number of history.jsonl entries to inject into the system prompt."""
-
-    max_history_summary_chars: int = 2_000
-    """Max chars per history summary entry."""
-
-    # -- memory index ----------------------------------------------------------
-
-    max_memory_index_lines: int = 200
-    """Max lines in MEMORY.md before truncation."""
-
-    # -- circuit breaker -------------------------------------------------------
-
-    max_consecutive_failures: int = 3
-    """Consecutive auto-compact failures before the breaker trips."""
 
     # -- compression ratio -----------------------------------------------------
 

@@ -23,6 +23,7 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     consolidated_cursor: int = 0
+    last_consolidated: int = 0    # index of last Consolidator-archived message
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

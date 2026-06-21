@@ -36,7 +36,7 @@ mybot-server           # HTTP/WS server (core.server:main), then open http://127
 - `agents/` — ReAct Agent (single-pass) + PlanSolve Agent (two-phase). Auto-discovered via `discover_agents()`
 - `context/` — ContextManager (system prompt assembly, compression, session repair) + SessionManager (JSON persistence)
 - `tools/` — 10 tools (bash, file R/W, grep, webfetch, websearch, memory CRUD, subagent), ToolRegistry, ToolGuard security
-- `memory/` — Long-term file-based memory (MemoryStore, MemoryManager, typed entries)
+- `memory/` — Long-term file-based memory (MemoryStore, Consolidator + Dream pipeline)
 - `observability/` — Structured logging (loguru), Prometheus-style metrics, span tracing, rich CLI display
 - `config/` — `.env` auto-loading, typed `Config` class
 - `utils/` — Jinja2 template rendering (`render_template()`)
@@ -86,8 +86,8 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 **`Dispatcher`** (`core/dispatcher.py`): Four-layer routing (regex commands → keyword heuristics → optional LLM classification → default). The LLM classifier is instantiated internally when `provider` is given — uses a cheap model for <10 token responses.
 
 **`ContextManager`** (`context/context_manager.py`): Unified context assembly and compression. Key behaviors:
-- Compression is **non-destructive**: `session.messages` is never modified. Only `consolidated_cursor` advances and summaries are appended to `history.jsonl`
-- System prompt assembly: base prompt → memory context (SOUL.md, USER.md, long-term memories) → history summaries → skills → tools
+- Compression is **non-destructive**: `session.messages` is never modified. `CompactionService` advances `consolidated_cursor` to skip old messages; `Consolidator` appends LLM summaries to `memory/history.jsonl`
+- System prompt assembly: base prompt → skills → tools → memory context (SOUL.md, USER.md, MEMORY.md) → file context → recent history
 - Session repair on load: detects unmatched tool calls, missing assistant responses (3 interruption patterns)
 - Idle compression + token-budget compression share the same `compress()` method
 
@@ -128,6 +128,14 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 ## Known Gaps (from README.md roadmap)
 
 - **P1**: MCP integration
-- **P2**: Agent eval benchmarks, checkpoint/resume for long tasks, Memory Dream system
+- **P2**: Agent eval benchmarks, checkpoint/resume for long tasks
 - **P3**: Multimodal input, more providers (Anthropic direct, Ollama), external chat channels
 - See `README.md` Roadmap for the full prioritized list with status markers
+
+## Memory System Improvement Roadmap
+
+See `docs/memory-comparison.md` for the full cross-project analysis. Summary:
+
+- **P1 (short-term)**: ~~Dream dedup~~, ~~age annotations (`<- Nd`)~~, session source tracking in history.jsonl
+- **P2 (medium-term)**: Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay
+- **P3 (long-term)**: Heartbeat service, Skill system, chunk-level retrieval granularity

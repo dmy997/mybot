@@ -31,6 +31,9 @@ from tools import ToolRegistry
 from tools.mcp.client_manager import MCPClientManager
 from tools.tool import Tool
 
+from services.cron import CronScheduler
+from memory.dream import Dream
+
 from .dispatcher import Dispatcher
 from .runner import AgentInput
 
@@ -136,6 +139,19 @@ class Orchestrator:
         )
         self._setup_mcp()
 
+        # Cron — self-driven periodic task scheduler
+        cron_dir = self.workspace / "cron"
+        self._dream = Dream(
+            store=self.ctx.store,
+            provider=provider,
+            model=compress_model or "",
+        )
+        self.cron = CronScheduler(
+            state_dir=cron_dir,
+            on_job=self._on_cron_job,
+        )
+        self.cron.register_job("dream", interval_hours=2)
+
     def _register_default_tools(self) -> None:
         """Auto-discover and register tools available in the ``"core"`` scope."""
         from tools import discover_tools
@@ -191,6 +207,23 @@ class Orchestrator:
         """Disconnect all MCP servers and unregister their tools."""
         if self._mcp_manager is not None:
             await self._mcp_manager.stop()
+
+    # -- Cron / Dream ---------------------------------------------------------
+
+    async def _on_cron_job(self, name: str) -> None:
+        """Route cron job *name* to the appropriate handler."""
+        if name == "dream":
+            await self._dream.run()
+
+    async def start_services(self) -> None:
+        """Start background services (MCP + cron)."""
+        await self.start_mcp()
+        await self.cron.start()
+
+    async def stop_services(self) -> None:
+        """Stop background services (MCP + cron)."""
+        self.cron.stop()
+        await self.stop_mcp()
 
     # -- helpers ---------------------------------------------------------------
 
@@ -326,6 +359,28 @@ class Orchestrator:
                 # 6. Save session — append only the new exchange
                 assistant_msgs = output.messages[len(messages):]
                 await self.ctx.save_exchange(session_key, user_input, assistant_msgs)
+
+                # 7. Consolidate — fire-and-forget, never blocks the response
+                try:
+                    session = self.ctx.session.get_session(session_key)
+                    if session:
+
+                        async def _build_fn():
+                            return await self.ctx.build_messages(
+                                session_key,
+                                "",
+                                tools=self._tools,
+                            )
+
+                        asyncio.create_task(
+                            self.ctx.consolidator.maybe_consolidate(
+                                session, build_messages_fn=_build_fn,
+                            )
+                        )
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "Consolidation skipped for {!r}", session_key,
+                    )
 
                 return OrchestratorResult(
                     content=output.content,
@@ -722,7 +777,7 @@ def main() -> None:
         nonlocal _prompt_session, _last_paradigm
 
         _init_prompt_session()
-        await orche.start_mcp()
+        await orche.start_services()
         await bus.publish(SessionCreated(session_key=session_key))
 
         renderer: StreamRenderer | None = None
@@ -856,7 +911,7 @@ def main() -> None:
         finally:
             if renderer:
                 await renderer.close()
-            await orche.stop_mcp()
+            await orche.stop_services()
 
     try:
         asyncio.run(_run())

@@ -43,7 +43,7 @@ _BLOCKED_FILE_EXTENSIONS: frozenset[str] = frozenset({
 })
 
 _BLOCKED_PATH_PATTERNS: list[str] = [
-    r"(^|/)\.git/",
+    r"(^|/)\.git(/|$)",
     r"(^|/)\.ssh/",
     # Credential-related keywords as path components (surrounded by
     # non-alphanumeric chars — covers `/`, `_`, `-`, `.`, `$`, `^`)
@@ -249,7 +249,7 @@ class ToolGuard:
 
         # --- FILE_READ / FILE_WRITE -----------------------------------------
         if Capability.FILE_READ in capabilities or Capability.FILE_WRITE in capabilities:
-            path = arguments.get("file_path", "")
+            path = arguments.get("path", "") or arguments.get("file_path", "") or arguments.get("dir_path", "")
             if path:
                 err = self._check_sensitive_path(path)
                 if err:

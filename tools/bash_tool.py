@@ -133,8 +133,8 @@ class BashTool(Tool):
         "The command runs in a sandboxed environment with a timeout and "
         "output length limits. DANGEROUS commands (rm -rf /, sudo, curl|sh, "
         "chmod 777 /, etc.) are blocked. "
-        "Use this to run build commands, linting, tests, git operations, "
-        "and file-system listings."
+        "Use this to run build commands, linting, tests, and git operations. "
+        "For listing files or exploring directories, use the 'ls' tool instead."
     )
     parameters: dict[str, Any] = {
         "type": "object",

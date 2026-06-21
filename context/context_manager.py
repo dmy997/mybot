@@ -13,7 +13,6 @@ Thresholds are read from :class:`TokenBudget` (single configuration source).
 
 from __future__ import annotations
 
-import asyncio
 import json as _json
 import re
 from datetime import datetime
@@ -26,15 +25,11 @@ if TYPE_CHECKING:
     pass
 
 from context.compaction import (
-    CompactionResult,
     CompactionService,
-    _count_tokens,
     _estimate_message_tokens,
 )
-from context.memory_service import MemoryService
-from context.session_memory import SessionMemory
 from context.token_budget import TokenBudget
-from memory import MemoryManager
+from memory.consolidator import Consolidator
 from memory.store import MemoryStore
 from tools import ToolRegistry
 from utils import render_template
@@ -45,7 +40,6 @@ from .session import SessionManager
 __all__ = [
     "ContextManager",
     "_estimate_message_tokens",
-    "CompactionResult",
     "CompactionService",
     "TokenBudget",
 ]
@@ -188,9 +182,17 @@ class ContextManager:
         from core.skills import SkillsLoader as _SkillsLoader
 
         self.session = SessionManager(self.workspace)
-        memory_store = MemoryStore(self.workspace)
-        self.memory = MemoryManager(memory_store)
+        self.store = MemoryStore(self.workspace)
         self.skills_loader = _SkillsLoader(self.workspace, disabled_skills=disabled_skills)
+
+        # Consolidator — per-turn LLM summarization → history.jsonl
+        self.consolidator = Consolidator(
+            store=self.store,
+            provider=provider,
+            model=compress_model or "",
+            context_window_tokens=max_context_tokens,
+            consolidation_ratio=compress_ratio,
+        )
 
         # Unified token budget (must be first — used by memory_service below)
         self.token_budget = TokenBudget(
@@ -199,24 +201,11 @@ class ContextManager:
             idle_compress_seconds=idle_compress_seconds,
         )
 
-        # Enhanced memory service (relevance filtering + index truncation)
-        self.memory_service = MemoryService(
-            self.memory,
-            provider=None,
-            max_index_lines=self.token_budget.max_memory_index_lines,
-        )
-
-        # Unified compaction service (three-layer pyramid)
+        # Unified compaction service (cursor advancement, no LLM)
         self.compaction = CompactionService(
-            provider=None,
             token_budget=self.token_budget,
-            workspace=self.workspace,
             session_manager=self.session,
-            compress_model=compress_model,
         )
-
-        # Session-memory cache (lazy-init per session key)
-        self._session_memories: dict[str, SessionMemory] = {}
 
         # Three-layer partitioned prompt cache:
         #
@@ -227,42 +216,23 @@ class ContextManager:
         #   Keyed by (session, query_bucket) so similar queries reuse results.
         #   Invalidated on remember() / forget().
         #
-        # Layer 3 — history summaries: compression archives.
-        #   Keyed by session_key; invalidated after auto/full compact.
-        #
-        # Dynamic parts (session notes, file context) are never cached and
+        # Dynamic parts (file context, recent history) are never cached and
         # always computed fresh.
         self._static_prompt: str | None = None
         self._memory_cache: dict[str, str] = {}    # key: "session:query_bucket"
         self._memory_cache_max = 50
-        self._history_cache: dict[str, str] = {}   # key: session_key
-        self._history_cache_max = 50
 
-        # Set via property to sync provider to compaction + memory_service
-        self.provider = provider
+        self._provider = provider
+        self._compress_model = compress_model
 
-    # -- backward-compat internal wrappers (delegate to compaction) ---------
-
-    def _write_history(
-        self, session_key: str, compressed_count: int, summary: str,
-    ) -> None:
-        """Delegate to CompactionService._write_history."""
-        self.compaction._write_history(session_key, compressed_count, summary)
-
-    def _history_path(self, session_key: str) -> Path:
-        """Delegate to CompactionService._history_path."""
-        return self.compaction._history_path(session_key)
-
-    # -- backward-compat properties (sync with token_budget / compaction) ---
+    # -- properties (sync with token_budget) --------------------------------
 
     @property
     def provider(self) -> Any | None:
-        return self.compaction.provider
+        return self._provider
 
     @provider.setter
     def provider(self, value: Any | None) -> None:
-        self.compaction.provider = value
-        self.memory_service.provider = value
         self._provider = value
 
     @property
@@ -291,11 +261,11 @@ class ContextManager:
 
     @property
     def compress_model(self) -> str | None:
-        return self.compaction.compress_model
+        return self._compress_model
 
     @compress_model.setter
     def compress_model(self, value: str | None) -> None:
-        self.compaction.compress_model = value
+        self._compress_model = value
 
     # ========================================================================
     # Public API
@@ -381,31 +351,26 @@ class ContextManager:
             result = await self.compaction.auto_compact(
                 session_key, history,
                 budget_tokens=int(budget.effective_window * budget.compress_ratio),
-                session_memory=self._get_session_memory(session_key),
             )
             if result.compressed_count > 0:
-                self._invalidate_history_cache(session_key)
                 return await self._rebuild_after_compact(
                     session_key, current_input, tools, skills,
                 )
 
         # Auto-compact threshold
         elif total > budget.auto_compact_threshold:
-            if self.compaction.can_auto_compact():
-                logger.info(
-                    "Context at {} tokens exceeds auto-compact threshold ({}), compacting",
-                    total, budget.auto_compact_threshold,
+            logger.info(
+                "Context at {} tokens exceeds auto-compact threshold ({}), compacting",
+                total, budget.auto_compact_threshold,
+            )
+            result = await self.compaction.auto_compact(
+                session_key, history,
+                budget_tokens=int(budget.effective_window * budget.compress_ratio),
+            )
+            if result.compressed_count > 0:
+                return await self._rebuild_after_compact(
+                    session_key, current_input, tools, skills,
                 )
-                result = await self.compaction.auto_compact(
-                    session_key, history,
-                    budget_tokens=int(budget.effective_window * budget.compress_ratio),
-                    session_memory=self._get_session_memory(session_key),
-                )
-                if result.compressed_count > 0:
-                    self._invalidate_history_cache(session_key)
-                    return await self._rebuild_after_compact(
-                        session_key, current_input, tools, skills,
-                    )
 
         # Warning threshold
         elif total > budget.warning_threshold:
@@ -429,6 +394,10 @@ class ContextManager:
 
         Exactly one of *keep_recent* or *budget_tokens* must be provided.
 
+        When *keep_recent* (idle compression) is used, the Consolidator is
+        invoked to LLM-summarise the older messages into the global
+        ``memory/history.jsonl`` before the cursor is advanced.
+
         Returns the number of messages compressed (0 if nothing was done).
         """
         session = self.session.get_session(session_key)
@@ -439,10 +408,8 @@ class ContextManager:
             session_key, unsummarised,
             budget_tokens=budget_tokens,
             keep_recent=keep_recent,
-            session_memory=self._get_session_memory(session_key),
+            consolidator=self.consolidator,
         )
-        if result.compressed_count > 0:
-            self._invalidate_history_cache(session_key)
         return result.compressed_count
 
     # -- session lifecycle ----------------------------------------------------
@@ -456,10 +423,7 @@ class ContextManager:
         tools_used: list[str] | None = None,
         errors: list[str] | None = None,
     ) -> None:
-        """Append a user+assistant exchange to the session log.
-
-        Also updates the session notes file for better compression quality.
-        """
+        """Append a user+assistant exchange to the session log."""
         async with self.session.lock_session(session_key):
             session = self.session.get_session(session_key)
             session.messages.append({"role": "user", "content": user_input})
@@ -467,41 +431,6 @@ class ContextManager:
                 session.messages.append(msg)
             session.updated_at = datetime.now()
             self.session.save_session(session)
-
-        # Update structured session notes (outside lock — notes are per-session, not shared)
-        if tools_used or assistant_messages:
-            assistant_content = ""
-            for m in assistant_messages:
-                if m.get("role") == "assistant" and m.get("content"):
-                    assistant_content = str(m["content"])
-                    break
-            notes = self._get_session_memory(session_key)
-
-            # 1. Rule-based update (always runs, synchronous)
-            notes.update(
-                user_input=user_input,
-                assistant_content=assistant_content,
-                tools_used=tools_used,
-                errors=errors,
-            )
-
-            # 2. Fork-agent update (fire-and-forget background task)
-            if self.provider is not None:
-                try:
-                    _ = asyncio.create_task(
-                        notes.update_async(
-                            self.provider,
-                            user_input,
-                            assistant_content,
-                            tools_used=tools_used,
-                            errors=errors,
-                            model=self.compress_model,
-                        ),
-                        name=f"fork-agent-{session_key}",
-                    )
-                except RuntimeError:
-                    # No running event loop (e.g. sync test)
-                    pass
 
     async def save_session(
         self,
@@ -531,13 +460,6 @@ class ContextManager:
     # ========================================================================
     # Session memory (per-conversation structured notes)
     # ========================================================================
-
-    def _get_session_memory(self, session_key: str) -> SessionMemory:
-        """Get or create the :class:`SessionMemory` for *session_key*."""
-        if session_key not in self._session_memories:
-            notes_path = self.workspace / "sessions" / f"{session_key}_notes.md"
-            self._session_memories[session_key] = SessionMemory(session_key, notes_path)
-        return self._session_memories[session_key]
 
     # ========================================================================
     # System prompt assembly
@@ -577,9 +499,7 @@ class ContextManager:
             f"{session_key or 'default'}:{hash(query or '') % 20}"
         )
         if mem_key not in self._memory_cache:
-            self._memory_cache[mem_key] = (
-                await self.memory_service.build_memory_context(query=query)
-            )
+            self._memory_cache[mem_key] = self._build_memory_context()
             # Evict oldest if at capacity
             if len(self._memory_cache) > self._memory_cache_max:
                 oldest = next(iter(self._memory_cache))
@@ -588,44 +508,34 @@ class ContextManager:
         if memory_ctx.strip():
             parts.append(memory_ctx)
 
-        # -- Layer 3: History summaries (cached per session) ------------------
+        # -- Dynamic (never cached) ------------------------------------------
 
-        if session_key:
-            if session_key not in self._history_cache:
-                self._history_cache[session_key] = (
-                    self.compaction.read_history_summaries(
-                        session_key,
-                        max_entries=self.token_budget.max_history_summaries,
-                        max_chars_per_entry=self.token_budget.max_history_summary_chars,
-                    )
-                )
-                if len(self._history_cache) > self._history_cache_max:
-                    oldest = next(iter(self._history_cache))
-                    self._history_cache.pop(oldest)
-            history_ctx = self._history_cache[session_key]
-            if history_ctx:
-                parts.append(history_ctx)
-
-        # -- Layer 4: Dynamic (never cached) ----------------------------------
-
-        # 4a. Session notes — only inject structured digest (no raw Work Log)
-        #     truncate_for_context() returned up to 48K chars including the
-        #     full exchange log, which duplicated the messages array.
-        #     get_compact_summary() is capped at 2K chars and only contains
-        #     distilled sections: Current Task, Key Decisions, Files, Errors.
-        if session_key:
-            notes = self._get_session_memory(session_key)
-            notes_ctx = notes.get_compact_summary()
-            if notes_ctx.strip():
-                parts.append(notes_ctx)
-
-        # 4b. File context recovery
+        # File context recovery
         if messages:
             file_ctx = self._extract_file_context(messages)
             if file_ctx:
                 parts.append(file_ctx)
 
+        # Recent history (unprocessed history.jsonl entries since last Dream)
+        if session_key:
+            history_ctx = self._build_history_context()
+            if history_ctx:
+                parts.append(history_ctx)
+
         return "\n\n".join(parts)
+
+    def _build_history_context(self, max_entries: int = 20, max_chars: int = 16_000) -> str:
+        """Build a 'Recent History' section from unprocessed history.jsonl entries."""
+        dream_cursor = self.store.get_dream_cursor()
+        entries = self.store.read_history(since_cursor=dream_cursor)
+        if not entries:
+            return ""
+        entries = entries[-max_entries:]
+        lines = [f"- {e['content']}" for e in entries]
+        text = "# Recent History\n\n" + "\n".join(lines)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n... (truncated)"
+        return text
 
     async def _build_static_prompt(
         self,
@@ -827,8 +737,29 @@ class ContextManager:
         )
 
     # ========================================================================
-    # Memory access (long-term user/feedback/project/reference)
+    # Memory access — direct MEMORY.md operations
     # ========================================================================
+
+    def _build_memory_context(self) -> str:
+        """Build the memory section for system-prompt injection.
+
+        Reads SOUL.md, USER.md, and MEMORY.md directly from the store.
+        """
+        parts: list[str] = []
+
+        soul = self.store.read_soul()
+        if soul.strip():
+            parts.append(f"# Identity (SOUL.md)\n\n{soul}")
+
+        user = self.store.read_user()
+        if user.strip() and not self._is_user_template(user):
+            parts.append(f"# User Profile (USER.md)\n\n{user}")
+
+        memory_ctx = self.store.get_memory_context()
+        if memory_ctx.strip():
+            parts.append(memory_ctx)
+
+        return "\n\n---\n\n".join(parts) if parts else ""
 
     def remember(
         self,
@@ -838,20 +769,88 @@ class ContextManager:
         mem_type: str = "user",
         description: str = "",
     ) -> None:
-        """Create or update a long-term memory entry."""
-        self.memory.remember(name, content, mem_type=mem_type, description=description)
+        """Append a fact to MEMORY.md (dedup by content).
+
+        Hand-written entries and Dream-generated entries coexist in the
+        same file; Dream's dedup logic avoids duplicating facts that
+        already appear.
+        """
+        current = self.store.read_memory_file()
+        # Dedup: skip if content already appears
+        if content.strip().lower() in current.lower():
+            return
+        entry = f"- [{mem_type}] {name}: {content}"
+        if description:
+            entry += f"  # {description}"
+        updated = current.rstrip() + "\n" + entry + "\n"
+        self.store.write_memory_file(updated)
         self._invalidate_memory_cache()
 
     def forget(self, name: str) -> bool:
-        """Delete a long-term memory entry."""
-        result = self.memory.forget(name)
-        if result:
+        """Remove a fact from MEMORY.md by name match."""
+        current = self.store.read_memory_file()
+        lines = current.splitlines()
+        new_lines: list[str] = []
+        removed = False
+        for line in lines:
+            if f"[{name}]" in line or (line.startswith("- ") and name.lower() in line.lower()):
+                removed = True
+                continue
+            new_lines.append(line)
+        if removed:
+            self.store.write_memory_file("\n".join(new_lines) + "\n")
             self._invalidate_memory_cache()
-        return result
+            return True
+        return False
 
-    def recall(self, query: str, *, top_n: int = 10) -> list[Any]:
-        """Search long-term memories by keyword."""
-        return self.memory.recall(query, top_n=top_n)
+    def recall(self, query: str, *, top_n: int = 10) -> list[dict]:
+        """Keyword search in MEMORY.md content.
+
+        Returns list of dicts with name/content/type keys.
+        """
+        current = self.store.read_memory_file()
+        if not query.strip():
+            return []
+        query_lower = query.lower()
+        results: list[dict] = []
+        for line in current.splitlines():
+            line = line.strip()
+            if not line.startswith("- "):
+                continue
+            if query_lower not in line.lower():
+                continue
+            # Parse: "- [type] name: content"
+            rest = line[2:]  # strip "- "
+            entry: dict = {"raw": rest}
+            if rest.startswith("[") and "] " in rest:
+                bracket_end = rest.index("] ")
+                entry["mem_type"] = rest[1:bracket_end]
+                rest = rest[bracket_end + 2:]
+            # Split name: content
+            if ": " in rest:
+                name_part, content_part = rest.split(": ", 1)
+                entry["name"] = name_part.strip()
+                entry["content"] = content_part.split("  #")[0].strip()
+            else:
+                entry["name"] = rest.strip()
+                entry["content"] = rest.strip()
+            if "content" in entry:
+                results.append(entry)
+            if len(results) >= top_n:
+                break
+        return results
+
+    @staticmethod
+    def _is_user_template(content: str) -> bool:
+        """Return True if USER.md content looks like an unfilled template."""
+        markers = [
+            "Edit this file to customize",
+            "(your timezone",
+            "(your role",
+            "(preferred language",
+        ]
+        lower = content.lower()
+        return any(m.lower() in lower for m in markers)
 
     # ========================================================================
     # Prompt cache
@@ -878,13 +877,3 @@ class ContextManager:
             keys = [k for k in self._memory_cache if k.startswith(prefix)]
             for k in keys:
                 self._memory_cache.pop(k, None)
-
-    def _invalidate_history_cache(self, session_key: str | None = None) -> None:
-        """Invalidate the history-summary cache layer.
-
-        Called after compression writes new history.jsonl entries.
-        """
-        if session_key is None:
-            self._history_cache.clear()
-        else:
-            self._history_cache.pop(session_key, None)

@@ -276,85 +276,107 @@ class TestSSRFDetection:
 class TestSensitivePathBlocking:
     def test_blocks_env_file_read(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": ".env"}
+            "read", {Capability.FILE_READ}, {"path": ".env"}
         )
         assert not allowed
         assert "blocked file extension" in reason
 
     def test_blocks_env_file_write(self, guard):
         allowed, reason = guard.pre_check(
-            "write", {Capability.FILE_WRITE}, {"file_path": ".env.production"}
+            "write", {Capability.FILE_WRITE}, {"path": ".env.production"}
         )
         assert not allowed
 
     def test_blocks_pem_key(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": "cert.pem"}
+            "read", {Capability.FILE_READ}, {"path": "cert.pem"}
         )
         assert not allowed
 
     def test_blocks_key_file(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": "id_rsa.key"}
+            "read", {Capability.FILE_READ}, {"path": "id_rsa.key"}
         )
         assert not allowed
 
     def test_blocks_p12_keystore(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": "keystore.p12"}
+            "read", {Capability.FILE_READ}, {"path": "keystore.p12"}
         )
         assert not allowed
 
     def test_blocks_path_with_credentials(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": "config/credentials.yml"}
+            "read", {Capability.FILE_READ}, {"path": "config/credentials.yml"}
         )
         assert not allowed
         assert "credentials" in reason
 
     def test_blocks_path_with_secret(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": "k8s/secret.yaml"}
+            "read", {Capability.FILE_READ}, {"path": "k8s/secret.yaml"}
         )
         assert not allowed
 
     def test_blocks_git_dir(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": ".git/config"}
+            "read", {Capability.FILE_READ}, {"path": ".git/config"}
         )
         assert not allowed
         assert ".git" in reason
 
     def test_blocks_ssh_dir(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": ".ssh/id_rsa"}
+            "read", {Capability.FILE_READ}, {"path": ".ssh/id_rsa"}
         )
         assert not allowed
 
     def test_blocks_token_file(self, guard):
         allowed, reason = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": "auth_token.txt"}
+            "read", {Capability.FILE_READ}, {"path": "auth_token.txt"}
         )
         assert not allowed
 
     def test_allows_normal_txt_file(self, guard):
         allowed, _ = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": "README.md"}
+            "read", {Capability.FILE_READ}, {"path": "README.md"}
         )
         assert allowed
 
     def test_allows_normal_py_file(self, guard):
         allowed, _ = guard.pre_check(
-            "write", {Capability.FILE_WRITE}, {"file_path": "src/main.py"}
+            "write", {Capability.FILE_WRITE}, {"path": "src/main.py"}
         )
         assert allowed
 
     def test_allows_env_example(self, guard):
         """'.env.example' should NOT be blocked — only exact .env suffix."""
         allowed, _ = guard.pre_check(
-            "read", {Capability.FILE_READ}, {"file_path": ".env.example"}
+            "read", {Capability.FILE_READ}, {"path": ".env.example"}
         )
         assert allowed
+
+    def test_backward_compat_file_path_param(self, guard):
+        """Old 'file_path' parameter name is still accepted."""
+        allowed, _ = guard.pre_check(
+            "read", {Capability.FILE_READ}, {"file_path": "README.md"}
+        )
+        assert allowed
+
+    def test_dir_path_param_for_ls_tool(self, guard):
+        """'dir_path' parameter name (used by ls tool) is checked."""
+        allowed, _ = guard.pre_check(
+            "ls", {Capability.FILE_READ}, {"dir_path": "src"}
+        )
+        assert allowed
+
+    def test_dir_path_blocks_sensitive(self, guard):
+        """'dir_path' pointing to sensitive path is blocked."""
+        allowed, reason = guard.pre_check(
+            "ls", {Capability.FILE_READ}, {"dir_path": ".git"}
+        )
+        assert not allowed
+        assert ".git" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +396,7 @@ class TestMultipleCapabilities:
         """Command injection check runs first, before file checks."""
         caps = {Capability.SHELL, Capability.NETWORK, Capability.FILE_READ, Capability.FILE_WRITE}
         allowed, reason = guard.pre_check(
-            "bash", caps, {"command": "echo $(whoami)", "file_path": "README.md"}
+            "bash", caps, {"command": "echo $(whoami)", "path": "README.md"}
         )
         # Injection fires first
         assert not allowed
@@ -399,7 +421,7 @@ class TestScopePolicies:
         # Network blocked
         assert not guard.pre_check("curl", {Capability.NETWORK}, {"url": "https://example.com"})[0]
         # File read still OK (sensitive path check still applies)
-        assert guard.pre_check("read", {Capability.FILE_READ}, {"file_path": "README.md"})[0]
+        assert guard.pre_check("read", {Capability.FILE_READ}, {"path": "README.md"})[0]
 
     def test_memory_restricted(self, workspace):
         guard = ToolGuard(workspace, scope="memory", allow_network=False, allow_shell=False)

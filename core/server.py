@@ -424,7 +424,7 @@ def main() -> None:
         async def _serve():
             config = uvicorn.Config(app, host=host, port=port)
             server = uvicorn.Server(config)
-            await orchestrator.start_mcp()
+            await orchestrator.start_services()
             await server.serve()
 
         asyncio.run(_serve())

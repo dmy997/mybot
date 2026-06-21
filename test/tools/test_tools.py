@@ -1,4 +1,4 @@
-"""Tests for BashTool, ReadTool, WriteTool."""
+"""Tests for BashTool, ReadTool, WriteTool, ListDirTool."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tools.bash_tool import BashTool, _contains_dangerous_pattern
-from tools.file_tools import ReadTool, WriteTool, _resolve_safe
+from tools.file_tools import ListDirTool, ReadTool, WriteTool, _resolve_safe
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -304,6 +304,92 @@ class TestWriteTool:
 
 
 # ============================================================================
+# ListDirTool (ls)
+# ============================================================================
+
+
+class TestListDirTool:
+    @pytest.mark.asyncio
+    async def test_list_root_directory(self, populated_ws):
+        tool = ListDirTool(populated_ws)
+        r = await tool.execute(".")
+        assert r.success
+        assert "hello.txt" in r.content
+        assert "sub/" in r.content
+
+    @pytest.mark.asyncio
+    async def test_list_subdirectory(self, populated_ws):
+        tool = ListDirTool(populated_ws)
+        r = await tool.execute("sub")
+        assert r.success
+        assert "nested.txt" in r.content
+
+    @pytest.mark.asyncio
+    async def test_list_empty_directory(self, workspace):
+        tool = ListDirTool(workspace)
+        r = await tool.execute(".")
+        assert r.success
+        assert "empty" in r.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_dirs_sorted_before_files(self, populated_ws):
+        tool = ListDirTool(populated_ws)
+        r = await tool.execute(".")
+        assert r.success
+        # sub/ (directory) should appear before hello.txt (file)
+        sub_idx = r.content.find("sub/")
+        hello_idx = r.content.find("hello.txt")
+        assert sub_idx < hello_idx
+
+    @pytest.mark.asyncio
+    async def test_not_a_directory(self, populated_ws):
+        tool = ListDirTool(populated_ws)
+        r = await tool.execute("hello.txt")
+        assert not r.success
+        assert "Not a directory" in r.error
+
+    @pytest.mark.asyncio
+    async def test_path_traversal_blocked(self, populated_ws):
+        tool = ListDirTool(populated_ws)
+        r = await tool.execute("../outside")
+        assert not r.success
+        assert "Invalid" in r.error or "unsafe" in r.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_symlink_blocked(self, workspace):
+        (workspace / "target_dir").mkdir()
+        (workspace / "link_dir").symlink_to(workspace / "target_dir")
+        tool = ListDirTool(workspace)
+        r = await tool.execute("link_dir")
+        assert not r.success
+
+    @pytest.mark.asyncio
+    async def test_recursive_listing(self, populated_ws):
+        tool = ListDirTool(populated_ws)
+        r = await tool.execute(".", recursive=True)
+        assert r.success
+        # Root files + sub/ files should both appear
+        assert "hello.txt" in r.content
+        assert "nested.txt" in r.content
+
+    @pytest.mark.asyncio
+    async def test_glob_filter(self, populated_ws):
+        tool = ListDirTool(populated_ws)
+        r = await tool.execute(".", glob="*.txt")
+        assert r.success
+        assert "hello.txt" in r.content
+        # sub/ is a directory, should not match *.txt
+        assert "sub/" not in r.content
+
+    @pytest.mark.asyncio
+    async def test_glob_no_match(self, populated_ws):
+        tool = ListDirTool(populated_ws)
+        r = await tool.execute(".", glob="*.xyz")
+        assert r.success
+        assert "no entries matching" in r.content.lower()
+
+
+# ============================================================================
 # BashTool
 # ============================================================================
 
@@ -408,7 +494,7 @@ class TestToolIntegration:
         assert "bash" in registry
         assert "read" in registry
         assert "write" in registry
-        assert len(registry) == 6  # bash, read, write, webfetch, grep, websearch
+        assert len(registry) == 7  # bash, ls, read, write, webfetch, grep, websearch
 
     def test_tool_definitions_valid(self, workspace):
         from tools import ToolRegistry, discover_tools
@@ -418,7 +504,7 @@ class TestToolIntegration:
             registry.register(tool)
 
         definitions = registry.get_definitions()
-        assert len(definitions) == 6  # bash, read, write, webfetch, grep, websearch
+        assert len(definitions) == 7  # bash, ls, read, write, webfetch, grep, websearch
         for d in definitions:
             assert d["type"] == "function"
             assert d["function"]["name"]
@@ -433,7 +519,7 @@ class TestToolIntegration:
         # Should not contain Tool or ToolResult
         assert "tool" not in tools_dict
         assert "ToolResult" not in tools_dict
-        assert len(tools_dict) == 6  # bash, read, write, webfetch, grep, websearch
+        assert len(tools_dict) == 7  # bash, ls, read, write, webfetch, grep, websearch
 
     def test_discover_tools_returns_instances(self, workspace):
         from tools import Tool, discover_tools
@@ -455,12 +541,13 @@ class TestToolIntegration:
         # bash is not available in "memory" scope
         core_tools = registry.for_scope("core")
         core_names = {t.name for t in core_tools}
-        assert core_names == {"bash", "read", "write", "webfetch", "grep", "websearch"}
+        assert core_names == {"bash", "ls", "read", "write", "webfetch", "grep", "websearch"}
 
         memory_tools = registry.for_scope("memory")
         memory_names = {t.name for t in memory_tools}
         assert "read" in memory_names
         assert "grep" in memory_names
+        assert "ls" in memory_names
         assert "bash" not in memory_names
         assert "write" not in memory_names
         assert "webfetch" not in memory_names
@@ -473,9 +560,9 @@ class TestToolIntegration:
             registry.register(tool)
 
         defs = registry.get_definitions_for_scope("memory")
-        assert len(defs) == 2  # read + grep
+        assert len(defs) == 3  # ls + read + grep
         names = {d["function"]["name"] for d in defs}
-        assert names == {"read", "grep"}
+        assert names == {"ls", "read", "grep"}
 
     # -- parallel flag -----------------------------------------------------
 

@@ -517,7 +517,7 @@ class AgentCore:
     ) -> list[dict[str, Any]]:
         """Append goal to the last user message so the prompt prefix stays cacheable.
 
-        Following nanobot's pattern: dynamic content goes at the *end* of user
+        Dynamic content goes at the *end* of user
         messages, never prepended to the system prompt.  This keeps the system
         prompt + tool definitions prefix stable for prompt-cache hits across turns.
         """
