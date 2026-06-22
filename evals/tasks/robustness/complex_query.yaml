@@ -1,0 +1,11 @@
+id: complex_multi_file_query
+description: "Answer a question that requires examining multiple files"
+prompt: "What environment variables does mybot use for configuration? Look at the config module to find all supported env vars and their defaults."
+expected_tools: [grep, Read]
+expected_in_answer:
+  - OPENAI_API_KEY
+  - WORKSPACE
+  - LLM_MODEL_ID
+  - MYBOT_PORT
+max_steps: 10
+timeout_seconds: 120

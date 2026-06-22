@@ -1,7 +1,7 @@
 # mybot
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-711%20passed-green)](.)
+[![Tests](https://img.shields.io/badge/tests-782%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 受 **Claude Code**、**nanobot**、**OpenClaw** 启发，通过 Claude Code vibe coding 开发的个人 AI 助手框架。可读性强，高度模块化，轻量无冗余。
@@ -173,10 +173,40 @@ MYBOT_OTEL_ENABLED=1 mybot
 
 ```bash
 ruff check .                               # lint
-pytest                                     # 全部 711 个测试
+pytest                                     # 全部 782 个测试
 pytest test/core/test_middleware.py -v     # 单个测试文件
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 bash scripts/loc.sh                        # 按模块统计代码行数
+```
+
+## 评估系统
+
+mybot 提供两层 Agent 评估体系：
+
+**Layer 1 — 自定义任务（CI 就绪）**：9 个 YAML 定义的任务覆盖工具调用、推理、鲁棒性三类，
+4 个规则评分器（完成率、关键词、工具集 Jaccard、步骤效率），pytest 集成。
+
+```bash
+pytest evals/ -v                             # CI 模式（mock，21 个测试）
+python -m evals                              # 真实 LLM 评估（react）
+python -m evals --paradigm react --paradigm plan_solve  # 范式对比
+python -m evals --task file_read_basic       # 单任务
+python -m evals -o report.md                 # 导出 Markdown 报告
+```
+
+**Layer 2 — 社区基准**：BFCL（函数调用准确率，AST 匹配）和 GAIA（通用 AI 能力，准精确匹配），
+参考 hello-agents 的 Dataset→Evaluator→Metrics 三层架构。
+
+```bash
+# BFCL（需先 clone gorilla 仓库：git clone https://github.com/ShishirPatil/gorilla.git temp_gorilla）
+python -m evals --benchmark bfcl --category simple_python --max-samples 20   # 单分类抽样
+python -m evals --benchmark bfcl --category simple_python                     # 全量运行
+# 可用分类: simple_python, simple_java, simple_javascript, multiple, parallel, irrelevance
+
+# GAIA（需 HuggingFace token 访问 gaia-benchmark/GAIA）
+python -m evals --benchmark gaia --level 1 --max-samples 10                  # 单级别抽样
+python -m evals --benchmark gaia --level 1                                    # 全量运行
+python -m evals --benchmark gaia                                              # 全部 3 个级别
 ```
 
 ## 路线图
@@ -193,22 +223,28 @@ bash scripts/loc.sh                        # 按模块统计代码行数
 - EventBus（异步发布/订阅）+ MessageBus（双队列消息总线）
 - 13 个内置 Skill
 - 上下文管理子系统（压缩、修复、空闲自动压缩）
-- 基于文件的长期记忆系统（store–manager–service 三层、类型化条目）
+- 基于文件的长期记忆系统（MemoryStore + Consolidator + Dream 两级管道）
 - 会话历史持久化（基于游标的增量加载）
 - 长任务断点恢复机制（checkpoint/resume）
 - OpenTelemetry 桥接 → Jaeger trace 可视化
 - MCP（Model Context Protocol）集成 — 连接外部工具服务器
+- Memory Dream 系统 — 两阶段 LLM 记忆合并（Consolidator 实时摘要 + Dream 周期回顾）
 
 ### P2 — 质量与可靠性
 
-- **Agent 性能评估系统** — 建立标准任务集和自动化评测指标（任务完成率、步骤效率、工具选择准确率），支持回归测试和范式对比
-- **Memory Dream 系统** — 利用空闲时间对历史会话进行回顾、总结和关联发现，将碎片记忆提炼为结构化知识
+- ~~**Agent 性能评估系统（第一阶段）**~~ — 9 个自定义 YAML 任务 + 4 个规则评分器 + pytest CI 集成 ✅
+- ~~**Agent 性能评估系统（第二阶段）**~~ — BFCL/GAIA 社区基准、LLM Judge 评分器、CLI 入口 ✅
+- **混合搜索** — SQLite + sqlite-vec + FTS5 为 MEMORY.md 和 history.jsonl 建立可搜索索引（参考 OpenClaw）
+- **时间衰减** — 指数衰减让旧记忆在搜索中权重自然下降（参考 OpenClaw 30 天半衰期）
 
 ### P3 — 扩展能力
 
 - **多模态输入** — 支持图片、音频等非文本输入，通过 Provider 多模态 API 传入 LLM
 - **更多 LLM Provider** — Anthropic 直连、Ollama 本地模型
 - **多消息频道** — 微信、Telegram、Discord 等外部频道接入
+- **Heartbeat 服务** — 周期任务检查，按 HEARTBEAT.md 清单定时执行（参考 nanobot）
+- **Skill 系统增强** — Dream 自动提取重复工作流为可复用 SKILL.md
+- **Chunk 级检索** — 大文件分块存储和检索，减少上下文浪费
 
 ## License
 

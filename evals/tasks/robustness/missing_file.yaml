@@ -1,0 +1,10 @@
+id: missing_file_handling
+description: "Handle a request about a file that does not exist gracefully"
+prompt: "Read the file 'nonexistent_config.json' in the project root and tell me what it contains. If it doesn't exist, explain what happened."
+expected_tools: [Read]
+expected_in_answer:
+  - not
+  - exist
+  - found
+max_steps: 5
+timeout_seconds: 60

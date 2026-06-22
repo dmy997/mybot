@@ -1,0 +1,11 @@
+id: multi_tool_search
+description: "Chain grep and read operations to answer a code-level question"
+prompt: "Find the class that implements the 'auto_compact' method in the mybot project. First use grep to locate the file, then read it to confirm. Tell me what parameters the method accepts."
+expected_tools: [grep, Read]
+expected_in_answer:
+  - session_key
+  - messages
+  - budget_tokens
+  - keep_recent
+max_steps: 10
+timeout_seconds: 120

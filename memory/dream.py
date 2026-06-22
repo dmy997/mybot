@@ -404,8 +404,12 @@ class Dream:
         lines: list[str] = []
         for e in entries:
             ts = e.get("timestamp", "?")
+            sk = e.get("session_key", "")
             content = str(e.get("content", ""))
             if len(content) > _MAX_HISTORY_CHARS:
                 content = content[:_MAX_HISTORY_CHARS] + "\n... (truncated)"
-            lines.append(f"[{ts}] cursor={e.get('cursor', '?')}\n{content}\n")
+            meta = f"[{ts}] cursor={e.get('cursor', '?')}"
+            if sk:
+                meta += f" session={sk}"
+            lines.append(f"{meta}\n{content}\n")
         return "\n".join(lines)

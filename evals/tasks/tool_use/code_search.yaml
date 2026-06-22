@@ -1,0 +1,10 @@
+id: code_search_grep
+description: "Use grep to locate a function definition and report its location"
+prompt: "Use grep to find where the function '_estimate_message_tokens' is defined in this project. Report the exact file path and line number."
+expected_tools: [grep]
+expected_in_answer:
+  - "_estimate_message_tokens"
+  - context
+  - compaction
+max_steps: 5
+timeout_seconds: 60

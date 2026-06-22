@@ -1,0 +1,11 @@
+id: code_analysis_tokens
+description: "Analyze token estimation logic from source code"
+prompt: "Look at the token estimation code in the mybot context module. How is token count estimated when tiktoken is not installed? Show me the fallback logic."
+expected_tools: [grep, Read]
+expected_in_answer:
+  - len
+  - text
+  - divided
+  - chars
+max_steps: 8
+timeout_seconds: 120

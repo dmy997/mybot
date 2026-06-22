@@ -1,0 +1,11 @@
+id: file_read_basic
+description: "Find and read a specific source file, then answer questions about its content"
+prompt: "Find the file in this project that contains the class 'TokenBudget'. Read it and tell me what properties (computed attributes with @property) it defines. List each property name and its purpose."
+expected_tools: [grep, Read]
+expected_in_answer:
+  - effective_window
+  - warning_threshold
+  - auto_compact_threshold
+  - block_threshold
+max_steps: 8
+timeout_seconds: 120

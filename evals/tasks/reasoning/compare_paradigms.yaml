@@ -1,0 +1,12 @@
+id: compare_agent_paradigms
+description: "Compare react and plan_solve agent paradigms from the codebase"
+prompt: "In this project, what are the differences between the 'react' and 'plan_solve' agent paradigms? Find their implementations and explain the key differences in their execution flow."
+expected_tools: [grep, Read]
+expected_in_answer:
+  - react
+  - plan
+  - solve
+  - AgentCore
+  - run
+max_steps: 10
+timeout_seconds: 180

@@ -63,3 +63,9 @@ docs/
 # Personal files
 简历-*.docx
 量化公司Agent岗位调研报告.md
+
+# Third-party data (BFCL evaluation)
+temp_gorilla/
+
+# Runtime cron state
+cron/

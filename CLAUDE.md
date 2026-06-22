@@ -34,6 +34,7 @@ mybot-server           # HTTP/WS server (core.server:main), then open http://127
 - `providers/` — LLM backend abstraction (`LLMProvider` base, `OpenAICompatibleProvider`, retry logic, error types, factory)
 - `core/` — Orchestrator, Dispatcher, AgentCore (runner), Agent base class, Middleware chain, SkillsLoader, HTTP/WS server
 - `agents/` — ReAct Agent (single-pass) + PlanSolve Agent (two-phase). Auto-discovered via `discover_agents()`
+- `evals/` — Agent evaluation system (custom YAML tasks + BFCL/GAIA benchmarks)
 - `context/` — ContextManager (system prompt assembly, compression, session repair) + SessionManager (JSON persistence)
 - `tools/` — 10 tools (bash, file R/W, grep, webfetch, websearch, memory CRUD, subagent), ToolRegistry, ToolGuard security
 - `memory/` — Long-term file-based memory (MemoryStore, Consolidator + Dream pipeline)
@@ -127,15 +128,14 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 
 ## Known Gaps (from README.md roadmap)
 
-- **P1**: MCP integration
-- **P2**: Agent eval benchmarks, checkpoint/resume for long tasks
-- **P3**: Multimodal input, more providers (Anthropic direct, Ollama), external chat channels
+- **P2**: Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay
+- **P3**: Multimodal input, more providers (Anthropic direct, Ollama), external chat channels, Heartbeat service, Skill system enhancement, chunk-level retrieval
 - See `README.md` Roadmap for the full prioritized list with status markers
 
 ## Memory System Improvement Roadmap
 
 See `docs/memory-comparison.md` for the full cross-project analysis. Summary:
 
-- **P1 (short-term)**: ~~Dream dedup~~, ~~age annotations (`<- Nd`)~~, session source tracking in history.jsonl
+- **P1 (short-term)**: ~~Dream dedup~~, ~~age annotations (`<- Nd`)~~, ~~session source tracking in history.jsonl~~
 - **P2 (medium-term)**: Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay
 - **P3 (long-term)**: Heartbeat service, Skill system, chunk-level retrieval granularity

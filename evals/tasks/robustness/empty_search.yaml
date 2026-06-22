@@ -1,0 +1,10 @@
+id: empty_search_result
+description: "Handle a search that returns no results"
+prompt: "Search for the string 'xyzzy_nonexistent_function_12345' in this project using grep. Report what you find."
+expected_tools: [grep]
+expected_in_answer:
+  - not
+  - found
+  - match
+max_steps: 5
+timeout_seconds: 60
