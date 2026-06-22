@@ -82,25 +82,47 @@ class GAIALoader:
         return self._load_from_local()
 
     def _load_from_local(self) -> list[dict[str, Any]]:
-        """Load samples from local directory."""
-        metadata_path = (
-            self.local_data_dir / "2023" / self.split / "metadata.jsonl"
-        )
-        if not metadata_path.exists():
-            raise FileNotFoundError(
-                f"GAIA metadata not found: {metadata_path}\n"
-                f"Download from https://huggingface.co/datasets/gaia-benchmark/GAIA"
-            )
+        """Load samples from local directory (parquet or jsonl metadata)."""
+        base = self.local_data_dir / "2023" / self.split
 
+        # Try parquet first (current GAIA format)
+        parquet_path = base / "metadata.parquet"
+        if parquet_path.exists():
+            return self._load_from_parquet(parquet_path)
+
+        # Fallback: JSONL (older GAIA format)
+        jsonl_path = base / "metadata.jsonl"
+        if jsonl_path.exists():
+            return self._load_from_jsonl(jsonl_path)
+
+        raise FileNotFoundError(
+            f"GAIA metadata not found in {base}\n"
+            f"Download from https://huggingface.co/datasets/gaia-benchmark/GAIA"
+        )
+
+    def _load_from_parquet(self, path: Path) -> list[dict[str, Any]]:
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
+            raise ImportError(
+                "pyarrow is required to read GAIA parquet data. "
+                "Install it with: pip install pyarrow"
+            )
+        table = pq.read_table(str(path))
         items: list[dict[str, Any]] = []
-        with open(metadata_path, encoding="utf-8") as f:
+        for row in table.to_pylist():
+            items.append(self._standardize(row))
+        logger.info("GAIA loaded {} samples from {}", len(items), path)
+        return items
+
+    def _load_from_jsonl(self, path: Path) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    item = json.loads(line)
-                    items.append(self._standardize(item))
-
-        logger.info("GAIA loaded {} samples from {}", len(items), metadata_path)
+                    items.append(self._standardize(json.loads(line)))
+        logger.info("GAIA loaded {} samples from {}", len(items), path)
         return items
 
     @staticmethod
@@ -108,7 +130,7 @@ class GAIALoader:
         return {
             "task_id": raw.get("task_id", raw.get("id", "")),
             "question": raw.get("Question", raw.get("question", "")),
-            "level": raw.get("Level", raw.get("level", 1)),
+            "level": int(raw.get("Level", raw.get("level", 1))),
             "final_answer": raw.get("Final answer", raw.get("final_answer", "")),
             "file_name": raw.get("file_name", ""),
             "file_path": raw.get("file_path", ""),

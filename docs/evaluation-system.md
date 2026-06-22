@@ -140,13 +140,19 @@ BFCLMetrics
 
 ### 2.2 GAIA (General AI Assistants)
 
-**数据源**：HuggingFace gated dataset `gaia-benchmark/GAIA`（需申请访问）
+**数据源**：HuggingFace gated dataset `gaia-benchmark/GAIA`（需申请访问，设置 `HF_TOKEN`）
+
+**依赖**：`pip install huggingface-hub pyarrow`（或 `pip install -e ".[evals]"`）
 
 **评价方法**：准精确匹配（quasi-exact match）。对预测答案和预期答案做规范化后比较。
+
+**数据格式**：元数据优先从 `metadata.parquet`（当前格式）加载，回退到 `metadata.jsonl`（旧格式）。
 
 ```
 GAIALoader(local_data_dir, split)
     └─ load(level, max_samples) → [{task_id, question, final_answer, level}]
+        ├─ _load_from_parquet()   # pyarrow 读取 parquet
+        └─ _load_from_jsonl()     # 回退：逐行 JSON
 
 GAIAEvaluator(data_dir, split)
     └─ evaluate(agent_factory, level, max_samples)
