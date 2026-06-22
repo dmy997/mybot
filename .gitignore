@@ -57,9 +57,6 @@ mcp_servers.json
 test_mcp_config.json
 test_mcp_server.py
 
-# Internal docs
-docs/
-
 # Personal files
 简历-*.docx
 量化公司Agent岗位调研报告.md
