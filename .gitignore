@@ -66,3 +66,6 @@ temp_gorilla/
 
 # Runtime cron state
 cron/
+
+# Downloaded datasets (GAIA)
+data/

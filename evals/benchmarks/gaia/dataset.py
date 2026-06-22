@@ -1,7 +1,7 @@
 """GAIA dataset loader.
 
 Loads from HuggingFace (``gaia-benchmark/GAIA``) or a local directory.
-Requires ``HF_TOKEN`` and ``pip install huggingface_hub``.
+Requires ``HF_TOKEN`` and ``pip install huggingface-hub``.
 """
 
 from __future__ import annotations
@@ -56,17 +56,28 @@ class GAIALoader:
             from huggingface_hub import snapshot_download
         except ImportError:
             raise ImportError(
-                "huggingface_hub is required to download GAIA. "
-                "Install it with: pip install huggingface_hub"
+                "huggingface-hub is required to download GAIA. "
+                "Install it with: pip install huggingface-hub"
             )
 
         cache_dir = Path("data/gaia")
         logger.info("Downloading GAIA dataset from HuggingFace...")
-        local_dir = snapshot_download(
-            repo_id="gaia-benchmark/GAIA",
-            repo_type="dataset",
-            local_dir=str(cache_dir),
-        )
+        try:
+            local_dir = snapshot_download(
+                repo_id="gaia-benchmark/GAIA",
+                repo_type="dataset",
+                local_dir=str(cache_dir),
+            )
+        except Exception as exc:
+            if "403" in str(exc) or "GatedRepo" in type(exc).__name__:
+                raise PermissionError(
+                    f"GAIA is a gated dataset. Request access at "
+                    f"https://huggingface.co/datasets/gaia-benchmark/GAIA\n"
+                    f"Then set HF_TOKEN in .env and retry.\n"
+                    f"Or download manually and pass --gaia-data-dir <path>\n"
+                    f"Original error: {exc}"
+                ) from exc
+            raise
         self.local_data_dir = Path(local_dir)
         return self._load_from_local()
 
