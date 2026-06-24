@@ -156,8 +156,10 @@ class Consolidator:
         # 3. 若超过 budget: 分轮次 LLM 摘要 → history.jsonl
         # 4. 推进 session.last_consolidated
 
-    async def archive(self, messages, session_key="") -> str | None:
-        """调用 LLM 摘要消息，写入 history.jsonl."""
+    async def archive(self, messages, session_key="",
+                      instructions=None) -> str | None:
+        """调用 LLM 摘要消息，写入 history.jsonl.
+        当提供 instructions 时，会注入到系统提示词中指导摘要重点。"""
 ```
 
 - **Token 估计**: ~4 chars ≈ 1 token

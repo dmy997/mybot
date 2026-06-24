@@ -134,9 +134,12 @@ async def _recover_and_retry(self, spec, messages, tool_defs, info, *, step_coun
 
 ```python
 async def _recover_context_length(self, spec, messages, tool_defs, info, *, step_count=0):
-    # 第一步：使用更紧的预算进行轻量压缩
-    reduced_budget = int(self.max_context_tokens * 0.6)
-    compacted = self._lightweight_compact(messages, max_tokens=reduced_budget)
+    # 第一步：按可用策略压缩（优先使用注入的 CompactionService）
+    if self.compaction is not None:
+        compacted = self.compaction.micro_compact(messages, keep_recent_turns=1)
+    else:
+        reduced_budget = int(self.max_context_tokens * 0.6)
+        compacted = self._lightweight_compact(messages, max_tokens=reduced_budget)
     if _estimate_message_tokens(compacted) < _estimate_message_tokens(messages):
         return await self._call_llm(spec, compacted, tool_defs, recovery_attempt=True, ...)
 

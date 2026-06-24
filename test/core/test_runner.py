@@ -584,10 +584,11 @@ class TestAgentCoreCompaction:
     # -- budget gating ---------------------------------------------------------
 
     def test_no_compact_when_under_budget(self, core):
-        """Under budget → original messages returned (not a copy)."""
+        """Under budget → returns a copy without compaction."""
         msgs = [self._msg("user", "hi")]
         result = core._lightweight_compact(msgs, max_tokens=1_000_000)
-        assert result is msgs
+        assert result == msgs
+        assert result is not msgs  # always returns a new list
 
     def test_original_messages_untouched(self, core):
         """Compaction returns a new list; original unchanged."""

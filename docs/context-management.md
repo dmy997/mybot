@@ -14,7 +14,7 @@ ContextManager
 ├── Consolidator         — 实时 token 预算驱动的 LLM 摘要（fire-and-forget）
 ├── CompactionService    — 光标推进压缩（无 LLM，两层）
 │   ├── Layer 1: micro_compact  (规则, 无 LLM)
-│   └── Layer 2: auto_compact   (仅推进 consolidated_cursor，不调用 LLM)
+│   └── Layer 2: auto_compact   (推进 consolidated_cursor；idle 路径调用 LLM 摘要)
 └── SkillsLoader         — Skill 发现与注入
 ```
 
@@ -120,37 +120,49 @@ class TokenBudget:
 
 `context/compaction.py`
 
-CompactionService 负责**会话内上下文压缩**，仅推进游标，不生成 LLM 摘要。LLM 摘要职责已转移至 Consolidator。
+CompactionService 负责**会话内上下文压缩**。游标推进层（Layer 2）在 idle 和 full 压缩时会委托 Consolidator 做 LLM 摘要，micro_compact（Layer 1）是纯规则压缩。
 
 ### Layer 1: micro_compact（规则，无 LLM 调用）
 
 ```python
 @staticmethod
 def micro_compact(messages, keep_recent_turns=2, placeholder="[Old tool result cleared]"):
-    """清除超过 keep_recent_turns 轮的工具结果。"""
+    """三步规则压缩：
+    1. 清除超过 keep_recent_turns 轮的工具结果
+    2. 移除孤立的 tool_result（无匹配的 tool_call_id）
+    3. 补全缺失的 tool_result（tool_call 无对应结果）
+    """
 ```
 
 每次 `build_messages()` 前执行，返回新列表，不修改原始消息。
 
-### Layer 2: auto_compact（光标推进，无 LLM）
+### Layer 2: auto_compact（光标推进，idle 路径调用 LLM 摘要）
 
 ```python
 async def auto_compact(self, session_key, messages, *,
-                       budget_tokens=None, keep_recent=None) -> CompactionResult:
+                       budget_tokens=None, keep_recent=None,
+                       consolidator=None) -> CompactionResult:
 ```
 
 两种触发方式：
 - **Token 预算压缩**: 提供 `budget_tokens`，保留在该预算内的最近消息
-- **空闲压缩**: 提供 `keep_recent`，保留最近 N 条消息
+- **空闲压缩**: 提供 `keep_recent`，保留最近 N 条消息；若提供 `consolidator`，先通过 LLM 摘要旧消息再推进游标
 
 核心步骤：
 1. 根据 `budget_tokens` 或 `keep_recent` 确定保留数量
 2. 按角色边界调整分割点（`_adjust_split`），避免在 tool_call/tool_result 中间切断
-3. 推进 `consolidated_cursor`——**不调用 LLM，不写入文件**
+3. Idle 路径：调用 `consolidator.archive()` 将旧消息 LLM 摘要写入 `history.jsonl`
+4. 推进 `consolidated_cursor`——**`session.messages` 永不修改**
 
-### full_compact（用户触发）
+### full_compact（用户触发，始终执行）
 
-与 auto_compact 相同流程。`instructions` 参数保留用于 API 兼容但不实际使用（LLM 摘要由 Consolidator 处理）。
+```python
+async def full_compact(self, session_key, messages, *,
+                       instructions=None, budget_tokens=None,
+                       consolidator=None) -> CompactionResult:
+```
+
+与 auto_compact 相同的游标推进逻辑，但不受 circuit breaker 限制。当提供 `consolidator` 时，先调用 LLM 将旧消息摘要写入 `history.jsonl`，再推进游标。`instructions` 参数会被注入到 LLM 摘要提示词中，用于指导摘要重点。
 
 ### 压缩的非破坏性设计
 

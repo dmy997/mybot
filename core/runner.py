@@ -185,6 +185,7 @@ class AgentCore:
         self.max_context_tokens = max_context_tokens
         self.compaction = compaction  # optional CompactionService from context module
         self._workspace = Path(workspace).expanduser().resolve() if workspace else None
+        self._last_compacted_turns: int = 0
 
     # -- public entry point ----------------------------------------------------
 
@@ -548,16 +549,29 @@ class AgentCore:
         When a :class:`CompactionService` is injected, delegates to its
         ``micro_compact`` (Layer 1 — rule-based, no LLM).  Otherwise falls
         back to a lightweight 3-step summary compaction.
+
+        Skips compaction when no new tool turns were added since the last
+        call — avoids redundant work on consecutive iterations.
         """
+        # Skip if no new tool turns since last compaction
+        current_turns = sum(
+            1 for m in messages
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        if current_turns == self._last_compacted_turns:
+            return list(messages)
+
         # Use injected service when available
         if self.compaction is not None:
-            return self.compaction.micro_compact(
+            result = self.compaction.micro_compact(
                 messages,
                 keep_recent_turns=_LW_COMPACT_KEEP_TURNS,
             )
+        else:
+            result = self._lightweight_compact(messages)
 
-        # Lightweight fallback
-        return self._lightweight_compact(messages)
+        self._last_compacted_turns = current_turns
+        return result
 
     @staticmethod
     def _lightweight_compact(
@@ -579,7 +593,7 @@ class AgentCore:
         """
         threshold = int(max_tokens * trigger_ratio)
         if _estimate_message_tokens(messages) <= threshold:
-            return messages  # under budget: return original (not a copy)
+            return list(messages)  # under budget: return a copy (contract)
 
         # Step 1: Summarise old tool results
         total_turns = sum(
@@ -830,9 +844,12 @@ class AgentCore:
         step_count: int = 0,
     ) -> LLMResponse:
         """Compact context and retry; fall back to dropping if still too long."""
-        # 1st attempt: compact with a tighter budget
-        reduced_budget = int(self.max_context_tokens * 0.6)
-        compacted = self._lightweight_compact(messages, max_tokens=reduced_budget)
+        # 1st attempt: compact more aggressively than normal
+        if self.compaction is not None:
+            compacted = self.compaction.micro_compact(messages, keep_recent_turns=1)
+        else:
+            reduced_budget = int(self.max_context_tokens * 0.6)
+            compacted = self._lightweight_compact(messages, max_tokens=reduced_budget)
         if _estimate_message_tokens(compacted) < _estimate_message_tokens(messages):
             logger.warning(
                 "Context-length recovery: {} tokens → {} tokens (compacted)",

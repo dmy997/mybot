@@ -179,8 +179,12 @@ class Consolidator:
         return True
 
     async def archive(self, messages: list[dict],
-                      session_key: str = "") -> str | None:
+                      session_key: str = "",
+                      instructions: str | None = None) -> str | None:
         """Summarize *messages* via LLM and append to history.jsonl.
+
+        When *instructions* is provided, it is appended to the system prompt
+        to guide the summarisation (used by user-triggered full compaction).
 
         Returns the summary text on success, or None.
         """
@@ -189,16 +193,20 @@ class Consolidator:
 
         try:
             formatted = self._format_messages(messages)
+            system_prompt = render_template(
+                "agent/consolidator_archive.md",
+                strip=True,
+            )
+            if instructions:
+                system_prompt = (
+                    f"{system_prompt}\n\n"
+                    f"Additional user instructions for this summary:\n"
+                    f"{instructions}"
+                )
             response = await self.provider.chat_with_retry(
                 model=self.model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": render_template(
-                            "agent/consolidator_archive.md",
-                            strip=True,
-                        ),
-                    },
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": formatted},
                 ],
                 tools=[],

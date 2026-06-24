@@ -113,37 +113,72 @@ class CompactionService:
         keep_recent_turns: int = 2,
         placeholder: str = "[Old tool result cleared]",
     ) -> list[dict[str, Any]]:
-        """Clear tool results older than *keep_recent_turns* turns.
+        """Compact messages in three rule-based steps (no LLM).
 
-        Tool-calling turns are counted by assistant messages that carry
-        ``tool_calls``.  Results from the last *keep_recent_turns* turns
-        are kept intact; older ones are replaced with *placeholder*.
+        1. Clear tool results older than *keep_recent_turns* turns.
+        2. Remove orphan tool results (no matching tool_call_id).
+        3. Fill missing tool results (tool_call with no result).
 
         Returns a **new list** — the input is never modified.
         """
+        # Step 1: Clear old tool results
         total_turns = sum(
             1 for m in messages
             if m.get("role") == "assistant" and m.get("tool_calls")
         )
         cutoff = max(0, total_turns - keep_recent_turns)
+
         if cutoff == 0:
-            return list(messages)
+            cleaned = list(messages)
+        else:
+            cleaned: list[dict[str, Any]] = []
+            turn = 0
+            for msg in messages:
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    turn += 1
 
-        result: list[dict[str, Any]] = []
-        turn = 0
-        for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                turn += 1
-
-            if msg.get("role") == "tool" and turn <= cutoff:
-                content = msg.get("content", "")
-                if isinstance(content, str) and not content.startswith(placeholder):
-                    result.append({**msg, "content": placeholder})
+                if msg.get("role") == "tool" and turn <= cutoff:
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and not content.startswith(placeholder):
+                        cleaned.append({**msg, "content": placeholder})
+                    else:
+                        cleaned.append(msg)
                 else:
-                    result.append(msg)
-            else:
-                result.append(msg)
-        return result
+                    cleaned.append(msg)
+
+        # Step 2: Remove orphan tool results (no matching tool_call)
+        valid_ids: set[str] = set()
+        for msg in cleaned:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and "id" in tc:
+                        valid_ids.add(tc["id"])
+        cleaned = [
+            m for m in cleaned
+            if m.get("role") != "tool" or m.get("tool_call_id") in valid_ids
+        ]
+
+        # Step 3: Fill missing tool results
+        result_ids: set[str] = set()
+        for msg in cleaned:
+            if msg.get("role") == "tool":
+                result_ids.add(msg.get("tool_call_id", ""))
+
+        final: list[dict[str, Any]] = []
+        for msg in cleaned:
+            final.append(msg)
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    tc_id = tc.get("id") if isinstance(tc, dict) else ""
+                    if tc_id and tc_id not in result_ids:
+                        final.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": "[Tool result unavailable — compacted]",
+                        })
+                        result_ids.add(tc_id)
+
+        return final
 
     # ========================================================================
     # Layer 2: Auto-compact (cursor advancement, no LLM)
@@ -245,13 +280,14 @@ class CompactionService:
         *,
         instructions: str | None = None,
         budget_tokens: int | None = None,
+        consolidator: Any | None = None,
     ) -> CompactionResult:
         """User-triggered full compaction.
 
-        Always runs (no circuit breaker).  Same cursor-advancement logic
-        as :meth:`auto_compact`.  The *instructions* parameter is accepted
-        for API compatibility but unused (LLM summarisation is handled by
-        :class:`Consolidator`).
+        Always runs (no circuit breaker).  LLM-summarises old messages via
+        :class:`Consolidator.archive` (when *consolidator* is provided), then
+        advances the consolidated cursor.  The *instructions* parameter is
+        passed through to the LLM summarisation prompt.
         """
         unsummarised = list(messages)
         if len(unsummarised) <= 1:
@@ -268,6 +304,20 @@ class CompactionService:
         self._adjust_split(to_compress, to_keep)
         if not to_compress:
             return CompactionResult(0)
+
+        # LLM-summarise old messages before discarding them
+        if consolidator is not None:
+            try:
+                await consolidator.archive(
+                    to_compress,
+                    session_key=session_key,
+                    instructions=instructions,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Consolidator.archive failed during full compaction for {!r}",
+                    session_key,
+                )
 
         async with self.session.lock_session(session_key):
             session = self.session.get_session(session_key)

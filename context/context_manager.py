@@ -412,6 +412,36 @@ class ContextManager:
         )
         return result.compressed_count
 
+    async def full_compress(
+        self,
+        session_key: str,
+        *,
+        instructions: str | None = None,
+        budget_tokens: int | None = None,
+    ) -> int:
+        """User-triggered full compaction with LLM summarisation.
+
+        Unlike :meth:`compress` (which may idle-gate), this always runs.
+        Old messages are LLM-summarised via the Consolidator into
+        ``memory/history.jsonl``, then the consolidated cursor is advanced.
+
+        The *instructions* parameter is injected into the LLM summarisation
+        prompt to guide what the summary should focus on.
+
+        Returns the number of messages compressed (0 if nothing was done).
+        """
+        session = self.session.get_session(session_key)
+        cursor = session.consolidated_cursor
+        unsummarised = session.messages[cursor:]
+
+        result = await self.compaction.full_compact(
+            session_key, unsummarised,
+            instructions=instructions,
+            budget_tokens=budget_tokens,
+            consolidator=self.consolidator,
+        )
+        return result.compressed_count
+
     # -- session lifecycle ----------------------------------------------------
 
     async def save_exchange(
