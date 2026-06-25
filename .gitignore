@@ -43,8 +43,6 @@ htmlcov/
 # mypy
 .mypy_cache/
 
-# Skills (installed separately)
-skills/
 
 # Runtime artifacts
 .cli_history
