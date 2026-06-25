@@ -87,7 +87,7 @@ class AgentOutput:
 
 _DEFAULT_MAX_ITERATIONS = 20
 _DEFAULT_MAX_TOOL_RESULT_CHARS = 6_000
-_STALL_WARNING_STEPS = 50
+_STALL_WARNING_RATIO = 0.75  # fraction of max_iterations at which stall warning fires
 _CHECKPOINT_VERSION = 1
 
 # Lightweight compaction (fallback when CompactionService is not injected)
@@ -242,11 +242,12 @@ class AgentCore:
                     session_key=spec.session_key, step_count=step_count,
                 ))
 
-                # Stall detection: warn when step count is abnormally high
-                if step_count == _STALL_WARNING_STEPS:
+                # Stall detection: warn when step count passes a fraction of max_iterations
+                _stall_threshold = max(10, int(self.max_iterations * _STALL_WARNING_RATIO))
+                if step_count == _stall_threshold:
                     logger.warning(
-                        "Agent reached {} steps — possible stall or infinite loop",
-                        step_count,
+                        "Agent reached {} steps ({}% of max {}) — possible stall or infinite loop",
+                        step_count, int(_STALL_WARNING_RATIO * 100), self.max_iterations,
                     )
                     await bus.publish(AgentStallWarning(
                         session_key=spec.session_key, step_count=step_count,
