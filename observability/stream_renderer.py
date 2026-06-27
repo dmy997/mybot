@@ -1,32 +1,22 @@
 """Streaming renderer for CLI output.
 
-Uses Rich for Markdown rendering with a throttled update strategy:
-during streaming the buffer is accumulated and the Rich Live display is
-updated at most every ~80ms (12 FPS).  This prevents the asyncio hot path
-from being blocked by excessive Markdown object creation and Live update
-overhead — the common streaming bottleneck in WSL2 terminals.
-
-Rich Live uses ``screen=True`` (alternate screen buffer) so that the
-display properly scrolls when content exceeds the terminal height.  With
-``screen=False`` the ANSI cursor-up escape codes cannot move past the top
-of the terminal, causing new content to render below the visible viewport.
-On stop the final content is printed to the main screen for scrollback.
+During streaming, tokens are written directly to the terminal so that
+native terminal scrolling keeps the latest content visible.  Rich Live
+is deliberately NOT used because its ``screen=False`` cursor-up escape
+codes fail when the rendered content exceeds the terminal height,
+causing new content to render below the visible viewport.
 
 Flow per round:
-  spinner → first delta → header + throttled Rich Live updates (alt screen) →
-  on_end → stop Live → print final content to main screen + stop spinner
+  spinner -> first delta -> header + streamed tokens ->
+  on_end -> reset buffer + stop spinner (or re-arm spinner for next turn)
 """
 
 from __future__ import annotations
 
 import sys
-import time
 from contextlib import contextmanager, nullcontext
 
 from rich.console import Console
-from rich.live import Live
-from rich.markdown import Markdown
-from rich.text import Text
 
 
 def _make_console() -> Console:
@@ -80,16 +70,13 @@ class ThinkingSpinner:
 
 
 class StreamRenderer:
-    """Progressive Markdown renderer with throttled Rich Live updates.
+    """Progressive text renderer for CLI streaming output.
 
-    Tokens are accumulated into ``_buf`` as they arrive, but the Rich Live
-    display is only updated every ``_UPDATE_INTERVAL`` seconds.  The refresh
-    thread (``auto_refresh=True``) handles actual terminal output off the
-    asyncio event loop, so the only asyncio cost per delta is a string
-    concatenation.
+    Tokens are written directly to the terminal as they arrive so that
+    native terminal scrolling keeps the latest content visible regardless
+    of buffer size.  No Rich Live is used — its cursor-up escape codes
+    break when content exceeds terminal height.
     """
-
-    _UPDATE_INTERVAL = 0.08  # throttle to ~12 FPS
 
     def __init__(
         self,
@@ -103,16 +90,9 @@ class StreamRenderer:
         self._buf = ""
         self.streamed = False
         self._console = _make_console()
-        self._live: Live | None = None
         self._spinner: ThinkingSpinner | None = None
         self._header_printed = False
-        self._last_update = 0.0
         self._start_spinner()
-
-    def _renderable(self):
-        if self._md and self._buf:
-            return Markdown(self._buf)
-        return Text(self._buf or "")
 
     def _start_spinner(self) -> None:
         if self._show_spinner:
@@ -132,17 +112,6 @@ class StreamRenderer:
         self._console.print()
         self._console.print(f"[cyan]{self._bot_name}[/cyan]")
         self._header_printed = True
-
-    def _start_live(self) -> None:
-        self._live = Live(
-            self._renderable(),
-            console=self._console,
-            screen=True,
-            auto_refresh=True,
-            refresh_per_second=10,
-        )
-        self._live.start()
-        self._last_update = 0.0  # first delta after creation triggers update immediately
 
     # -- public properties / helpers ----------------------------------------
 
@@ -164,13 +133,7 @@ class StreamRenderer:
         return nullcontext()
 
     def pause_spinner(self):
-        """Context manager: pause spinner for tool progress.
-
-        Does **not** stop the Live display.  Rich's ``Live.console.print()``
-        automatically suspends the live region while output is written
-        through the same Console instance, so printing a tool-progress
-        line via *self._console* is coordinated with the live display.
-        """
+        """Context manager: pause spinner for tool progress."""
         @contextmanager
         def _pause():
             with self._spinner.pause() if self._spinner else nullcontext():
@@ -184,41 +147,27 @@ class StreamRenderer:
     # -- streaming ----------------------------------------------------------
 
     async def on_delta(self, delta: str) -> None:
-        """Accumulate delta and throttle Live updates."""
+        """Accumulate delta and write directly to terminal.
+
+        No Rich Live is used — native terminal scrolling keeps the
+        latest content visible regardless of buffer size.
+        """
         self.streamed = True
         self._buf += delta
-        if self._live is None:
-            if not self._buf.strip():
+        if not self._header_printed:
+            if not delta.strip():
                 return
             self._ensure_header()
-            self._start_live()
-            return
-
-        now = time.monotonic()
-        if now - self._last_update >= self._UPDATE_INTERVAL:
-            self._live.update(self._renderable())
-            self._last_update = now
+        self._console.file.write(delta)
+        self._console.file.flush()
 
     async def on_end(self, *, resuming: bool = False) -> None:
-        """Final update, stop Live, stop spinner.
-
-        With ``screen=True``, stopping Live switches back to the main
-        screen buffer where the content is not visible.  Print the
-        final rendered content so it persists for scrollback.
-        """
-        if self._live:
-            rendered = self._renderable()
-            self._live.stop()
-            self._live = None
-            self._console.print(rendered)
+        """Stop spinner, reset buffer for the next turn."""
+        self._buf = ""
         self._stop_spinner()
         if resuming:
-            self._buf = ""
             self._start_spinner()
 
     async def close(self) -> None:
-        """Stop spinner/live without a final render."""
-        if self._live:
-            self._live.stop()
-            self._live = None
+        """Stop spinner without final render (error/cleanup path)."""
         self._stop_spinner()
