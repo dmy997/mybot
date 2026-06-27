@@ -113,9 +113,16 @@ class ChatApp(App):
         tool_widgets: dict[str, ToolCallMessage] = {}
 
         # --- callbacks (sync — Textual widgets are thread-safe within asyncio) ---
+        _last_scroll_time = 0.0
 
         async def _on_delta(token: str) -> None:
+            nonlocal _last_scroll_time
             stream.add_token(token)
+            # Throttled auto-scroll (every ~150ms) to keep latest content visible
+            now = time.monotonic()
+            if now - _last_scroll_time >= 0.15:
+                chat.scroll_end(animate=False)
+                _last_scroll_time = now
 
         async def _on_thinking(token: str) -> None:
             pass  # spinner not needed — streaming widget is visible
