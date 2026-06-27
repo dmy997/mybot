@@ -654,33 +654,12 @@ class Orchestrator:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """CLI entry point for the interactive chat loop."""
-    import os
-    import select
+    """CLI entry point — launch the Textual chat UI."""
     import sys
-    import time
-    from contextlib import suppress
     from datetime import datetime
-    from typing import Any
-
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.formatted_text import HTML
-    from prompt_toolkit.history import FileHistory
-    from prompt_toolkit.patch_stdout import patch_stdout
 
     from config import Config
-    from observability.display import (
-        console,
-        print_error,
-        print_tool_progress_end,
-        print_tool_progress_start,
-        render_content,
-        show_banner,
-        show_history,
-        show_llm_usage,
-        show_sessions,
-    )
-    from observability.stream_renderer import StreamRenderer
+    from mybot.tui import ChatApp
     from providers.openai_compatible_provider import OpenAICompatibleProvider
 
     # -- CLI flags -----------------------------------------------------------
@@ -708,224 +687,31 @@ def main() -> None:
         if last_session_file.exists():
             session_key = last_session_file.read_text(encoding="utf-8").strip()
             if not session_key or not orche.ctx.session.get_session(session_key).messages:
-                print("No previous session found or session is empty. Starting a new one.")
                 session_key = datetime.now().strftime("%Y%m%d-%H%M%S")
         else:
-            print("No previous session found. Starting a new one.")
             session_key = datetime.now().strftime("%Y%m%d-%H%M%S")
     else:
         session_key = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    # Persist session key for future --continue
     last_session_file.parent.mkdir(parents=True, exist_ok=True)
     last_session_file.write_text(session_key, encoding="utf-8")
 
-    # -- startup banner -------------------------------------------------------
-    session = orche.ctx.session.get_session(session_key)
     model = Config.default_model
-    show_banner(
-        session_key=session_key,
-        model=model or "(provider default)",
-        msg_count=len(session.messages),
-        agents=list(orche.dispatcher.agents.keys()),
-        resumed=do_continue and bool(session.messages),
-    )
+    session = orche.ctx.session.get_session(session_key)
+    is_resumed = do_continue and bool(session.messages)
 
-    # -- prompt_toolkit session -----------------------------------------------
-    _prompt_session: PromptSession | None = None
-
-    def _init_prompt_session() -> None:
-        nonlocal _prompt_session
-        history_file = orche.workspace / ".cli_history"
-        history_file.parent.mkdir(parents=True, exist_ok=True)
-        _prompt_session = PromptSession(
-            history=FileHistory(str(history_file)),
-            enable_open_in_editor=False,
-            multiline=False,
-        )
-
-    def _flush_pending_tty_input() -> None:
-        """Drop unread keypresses typed while the agent was generating output."""
-        try:
-            fd = sys.stdin.fileno()
-            if not os.isatty(fd):
-                return
-        except Exception:
-            return
-        with suppress(Exception):
-            import termios
-            termios.tcflush(fd, termios.TCIFLUSH)
-            return
-        with suppress(Exception):
-            while True:
-                ready, _, _ = select.select([fd], [], [], 0)
-                if not ready:
-                    break
-                if not os.read(fd, 4096):
-                    break
-
-    async def _read_input_async() -> str:
-        """Read user input using prompt_toolkit."""
-        if _prompt_session is None:
-            raise RuntimeError("Call _init_prompt_session() first")
-        try:
-            with patch_stdout():
-                return await _prompt_session.prompt_async(
-                    HTML("<b fg='ansiblue'>You:</b> "),
-                )
-        except EOFError:
-            raise KeyboardInterrupt from None
-
-    _last_paradigm: str = "react"
-
-    # -- interactive loop -----------------------------------------------------
-
+    # -- launch Textual app --------------------------------------------------
     async def _run() -> None:
-        nonlocal _prompt_session, _last_paradigm
-
-        _init_prompt_session()
         await orche.start_services()
         await bus.publish(SessionCreated(session_key=session_key))
-
-        renderer: StreamRenderer | None = None
-
-        try:
-            while True:
-                _flush_pending_tty_input()
-                if renderer:
-                    renderer.stop_for_input()
-
-                try:
-                    line = await _read_input_async()
-                except KeyboardInterrupt:
-                    print("\nInterrupted.")
-                    break
-
-                user_input = line.strip()
-                if not user_input:
-                    continue
-
-                if user_input.lower() in ("/exit", "/quit"):
-                    print("Goodbye!")
-                    break
-
-                if user_input.lower().startswith("/"):
-                    parts = user_input.split(maxsplit=1)
-                    cmd = parts[0].lower()
-                    if cmd == "/help":
-                        show_banner(
-                            session_key=session_key,
-                            model=model or "(provider default)",
-                            msg_count=len(orche.ctx.session.get_session(session_key).messages),
-                            agents=list(orche.dispatcher.agents.keys()),
-                        )
-                        continue
-                    if cmd == "/history":
-                        session = orche.ctx.session.get_session(session_key)
-                        show_history(session_key, session.messages)
-                        continue
-                    if cmd == "/clear":
-                        console.clear()
-                        continue
-                    if cmd == "/sessions":
-                        show_sessions(orche.sessions)
-                        continue
-
-                renderer = StreamRenderer(bot_name="mybot")
-
-                # Direct callbacks — bypass MessageBus queue so deltas are
-                # rendered synchronously in the chat_stream task without
-                # inter-task scheduling latency.  Every other path (HTTP/WS
-                # server) still uses the MessageBus; only CLI takes this
-                # fast path.
-                async def _on_delta(token: str) -> None:
-                    await renderer.on_delta(token)
-
-                async def _on_thinking(token: str) -> None:
-                    pass  # spinner already visible
-
-                async def _on_thinking_done() -> None:
-                    pass
-
-                async def _on_tool_start(name: str) -> None:
-                    with renderer.pause_spinner():
-                        renderer.ensure_header()
-                        renderer.console.print(
-                            f"  [dim cyan][tool:{name}][/dim cyan]",
-                            highlight=False,
-                        )
-
-                async def _on_tool_exec_start(
-                    name: str, args: dict[str, Any], idx: int, total: int,
-                ) -> None:
-                    with renderer.pause_spinner():
-                        renderer.ensure_header()
-                        print_tool_progress_start(
-                            name, args, idx, total, _console=renderer.console,
-                        )
-
-                async def _on_tool_exec_end(ev: dict[str, Any]) -> None:
-                    with renderer.pause_spinner():
-                        renderer.ensure_header()
-                        print_tool_progress_end(ev, _console=renderer.console)
-
-                async def _on_new_turn() -> None:
-                    # Reset the renderer buffer between LLM turns so Markdown
-                    # rendering stays fast and content from different turns
-                    # is displayed as separate blocks.
-                    await renderer.on_end(resuming=True)
-
-                t_start = time.monotonic()
-                try:
-                    result = await orche.process_message(
-                        session_key=session_key,
-                        user_input=user_input,
-                        on_delta=_on_delta,
-                        on_thinking=_on_thinking,
-                        on_thinking_done=_on_thinking_done,
-                        on_tool_start=_on_tool_start,
-                        on_tool_execute_start=_on_tool_exec_start,
-                        on_tool_execute_end=_on_tool_exec_end,
-                        on_new_turn=_on_new_turn,
-                    )
-                except Exception as exc:
-                    await renderer.close()
-                    renderer = None
-                    print()
-                    print_error(str(exc))
-                    print()
-                    continue
-
-                # Final render
-                if renderer.streamed:
-                    await renderer.on_end()
-                else:
-                    await renderer.close()
-                    if result.content:
-                        print()
-                        render_content(result.content)
-
-                if result.error:
-                    print()
-                    print_error(result.error)
-                    if result.stop_reason:
-                        console.print(f"(stop_reason: {result.stop_reason})", style="dim")
-
-                print()
-                show_llm_usage(
-                    result.usage,
-                    (time.monotonic() - t_start) * 1000,
-                    0,
-                )
-                if result.paradigm:
-                    _last_paradigm = result.paradigm
-
-        except KeyboardInterrupt:
-            print("\nInterrupted.")
-        finally:
-            if renderer:
-                await renderer.close()
-            await orche.stop_services()
+        app = ChatApp(
+            orchestrator=orche,
+            session_key=session_key,
+            model=model or "(provider default)",
+            is_resumed=is_resumed,
+        )
+        await app.run_async()
+        await orche.stop_services()
 
     try:
         asyncio.run(_run())

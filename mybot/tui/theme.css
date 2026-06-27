@@ -1,0 +1,79 @@
+/* mybot TUI — dark theme */
+
+Screen {
+    background: #0d1117;
+    color: #c9d1d9;
+}
+
+#chat-area {
+    height: 1fr;
+    overflow-y: auto;
+    padding: 0 1;
+    scrollbar-size: 0 0;
+    border-bottom: solid $surface;
+}
+
+#chat-area UserMessage {
+    width: auto;
+    max-width: 85%;
+    margin: 1 0 0 0;
+    dock: right;
+    text-align: right;
+    color: #58a6ff;
+}
+
+#chat-area AssistantMessage {
+    width: auto;
+    max-width: 90%;
+    margin: 2 0 0 0;
+}
+
+#chat-area StreamingMessage {
+    width: auto;
+    max-width: 90%;
+    margin: 2 0 0 0;
+}
+
+#chat-area ToolCallMessage {
+    width: auto;
+    max-width: 90%;
+    margin: 0 0 0 0;
+}
+
+#chat-area ErrorMessage {
+    width: auto;
+    max-width: 90%;
+    margin: 2 0 0 0;
+}
+
+#input-area {
+    height: auto;
+    padding: 1;
+    dock: bottom;
+    background: $surface;
+}
+
+#user-input {
+    width: 1fr;
+    border: solid $primary;
+    background: $surface;
+    color: $text;
+}
+
+#user-input:focus {
+    border: solid $accent;
+}
+
+#status-bar {
+    height: 1;
+    dock: bottom;
+    background: $surface;
+    padding: 0 1;
+}
+
+#header-bar {
+    height: 1;
+    dock: top;
+    background: $surface;
+    padding: 0 1;
+}
