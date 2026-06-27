@@ -659,7 +659,7 @@ def main() -> None:
     from datetime import datetime
 
     from config import Config
-    from mybot.tui import ChatApp
+    from tui import ChatApp
     from providers.openai_compatible_provider import OpenAICompatibleProvider
 
     # -- CLI flags -----------------------------------------------------------
