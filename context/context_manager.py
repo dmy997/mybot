@@ -51,7 +51,10 @@ __all__ = [
 _DEFAULT_SYSTEM_PROMPT = (
     "Reply in the same language the user is using. "
     "If the user writes in Chinese, reply in Chinese. "
-    "If the user writes in English, reply in English."
+    "If the user writes in English, reply in English. "
+    "Follow the SOUL.md identity and USER.md profile unless they conflict "
+    "with the language of the current conversation — the user's message "
+    "language always takes priority."
 )
 
 # ---------------------------------------------------------------------------
@@ -551,6 +554,17 @@ class ContextManager:
             history_ctx = self._build_history_context()
             if history_ctx:
                 parts.append(history_ctx)
+
+        # Language enforcement: append as the LAST section so recency bias
+        # overrides any English tone set by SOUL.md or other upstream content.
+        parts.append(
+            "# Language Rule\n\n"
+            "Your response language MUST match the user's message language. "
+            "If the user writes in Chinese, you MUST reply in Chinese. "
+            "If the user writes in English, you MUST reply in English. "
+            "This rule overrides any language cues in your identity (SOUL.md) "
+            "or the user's profile (USER.md)."
+        )
 
         return "\n\n".join(parts)
 

@@ -250,6 +250,7 @@ class Orchestrator:
         on_tool_execute_end: (
             Callable[[dict[str, Any]], Awaitable[None]] | None
         ) = None,
+        on_new_turn: Callable[[], Awaitable[None]] | None = None,
     ) -> OrchestratorResult:
         """Execute a single agent run for *user_input*.
 
@@ -322,6 +323,7 @@ class Orchestrator:
                     on_tool_call_delta=_on_tool_call_delta,
                     on_tool_execute_start=on_tool_execute_start,
                     on_tool_execute_end=on_tool_execute_end,
+                    on_new_turn=on_new_turn,
                 )
 
                 # 5. Run agent (interruptible)
@@ -545,6 +547,10 @@ class Orchestrator:
                     await bus_msg.outbound.put(
                         OutboundMessage(session_key, cid, "tool_exec_end", ev))
 
+                async def _on_new_turn() -> None:
+                    await bus_msg.outbound.put(
+                        OutboundMessage(session_key, cid, "new_turn", None))
+
                 t_start = time.monotonic()
                 try:
                     result = await self.process_message(
@@ -562,6 +568,7 @@ class Orchestrator:
                         on_tool_end=_on_tool_end,
                         on_tool_execute_start=_on_tool_exec_start,
                         on_tool_execute_end=_on_tool_exec_end,
+                        on_new_turn=_on_new_turn,
                     )
                     await bus_msg.outbound.put(OutboundMessage(
                         session_key, cid, "final",
@@ -862,6 +869,12 @@ def main() -> None:
                         renderer.ensure_header()
                         print_tool_progress_end(ev, _console=renderer.console)
 
+                async def _on_new_turn() -> None:
+                    # Reset the renderer buffer between LLM turns so Markdown
+                    # rendering stays fast and content from different turns
+                    # is displayed as separate blocks.
+                    await renderer.on_end(resuming=True)
+
                 t_start = time.monotonic()
                 try:
                     result = await orche.process_message(
@@ -873,6 +886,7 @@ def main() -> None:
                         on_tool_start=_on_tool_start,
                         on_tool_execute_start=_on_tool_exec_start,
                         on_tool_execute_end=_on_tool_exec_end,
+                        on_new_turn=_on_new_turn,
                     )
                 except Exception as exc:
                     await renderer.close()
