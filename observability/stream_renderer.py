@@ -6,9 +6,15 @@ updated at most every ~80ms (12 FPS).  This prevents the asyncio hot path
 from being blocked by excessive Markdown object creation and Live update
 overhead — the common streaming bottleneck in WSL2 terminals.
 
+Rich Live uses ``screen=True`` (alternate screen buffer) so that the
+display properly scrolls when content exceeds the terminal height.  With
+``screen=False`` the ANSI cursor-up escape codes cannot move past the top
+of the terminal, causing new content to render below the visible viewport.
+On stop the final content is printed to the main screen for scrollback.
+
 Flow per round:
-  spinner → first delta → header + throttled Rich Live updates →
-  on_end → stop Live (content stays on screen) + stop spinner
+  spinner → first delta → header + throttled Rich Live updates (alt screen) →
+  on_end → stop Live → print final content to main screen + stop spinner
 """
 
 from __future__ import annotations
@@ -131,10 +137,9 @@ class StreamRenderer:
         self._live = Live(
             self._renderable(),
             console=self._console,
-            screen=False,
+            screen=True,
             auto_refresh=True,
             refresh_per_second=10,
-            transient=False,
         )
         self._live.start()
         self._last_update = 0.0  # first delta after creation triggers update immediately
@@ -195,12 +200,17 @@ class StreamRenderer:
             self._last_update = now
 
     async def on_end(self, *, resuming: bool = False) -> None:
-        """Final update, stop Live, stop spinner."""
+        """Final update, stop Live, stop spinner.
+
+        With ``screen=True``, stopping Live switches back to the main
+        screen buffer where the content is not visible.  Print the
+        final rendered content so it persists for scrollback.
+        """
         if self._live:
-            self._live.update(self._renderable())
-            self._live.refresh()
+            rendered = self._renderable()
             self._live.stop()
             self._live = None
+            self._console.print(rendered)
         self._stop_spinner()
         if resuming:
             self._buf = ""
