@@ -29,6 +29,9 @@ from typing import Any
 
 from loguru import logger
 
+from observability.metrics import REGISTRY
+from observability.recent import recent
+
 from .message_bus import InboundMessage, MessageBus
 from .orchestrator import Orchestrator
 
@@ -125,6 +128,25 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
     async def health(request: Request) -> JSONResponse:  # noqa: ARG001
         return JSONResponse({"status": "ok"})
 
+    async def metrics(request: Request) -> JSONResponse:  # noqa: ARG001
+        """Return current observability metrics as JSON."""
+        snap = REGISTRY.collect_all()
+        return JSONResponse({
+            "counters": snap.counters,
+            "gauges": snap.gauges,
+            "histograms": snap.histograms,
+        })
+
+    async def logs_endpoint(request: Request) -> JSONResponse:  # noqa: ARG001
+        """Return recent structured log events."""
+        limit = int(request.query_params.get("limit", "100"))
+        return JSONResponse(recent.get_logs(min(limit, 500)))
+
+    async def traces_endpoint(request: Request) -> JSONResponse:  # noqa: ARG001
+        """Return recent trace spans."""
+        limit = int(request.query_params.get("limit", "100"))
+        return JSONResponse(recent.get_spans(min(limit, 200)))
+
     async def chat_sse(request: Request) -> JSONResponse | StreamingResponse:
         if not _check_auth(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -183,11 +205,17 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                         if data.get("error"):
                             yield _sse_event("error", {"message": data["error"]})
                         else:
+                            snap = REGISTRY.collect_all()
                             yield _sse_event("done", {
                                 "content": content,
                                 "stop_reason": data.get("stop_reason", "completed"),
                                 "paradigm": data.get("paradigm", "unknown"),
                                 "usage": data.get("usage", {}),
+                                "metrics": {
+                                    "counters": snap.counters,
+                                    "gauges": snap.gauges,
+                                    "histograms": snap.histograms,
+                                },
                             })
                         break  # final — end stream
                     elif out.msg_type == "error":
@@ -294,11 +322,17 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                         if data.get("error"):
                             await _send("error", {"message": data["error"]})
                         else:
+                            snap = REGISTRY.collect_all()
                             await _send("done", {
                                 "content": content,
                                 "stop_reason": data.get("stop_reason", "completed"),
                                 "paradigm": data.get("paradigm", "unknown"),
                                 "usage": data.get("usage", {}),
+                                "metrics": {
+                                    "counters": snap.counters,
+                                    "gauges": snap.gauges,
+                                    "histograms": snap.histograms,
+                                },
                             })
                         break
                     elif out.msg_type == "error":
@@ -379,6 +413,9 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
     app = Starlette(routes=[
         Route("/", index),
         Route("/health", health),
+        Route("/metrics", metrics),
+        Route("/logs", logs_endpoint),
+        Route("/traces", traces_endpoint),
         Route("/chat/{session_id}", chat_sse, methods=["POST"]),
         Route("/sessions", list_sessions, methods=["GET"]),
         Route("/sessions/{session_id}", get_session, methods=["GET"]),

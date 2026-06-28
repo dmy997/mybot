@@ -20,6 +20,7 @@
   --bubble-assistant: #16213e;
   --bubble-tool: #1a3a2e;
   --bubble-think: #2a2a38;
+  --ok: #6ecca0;
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -55,6 +56,20 @@ input { font-family: inherit; }
 }
 .session-item:hover .del-btn { visibility: visible; }
 .session-item .del-btn:hover { color: var(--danger); }
+
+/* Sidebar nav */
+#sidebar-nav {
+  border-top: 1px solid var(--border); padding: 8px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+#sidebar-nav button {
+  padding: 8px 12px; background: transparent; color: var(--text-muted);
+  border: 1px solid transparent; border-radius: 8px; font-size: 12px;
+  text-align: left; transition: all .15s;
+}
+#sidebar-nav button:hover { background: rgba(255,255,255,.05); color: var(--text); }
+#sidebar-nav button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
 #new-session-btn {
   margin: 8px; padding: 10px; background: var(--accent); color: #fff;
   border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
@@ -63,6 +78,10 @@ input { font-family: inherit; }
 
 /* Main */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+/* Chat view */
+#chat-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+#chat-view.hidden { display: none; }
 #chat-header {
   padding: 12px 20px; border-bottom: 1px solid var(--border);
   font-size: 14px; color: var(--text-muted);
@@ -80,16 +99,15 @@ input { font-family: inherit; }
 }
 .message.assistant code { font-size: 12px; background: rgba(255,255,255,.08); padding: 2px 4px; border-radius: 3px; }
 .message.assistant pre code { background: none; padding: 0; }
+.message.error { align-self: center; background: rgba(229,62,62,.15); color: #f87171; font-size: 13px; }
 
-/* Thinking */
 .think-block {
   background: var(--bubble-think); border: 1px solid var(--border);
   border-radius: 8px; margin: 4px 0; overflow: hidden;
 }
 .think-summary {
   padding: 6px 12px; font-size: 12px; color: var(--text-muted);
-  cursor: pointer; display: flex; align-items: center; gap: 6px;
-  user-select: none;
+  cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none;
 }
 .think-summary:hover { background: rgba(255,255,255,.03); }
 .think-summary .arrow { transition: transform .2s; font-size: 10px; }
@@ -97,31 +115,20 @@ input { font-family: inherit; }
 .think-block.open .think-body { display: block; }
 .think-block.open .arrow { transform: rotate(90deg); }
 
-/* Tool calls */
 .tool-block {
   background: var(--bubble-tool); border: 1px solid var(--border);
   border-radius: 8px; margin: 4px 0; overflow: hidden;
 }
 .tool-summary {
-  padding: 6px 12px; font-size: 12px; color: #6ecca0;
-  cursor: pointer; display: flex; align-items: center; gap: 6px;
-  user-select: none;
+  padding: 6px 12px; font-size: 12px; color: var(--ok);
+  cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none;
 }
 .tool-summary:hover { background: rgba(255,255,255,.03); }
 .tool-body { padding: 8px 12px; font-size: 12px; color: #a0b0b0; white-space: pre-wrap; display: none; max-height: 200px; overflow-y: auto; }
 .tool-block.open .tool-body { display: block; }
-.tool-block.open .arrow { transform: rotate(90deg); }
 
-/* Error */
-.message.error { align-self: center; background: rgba(229,62,62,.15); color: #f87171; font-size: 13px; }
+.usage-badge { align-self: flex-end; font-size: 11px; color: var(--text-muted); padding: 2px 8px; }
 
-/* Usage badge */
-.usage-badge {
-  align-self: flex-end; font-size: 11px; color: var(--text-muted);
-  padding: 2px 8px;
-}
-
-/* Input */
 #input-area {
   padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 10px;
 }
@@ -138,6 +145,59 @@ input { font-family: inherit; }
 #send-btn:hover:not(:disabled) { background: var(--accent-hover); }
 #send-btn:disabled { opacity: .5; cursor: not-allowed; }
 
+/* Observability view */
+#observability-view { flex: 1; display: none; flex-direction: column; min-height: 0; }
+#observability-view.active { display: flex; }
+#obs-header {
+  padding: 12px 20px; border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+}
+#obs-header h2 { font-size: 16px; font-weight: 600; }
+#obs-header button {
+  padding: 6px 14px; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
+}
+#obs-header button:hover { background: var(--accent); color: #fff; }
+#obs-content { flex: 1; overflow-y: auto; padding: 16px 20px; }
+
+/* Metrics cards */
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.metric-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px;
+}
+.metric-card h3 { font-size: 13px; color: var(--accent); margin-bottom: 10px; text-transform: uppercase; letter-spacing: .5px; }
+.metric-card table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.metric-card td { padding: 4px 0; }
+.metric-card td:first-child { color: var(--text-muted); }
+.metric-card td:last-child { text-align: right; font-variant-numeric: tabular-nums; font-weight: 500; }
+.metric-card .err { color: var(--danger); }
+
+/* Log entries */
+.log-entry {
+  padding: 8px 12px; margin-bottom: 4px; border-radius: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+  font-size: 12px; line-height: 1.5;
+}
+.log-entry .ts { color: var(--text-muted); margin-right: 8px; }
+.log-entry .type { color: var(--accent); font-weight: 600; margin-right: 8px; }
+.log-entry .data { color: var(--text); word-break: break-all; }
+
+/* Trace spans */
+.span-entry {
+  padding: 8px 12px; margin-bottom: 6px; border-radius: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+  font-size: 12px;
+}
+.span-entry .name { font-weight: 600; color: var(--text); }
+.span-entry .meta { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+.span-entry .meta span { margin-right: 12px; }
+.span-entry .attr { color: var(--text-muted); font-size: 11px; margin-top: 4px; }
+.span-entry .attr code { color: var(--ok); background: rgba(255,255,255,.05); padding: 1px 4px; border-radius: 3px; }
+.span-entry.status-error { border-left: 3px solid var(--danger); }
+.span-entry.status-ok { border-left: 3px solid var(--ok); }
+.span-tree { margin-left: 16px; border-left: 1px dashed var(--border); padding-left: 12px; }
+
 /* Loading dots */
 .loading-dots { display: inline-flex; gap: 3px; padding: 4px 0; }
 .loading-dots span {
@@ -151,7 +211,6 @@ input { font-family: inherit; }
   40% { transform: scale(1); }
 }
 
-/* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -162,26 +221,45 @@ input { font-family: inherit; }
 <div id="sidebar">
   <div id="sidebar-header">mybot Chat</div>
   <div id="session-list"></div>
+  <div id="sidebar-nav">
+    <button data-view="metrics" onclick="switchView('metrics')">Metrics</button>
+    <button data-view="logs" onclick="switchView('logs')">Log</button>
+    <button data-view="trace" onclick="switchView('trace')">Trace</button>
+  </div>
   <button id="new-session-btn" onclick="newSession()">+ New Session</button>
 </div>
 
 <div id="main">
-  <div id="chat-header">
-    Session: <strong id="current-session-name">default</strong>
+  <div id="chat-view">
+    <div id="chat-header">
+      Session: <strong id="current-session-name">default</strong>
+    </div>
+    <div id="messages"></div>
+    <div id="input-area">
+      <input id="message-input" type="text" placeholder="Type a message..." autofocus
+             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}">
+      <button id="send-btn" onclick="sendMessage()">Send</button>
+    </div>
   </div>
-  <div id="messages"></div>
-  <div id="input-area">
-    <input id="message-input" type="text" placeholder="Type a message..." autofocus
-           onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}">
-    <button id="send-btn" onclick="sendMessage()">Send</button>
+
+  <div id="observability-view">
+    <div id="obs-header">
+      <h2 id="obs-title">Metrics</h2>
+      <button onclick="switchView('chat')">Back to Chat</button>
+    </div>
+    <div id="obs-content"></div>
   </div>
 </div>
 
 <script>
 let currentSession = 'default';
 let isStreaming = false;
+let activeObsView = null;
+let obsRefreshTimer = null;
 
+// =========================================================================
 // Session management
+// =========================================================================
 async function loadSessions() {
   const resp = await fetch('/sessions');
   const sessions = await resp.json();
@@ -211,18 +289,205 @@ function selectSession(key) {
   currentSession = key;
   document.getElementById('current-session-name').textContent = key;
   document.getElementById('messages').innerHTML = '';
+  switchView('chat');
   loadSessions();
 }
 
 function newSession() {
   const name = prompt('Session name:');
-  if (name && name.trim()) {
-    selectSession(name.trim());
+  if (name && name.trim()) selectSession(name.trim());
+}
+
+// =========================================================================
+// View switching
+// =========================================================================
+function switchView(view) {
+  const chatView = document.getElementById('chat-view');
+  const obsView = document.getElementById('observability-view');
+  const navBtns = document.querySelectorAll('#sidebar-nav button');
+
+  if (obsRefreshTimer) { clearInterval(obsRefreshTimer); obsRefreshTimer = null; }
+
+  if (view === 'chat') {
+    activeObsView = null;
+    chatView.classList.remove('hidden');
+    obsView.classList.remove('active');
+    navBtns.forEach(b => b.classList.remove('active'));
+  } else {
+    activeObsView = view;
+    chatView.classList.add('hidden');
+    obsView.classList.add('active');
+    document.getElementById('obs-title').textContent =
+      view === 'metrics' ? 'Metrics' : view === 'logs' ? 'Log' : 'Trace';
+    navBtns.forEach(b => b.classList.toggle('active', b.dataset.view === view));
+    refreshObsView();
+    obsRefreshTimer = setInterval(refreshObsView, 5000);
   }
 }
 
+async function refreshObsView() {
+  if (!activeObsView) return;
+  switch (activeObsView) {
+    case 'metrics': await showMetrics(); break;
+    case 'logs': await showLogs(); break;
+    case 'trace': await showTraces(); break;
+  }
+}
+
+// =========================================================================
+// Metrics
+// =========================================================================
+async function showMetrics() {
+  const el = document.getElementById('obs-content');
+  try {
+    const resp = await fetch('/metrics');
+    const data = await resp.json();
+    const { counters, gauges, histograms } = data;
+
+    el.innerHTML = `
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <h3>LLM</h3>
+          <table>
+            <tr><td>Calls</td><td>${counters.llm_calls_total || 0}</td></tr>
+            <tr><td>Errors</td><td class="${counters.llm_calls_errors_total ? 'err' : ''}">${counters.llm_calls_errors_total || 0}</td></tr>
+            <tr><td>Tokens Total</td><td>${fmtNum(counters.llm_tokens_total)}</td></tr>
+            <tr><td>Latency p50</td><td>${fmtMs(histograms.llm_latency_ms?.p50)}</td></tr>
+            <tr><td>Latency p95</td><td>${fmtMs(histograms.llm_latency_ms?.p95)}</td></tr>
+            <tr><td>Latency avg</td><td>${fmtMs(histograms.llm_latency_ms?.avg)}</td></tr>
+            <tr><td>Latency max</td><td>${fmtMs(histograms.llm_latency_ms?.max)}</td></tr>
+          </table>
+        </div>
+        <div class="metric-card">
+          <h3>Tools</h3>
+          <table>
+            <tr><td>Calls</td><td>${counters.tool_calls_total || 0}</td></tr>
+            <tr><td>Errors</td><td class="${counters.tool_calls_errors_total ? 'err' : ''}">${counters.tool_calls_errors_total || 0}</td></tr>
+            <tr><td>Latency p50</td><td>${fmtMs(histograms.tool_latency_ms?.p50)}</td></tr>
+            <tr><td>Latency p95</td><td>${fmtMs(histograms.tool_latency_ms?.p95)}</td></tr>
+            <tr><td>Latency avg</td><td>${fmtMs(histograms.tool_latency_ms?.avg)}</td></tr>
+            <tr><td>Latency max</td><td>${fmtMs(histograms.tool_latency_ms?.max)}</td></tr>
+          </table>
+        </div>
+        <div class="metric-card">
+          <h3>Agent</h3>
+          <table>
+            <tr><td>Steps (avg)</td><td>${histograms.agent_steps?.avg?.toFixed(1) || '-'}</td></tr>
+            <tr><td>Steps (max)</td><td>${histograms.agent_steps?.max?.toFixed(0) || '-'}</td></tr>
+            <tr><td>Errors</td><td class="${counters.agent_errors_total ? 'err' : ''}">${counters.agent_errors_total || 0}</td></tr>
+            <tr><td>Stall Warnings</td><td class="${counters.agent_stall_warnings_total ? 'err' : ''}">${counters.agent_stall_warnings_total || 0}</td></tr>
+            <tr><td>Active Sessions</td><td>${gauges.active_sessions != null ? gauges.active_sessions : '-'}</td></tr>
+          </table>
+        </div>
+      </div>`;
+  } catch (e) {
+    el.innerHTML = '<div class="error-msg">Failed to load metrics</div>';
+  }
+}
+
+// =========================================================================
+// Log
+// =========================================================================
+async function showLogs() {
+  const el = document.getElementById('obs-content');
+  try {
+    const resp = await fetch('/logs?limit=200');
+    const logs = await resp.json();
+
+    if (!logs.length) {
+      el.innerHTML = '<div style="color:var(--text-muted);padding:20px;">No log events yet. Send a message to generate events.</div>';
+      return;
+    }
+
+    const now = Date.now() / 1000;
+    el.innerHTML = logs.reverse().map(e => {
+      const ago = Math.round(now - e.timestamp);
+      const ts = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.round(ago/60)}m ago` : `${Math.round(ago/3600)}h ago`;
+      const dataStr = Object.entries(e.data).map(([k,v]) => {
+        const sv = typeof v === 'number' ? (v > 1000 ? fmtNum(v) : v) : String(v).substring(0, 80);
+        return `<span style="color:var(--text-muted)">${esc(k)}</span>=<span style="color:var(--text)">${esc(String(sv))}</span>`;
+      }).join(' ');
+      return `<div class="log-entry">
+        <span class="ts">${ts}</span>
+        <span class="type">${esc(e.event_type)}</span>
+        <span class="data">${dataStr}</span>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = '<div class="error-msg">Failed to load logs</div>';
+  }
+}
+
+// =========================================================================
+// Trace
+// =========================================================================
+async function showTraces() {
+  const el = document.getElementById('obs-content');
+  try {
+    const resp = await fetch('/traces?limit=100');
+    const spans = await resp.json();
+
+    if (!spans.length) {
+      el.innerHTML = '<div style="color:var(--text-muted);padding:20px;">No trace spans yet. Send a message to generate traces.</div>';
+      return;
+    }
+
+    const traces = {};
+    spans.forEach(s => {
+      if (!traces[s.trace_id]) traces[s.trace_id] = [];
+      traces[s.trace_id].push(s);
+    });
+
+    const traceIds = Object.keys(traces).sort((a, b) => {
+      const ma = Math.max(...traces[a].map(s => s.end_time || 0));
+      const mb = Math.max(...traces[b].map(s => s.end_time || 0));
+      return mb - ma;
+    });
+
+    el.innerHTML = traceIds.slice(0, 20).map(tid => {
+      const spans = traces[tid];
+      const roots = spans.filter(s => !s.parent_span_id);
+      const children = {};
+      spans.forEach(s => {
+        if (s.parent_span_id) {
+          if (!children[s.parent_span_id]) children[s.parent_span_id] = [];
+          children[s.parent_span_id].push(s);
+        }
+      });
+
+      function renderSpan(s, depth) {
+        const indent = depth > 0 ? ' class="span-tree"' : '';
+        const statusCls = s.status === 'error' ? ' status-error' : ' status-ok';
+        const dur = s.latency_ms != null ? fmtMs(s.latency_ms) : '?';
+        const attrs = Object.entries(s.attributes || {}).slice(0, 6).map(([k,v]) =>
+          `<code>${esc(k)}: ${esc(String(v))}</code>`
+        ).join(' ');
+
+        let html = `<div${indent}><div class="span-entry${statusCls}">
+          <div class="name">${esc(s.name)} <span style="color:var(--text-muted);font-weight:400">${dur}</span></div>
+          <div class="meta"><span>trace: ${esc(s.trace_id.substring(0, 8))}...</span><span>span: ${esc(s.span_id)}</span></div>`;
+        if (attrs) html += `<div class="attr">${attrs}</div>`;
+        html += '</div>';
+
+        const kids = children[s.span_id] || [];
+        kids.forEach(k => { html += renderSpan(k, depth + 1); });
+        html += '</div>';
+        return html;
+      }
+
+      return roots.map(r => renderSpan(r, 0)).join('');
+    }).join('');
+  } catch (e) {
+    el.innerHTML = '<div class="error-msg">Failed to load traces</div>';
+  }
+}
+
+// =========================================================================
 // Chat
+// =========================================================================
 async function sendMessage() {
+  if (activeObsView) switchView('chat');
+
   const input = document.getElementById('message-input');
   const btn = document.getElementById('send-btn');
   const message = input.value.trim();
@@ -232,21 +497,15 @@ async function sendMessage() {
   isStreaming = true;
   btn.disabled = true;
 
-  // Add user bubble
   const msgContainer = document.getElementById('messages');
   addBubble('user', message);
 
-  // Add streaming assistant bubble (placeholder)
   const asstEl = addBubble('assistant', '');
   const contentEl = asstEl.querySelector('.msg-content');
 
-  // Track state
-  let thinkingBlock = null;
-  let thinkingBody = null;
-  let toolBlock = null;
-  let toolBody = null;
+  let thinkingBlock = null, thinkingBody = null;
+  let toolBlock = null, toolBody = null;
   let textBuffer = '';
-  const lastToolNames = new Set();
 
   try {
     const resp = await fetch('/chat/' + currentSession, {
@@ -270,15 +529,13 @@ async function sendMessage() {
       if (done) break;
       buf += decoder.decode(value, { stream: true });
 
-      // Parse SSE events
       const parts = buf.split('\n\n');
-      buf = parts.pop(); // keep incomplete part
+      buf = parts.pop();
 
       for (const part of parts) {
         if (!part.trim()) continue;
         const lines = part.split('\n');
-        let event = '';
-        let data = '';
+        let event = '', data = '';
 
         for (const line of lines) {
           if (line.startsWith('event: ')) event = line.slice(7);
@@ -292,11 +549,7 @@ async function sendMessage() {
             textBuffer += data.token || '';
             contentEl.innerHTML = marked.parse(textBuffer);
             scrollDown();
-            // Dismiss thinking block when content starts
-            if (thinkingBlock && thinkingBlock.classList.contains('open')) {
-              thinkingBlock.classList.remove('open');
-            }
-            thinkingBlock = null;
+            if (thinkingBlock) { thinkingBlock.classList.remove('open'); thinkingBlock = null; }
             break;
 
           case 'thinking':
@@ -311,13 +564,12 @@ async function sendMessage() {
 
           case 'thinking_done':
             if (thinkingBlock) {
-              // Collapse after a brief moment
               setTimeout(() => thinkingBlock && thinkingBlock.classList.remove('open'), 2000);
             }
             break;
 
           case 'tool_start':
-            if (!toolBlock || !toolBlock.dataset.name || toolBlock.dataset.name !== data.name) {
+            if (!toolBlock || toolBlock.dataset.name !== data.name) {
               toolBlock = createToolBlock(asstEl, data.name);
               toolBody = toolBlock.querySelector('.tool-body');
             }
@@ -325,8 +577,7 @@ async function sendMessage() {
 
           case 'tool_end':
             if (toolBlock) {
-              const detail = data.detail || JSON.stringify(data);
-              toolBody.textContent += detail + '\n';
+              toolBody.textContent += (data.detail || JSON.stringify(data)) + '\n';
               if (data.status === 'error') {
                 toolBlock.querySelector('.tool-summary').style.color = '#f87171';
               }
@@ -355,16 +606,17 @@ async function sendMessage() {
     isStreaming = false;
     btn.disabled = false;
     document.getElementById('message-input').focus();
-    loadSessions(); // refresh counts
+    loadSessions();
+    if (activeObsView) refreshObsView();
   }
 }
 
 function addBubble(role, text) {
-  const msgContainer = document.getElementById('messages');
+  const msgs = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'message ' + role;
   div.innerHTML = '<div class="msg-content">' + (text ? esc(text) : '') + '</div>';
-  msgContainer.appendChild(div);
+  msgs.appendChild(div);
   scrollDown();
   return div;
 }
@@ -403,7 +655,19 @@ function esc(s) {
   return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// Init
+function fmtNum(n) {
+  if (n == null) return '-';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+function fmtMs(v) {
+  if (v == null) return '-';
+  if (v >= 1000) return (v / 1000).toFixed(1) + 's';
+  return v.toFixed(0) + 'ms';
+}
+
 loadSessions();
 </script>
 </body>

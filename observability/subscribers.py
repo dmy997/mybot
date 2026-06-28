@@ -14,14 +14,12 @@ from loguru import logger
 from core.events import (
     AgentCompleted,
     AgentStallWarning,
-    AgentStepStarted,
     LLMResponseReady,
     ToolExecutionCompleted,
     bus,
 )
 from observability import AgentRunEvent, LLMCallEvent, ToolCallEvent, emit
 from observability.metrics import REGISTRY
-
 
 # ---------------------------------------------------------------------------
 # Individual subscriber handlers

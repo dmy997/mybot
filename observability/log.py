@@ -175,6 +175,10 @@ def emit(event: Any, *, level: str = "INFO") -> None:
     summary = ", ".join(f"{k}={v!r}" for k, v in data.items())
     logger.bind(event_type=event_type, **data).log(level, summary)
 
+    # Store in recent event buffer for web UI
+    from observability.recent import recent
+    recent.add_log(event_type, data)
+
 
 def _to_dict(obj: Any) -> dict[str, Any]:
     """Convert a dataclass instance (or nested list of them) to a flat dict."""

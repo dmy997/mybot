@@ -81,6 +81,13 @@ class Tracer:
         self._on_span_end: list[Callable[[Span], None]] = []
         """Callbacks invoked when a span ends (for external bridge integration)."""
 
+        # Store completed spans in the recent buffer for web UI
+        self._on_span_end.append(self._store_recent)
+
+    def _store_recent(self, span: Span) -> None:
+        from observability.recent import recent
+        recent.add_span(span)
+
     # -- span creation ---------------------------------------------------------
 
     def start_trace(self, name: str, **attributes: Any) -> Span:
