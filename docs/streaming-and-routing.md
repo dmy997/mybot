@@ -46,27 +46,27 @@ AgentCore._call_llm()  (core/runner.py:677-812)
 此处分为两条路径：CLI 直接渲染 vs HTTP/WS 通过 MessageBus 中转
 ═══════════════════════════════════════════════════════════════════════
 
-┌─── CLI 路径 (orchestrator.py:834-843) ─────────────────────────────┐
+┌─── CLI 路径 (tui/app.py) ───────────────────────────────────────────┐
+│                                                                      │
+│  ChatApp (Textual TUI) 替代了旧版 StreamRenderer 实现：             │
 │                                                                      │
 │  async def _on_delta(token):                                         │
-│      await renderer.on_delta(token)  ← 直接调用 StreamRenderer      │
+│      stream.add_token(token)  ← 写入 StreamingMessage 控件          │
 │                                                                      │
-│  async def _on_tool_call_delta(tc):                                  │
-│      # 去重后调用 on_tool_start 回调                                │
-│      if idx not in _shown_tool_indices:                              │
-│          _shown_tool_indices.add(idx)                                │
-│          await on_tool_start(name)                                   │
+│  async def _on_tool_start(name, args_brief):                         │
+│      # 由 SSE on_tool_call_delta 触发；部分 provider 不支持流式工具调用│
+│      pass  # 实际显示由 _on_tool_exec_start 负责                     │
 │                                                                      │
-│  spec = AgentInput(                                                  │
-│      on_content_delta=_on_delta,           ← 直接绑定到 renderer     │
-│      on_thinking_delta=_on_thinking_delta,                          │
-│      on_tool_call_delta=_on_tool_call_delta,                        │
-│  )                                                                   │
+│  async def _on_tool_exec_start(name, args, idx, total):              │
+│      stream.add_token(f"\n\n● **{name}**({args})\n")                │
 │                                                                      │
-│  StreamRenderer (observability/stream_renderer.py:181)               │
-│    ├── 维护 Rich Console 实例                                        │
-│    ├── on_delta(token) → 实时打印到终端 (不换行)                     │
-│    └── 线程安全：通过 Rich Live/Layout 更新                          │
+│  async def _on_tool_exec_end(ev):                                    │
+│      if ev["status"] == "error":                                     │
+│          stream.add_token(f"  ✗ **{ev['detail']}**\n")               │
+│                                                                      │
+│  StreamingMessage (tui/widgets.py)                                   │
+│    ├── add_token(token) → 累积 + 节流渲染（0.08s / ~12 FPS）        │
+│    └── finish() → 最终刷新，完整 Markdown 渲染                       │
 └──────────────────────────────────────────────────────────────────────┘
 
 ┌─── HTTP/WS 路径 (orchestrator.py:517-564) ──────────────────────────┐
@@ -81,9 +81,30 @@ AgentCore._call_llm()  (core/runner.py:677-812)
 │          session_key, cid, "thinking", token                         │
 │      ))                                                              │
 │                                                                      │
-│  async def _on_tool_start(name):                                     │
+│  async def _on_thinking_done():                                      │
+│      await bus_msg.outbound.put(OutboundMessage(                     │
+│          session_key, cid, "thinking_done", None                     │
+│      ))                                                              │
+│                                                                      │
+│  async def _on_tool_start(name, args_brief=""):                      │
 │      await bus_msg.outbound.put(OutboundMessage(                     │
 │          session_key, cid, "tool_start", name                        │
+│      ))                                                              │
+│                                                                      │
+│  async def _on_tool_exec_start(name, args, idx, total):              │
+│      await bus_msg.outbound.put(OutboundMessage(                     │
+│          session_key, cid, "tool_exec_start",                        │
+│          {"name": name, "args": args, "index": idx, "total": total}  │
+│      ))                                                              │
+│                                                                      │
+│  async def _on_tool_exec_end(ev):                                    │
+│      await bus_msg.outbound.put(OutboundMessage(                     │
+│          session_key, cid, "tool_exec_end", ev                       │
+│      ))                                                              │
+│                                                                      │
+│  async def _on_new_turn():                                           │
+│      await bus_msg.outbound.put(OutboundMessage(                     │
+│          session_key, cid, "new_turn", None                          │
 │      ))                                                              │
 │                                                                      │
 │  # 所有回调 = 构造 OutboundMessage → outbound_queue.put()            │
@@ -301,7 +322,7 @@ class OutboundMessage:
 
 | 来源 | 入站方式 | 出站消费方式 | 过滤逻辑 | 特殊能力 |
 |------|---------|-------------|---------|---------|
-| **CLI** | `orchestrator.process_message()` 同步调用 | 无 MessageBus，回调直接到 StreamRenderer | 无需过滤（单请求） | 直接渲染，零延迟 |
+| **CLI** | `orchestrator.process_message()` 同步调用 | 无 MessageBus，回调直接更新 StreamingMessage（tui/widgets.py） | 无需过滤（单请求） | 直接渲染，零延迟 |
 | **HTTP SSE** | `POST /chat/{sid}` → inbound.put() | `async for` 读 outbound 队列 | `out.correlation_id != cid` → skip | 流式响应 |
 | **WebSocket** | `{"type":"chat"...}` → inbound.put() | `async for` 读 outbound 队列 | `out.correlation_id != cid` → skip | 支持 cancel（取消 in-flight task） |
 

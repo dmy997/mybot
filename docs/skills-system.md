@@ -12,7 +12,7 @@ skills/                         # 内置 Skill（随 mybot 分发）
 ├── pptx/SKILL.md
 ├── frontend-design/SKILL.md
 ├── canvas-design/SKILL.md
-└── ...（共 14 个 Skill）
+└── ...（共 16 个 Skill）
 
 workspace/skills/               # 用户自定义 Skill（覆盖内置）
 └── my-custom-skill/SKILL.md
@@ -99,17 +99,17 @@ Skills 的组装发生在**系统提示词构建阶段**，由 `ContextManager` 
 入口层
 ═══════════════════════════════════════════════════════════════════════════
 
-CLI (orchestrator.py:776-878)
+CLI (orchestrator.py:698-765)
   └── orche.process_message(session_key, user_input)
         # skills 参数未传入 → 默认为 None
         # ⚠️ 当前未调用 get_always_skills()
 
-HTTP/WS (orchestrator.py:550)
+HTTP/WS (orchestrator.py:529-630)
   └── orche.process_message(..., skills=msg.skills)
         # 从 InboundMessage 提取用户指定的 skill 列表
 
 ═══════════════════════════════════════════════════════════════════════════
-Orchestrator.process_message() — orchestrator.py:254-409
+Orchestrator.process_message() — orchestrator.py:263-435
 ═══════════════════════════════════════════════════════════════════════════
 
 line 274:  active_skills = list(skills or [])
@@ -125,7 +125,7 @@ line 311:  spec = AgentInput(init_messages=messages, ...)
            # AgentInput 没有 skills 字段——skills 已烘焙进 system prompt
 
 ═══════════════════════════════════════════════════════════════════════════
-ContextManager.build_messages() — context_manager.py:276-382
+ContextManager.build_messages() — context_manager.py:295-408
 ═══════════════════════════════════════════════════════════════════════════
 
 line 326:  system_content = await self._build_system_prompt(
@@ -133,9 +133,11 @@ line 326:  system_content = await self._build_system_prompt(
                messages=history,
            )
 
-line 332:  preliminary = [
-               {"role": "system", "content": system_content},  ← skills 在此
-           ] + history + [{"role": "user", "content": current_input}]
+line 354:  preliminary = (
+               [{"role": "system", "content": system_content}],  # ← skills 在此
+           ) + history + (
+               [{"role": "system", "content": lang_hint}] if lang_hint else []
+           ) + [{"role": "user", "content": current_input}]
 
 ═══════════════════════════════════════════════════════════════════════════
 ContextManager._build_system_prompt() — context_manager.py:498-555
@@ -143,22 +145,22 @@ ContextManager._build_system_prompt() — context_manager.py:498-555
 
 三层缓存分区：
 
-Layer 1 (静态, line 522):  static = await _build_static_prompt(tools, skills)
+Layer 1 (静态, line 548):  static = await _build_static_prompt(tools, skills)
                            # 首次构建后无限期缓存
                            # 仅在 _invalidate_static() 时重建（tools 变更触发）
 
-Layer 2 (记忆, line 531):  memory_ctx = _build_memory_context()
+Layer 2 (记忆, line 558):  memory_ctx = _build_memory_context()
                            # 按 (session, query_bucket) 缓存
                            # 在 remember()/forget() 时失效
 
-Dynamic (每次重建, line 544+):
+Dynamic (每次重建, line 571+):
   - file_ctx  = _extract_file_context(messages)
   - history_ctx = _build_history_context()
 ```
 
 ### _build_static_prompt 内部详细流程
 
-`context_manager.py:570-614`
+`context_manager.py:612-656`
 
 ```
 _build_static_prompt(tools, skills)
@@ -194,7 +196,7 @@ _build_static_prompt(tools, skills)
   │     │   │   └── "### Skill: {name}\n\n{body}"
   │     │   └── 返回 "\n\n---\n\n".join(parts)
   │     │
-  │     ├── skills_content = "\n\n".join([autoload_skills, explicit_skills])
+  │     ├── skills_content = "\n\n".join(p for p in [autoload_skills, explicit_skills] if p)
   │     └── parts.append(
   │           render_template("agent/skills_section.md",
   │                           skills_summary=skills_content)
@@ -221,7 +223,7 @@ _build_static_prompt(tools, skills)
 - **docx** — 创建/编辑 Word 文档  `skills/docx/SKILL.md`
 - **xlsx** — 创建/编辑 Excel 文件  `skills/xlsx/SKILL.md`
 - **frontend-design** — 创建高质量前端界面  `skills/frontend-design/SKILL.md`
-... (14 个 skill 的摘要列表)
+... (16 个 skill 的摘要列表)
 
 ### Skill: docx
 
@@ -235,6 +237,13 @@ _build_static_prompt(tools, skills)
 
 ---
 
+# Available Tools
+
+- **bash**: 执行 shell 命令
+...
+
+---
+
 # Identity (SOUL.md)
 ...
 
@@ -245,10 +254,27 @@ _build_static_prompt(tools, skills)
 
 ---
 
-# Available Tools
+# Memory
 
-- **bash**: 执行 shell 命令
-...
+<MEMORY.md 内容>
+
+---
+
+# Files in Context
+
+<最近消息中引用的文件内容>
+
+---
+
+# Recent History
+
+<history.jsonl 中 Dream 尚未处理的摘要条目>
+
+---
+
+# LANGUAGE RULE — HIGHEST PRIORITY
+
+ALWAYS respond in the same language as the user's input.
 ```
 
 ## Skill 发现与加载的完整文件 I/O 路径
@@ -276,7 +302,7 @@ list_skills()
 2. **完整级**（`load_skills_for_context()`）：仅对用户显式请求的 skill（通过 `skills` 参数传入）注入完整 Markdown 正文。
 
 这种设计确保：
-- 系统提示词体积可控（15 个 skill 摘要 ≈ 2KB，而 15 个完整 skill ≈ 50KB+）
+- 系统提示词体积可控（16 个 skill 摘要 ≈ 2KB，而 16 个完整 skill ≈ 50KB+）
 - Agent 知道有哪些能力可用（通过摘要）
 - 需要时按需加载完整指令（通过 `read_file` 工具）
 

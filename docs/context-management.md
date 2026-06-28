@@ -106,9 +106,10 @@ class TokenBudget:
     block_threshold: int                   # effective_window - 3_000
 
     # 各阶段截断限制
-    tool_result_max_chars: int = 6_000     # 新工具结果
-    history_tool_result_max_chars: int = 4_000  # 历史工具结果
-    tool_call_args_max_chars: int = 10_000      # 工具调用参数
+    history_tool_result_max_chars: int = 4_000  # 历史工具结果（micro_compact 使用）
+    tool_call_args_max_chars: int = 10_000      # 工具调用参数（历史）
+    # 注：新工具结果截断由 AgentCore.max_tool_result_chars 控制（core/runner.py，默认 6_000）
+    # TokenBudget.tool_result_max_chars 已弃用，不再被任何代码读取
 
     # 压缩参数
     compress_ratio: float = 0.5            # 压缩时给最近消息保留的比例
@@ -199,7 +200,7 @@ asyncio.create_task(
 
 | 维度 | CompactionService | Consolidator |
 |------|------------------|-------------|
-| 写入位置 | (不写入文件 — 仅推进游标) | `memory/history.jsonl` |
+| 写入位置 | 仅推进游标（idle 路径委托 Consolidator 写入 `history.jsonl`） | `memory/history.jsonl` |
 | 目的 | 压缩会话上下文（跳过旧消息） | 提取长期记忆事实 |
 | 触发 | Token 预算 / 空闲 | Token 预算（每次对话后检查） |
 | 下游消费者 | 仅当前会话 | Dream → MEMORY.md |

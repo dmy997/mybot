@@ -109,7 +109,7 @@ compute_overall(scores) → EvalResult
 `evals/conftest.py` 提供 `--live-eval` 选项。CI 模式（默认）不调用 LLM，只验证任务加载、数据结构、评分管线：
 
 ```bash
-pytest evals/ -v                          # CI 模式：36 个测试
+pytest evals/ -v                          # CI 模式：38 个测试
 pytest evals/ -v --live-eval              # 需要真实 LLM
 ```
 
@@ -217,21 +217,24 @@ class EvalTask:
     prompt: str
     expected_tools: list[str]
     expected_in_answer: list[str]
-    max_steps: int
-    timeout_seconds: int
+    max_steps: int = 10
+    timeout_seconds: int = 120
+    paradigms: list[str]          # 允许的范式列表（默认全部）
 
 @dataclass
 class EvalResult:
     task_id: str
     category: str
     paradigm: str
-    passed: bool
-    overall_score: float          # 0.0 - 1.0
+    passed: bool = False
+    overall_score: float = 0.0    # 0.0 - 1.0
     scores: list[ScoreResult]     # 各维度评分
+    tool_events: list[dict]       # 工具执行事件
     tools_used: list[str]
-    step_count: int
-    duration_seconds: float
-    error: str | None
+    step_count: int = 0
+    content_preview: str = ""     # 回复内容预览（前 200 字符）
+    duration_seconds: float = 0.0
+    error: str | None = None
 
 @dataclass
 class ScoreResult:

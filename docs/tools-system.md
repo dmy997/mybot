@@ -72,6 +72,9 @@ class ToolRegistry:
     def register(self, tool: Tool): ...
     def unregister(self, name: str): ...
     def get(self, name: str) -> Tool | None: ...
+    def get_definitions(self) -> list[dict]:
+        """返回所有已注册工具的 OpenAI schema 列表"""
+        return [t.to_openai_schema() for t in self._tools.values()]
 ```
 
 ### 范围过滤
@@ -142,7 +145,7 @@ class ToolGuard:
 
 **SHELL — 命令注入检测** (`_check_command_injection`):
 
-扫描命令字符串，检测 8 种注入模式：
+扫描命令字符串，检测 9 种注入模式：
 
 ```python
 _EXTRA_INJECTION_PATTERNS = [
@@ -154,6 +157,7 @@ _EXTRA_INJECTION_PATTERNS = [
     r"\$'\\x[0-9a-fA-F]{2}",   # $'\xHH' 编码绕过
     r"\bsocat\b",              # 反向 shell 瑞士军刀
     r"\bnc\b.*-[lL].*-[eE]",   # netcat 反向 shell
+    r"\bnc\b.*-[lL].*-[cC]",   # netcat connect-back
 ]
 ```
 
@@ -182,7 +186,7 @@ _SSRF_BLOCKED_CIDRS = [
 _BLOCKED_FILE_EXTENSIONS = {".env", ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"}
 
 _BLOCKED_PATH_PATTERNS = [
-    r"(^|/)\.git/",
+    r"(^|/)\.git(/|$)",
     r"(^|/)\.ssh/",
     r"(^|[^a-zA-Z0-9])credentials([^a-zA-Z0-9]|$)",
     r"(^|[^a-zA-Z0-9])secret([^a-zA-Z0-9]|$)",

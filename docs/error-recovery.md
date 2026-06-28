@@ -55,30 +55,47 @@ class FatalLLMError(Exception):
 
 `providers/openai_compatible_provider.py`
 
-Provider 的 `_classify_error()` 将 OpenAI API 异常映射为三类错误：
+Provider 的 `_classify_error()` 按 OpenAI SDK 异常类型分类（非 HTTP 状态码）：
 
-- HTTP 429 (Rate Limit) → `RetryableLLMError`，携带 `retry_after`
-- HTTP 5xx 服务端错误 → `RetryableLLMError`
-- HTTP 400 中 context_length_exceeded → `RecoverableLLMError`
-- HTTP 400 中 content_filter → `RecoverableLLMError`
-- HTTP 401/403 认证错误 → `FatalLLMError`
-- 其他 HTTP 4xx → `FatalLLMError`
+- `RateLimitError` → `RetryableLLMError`（`rate_limit`），携带 `retry_after`
+- `InternalServerError` → `RetryableLLMError`（`server_error`）
+- `APIConnectionError` / `APITimeoutError` → `RetryableLLMError`（`network_error`）
+- `AuthenticationError` → `FatalLLMError`（`auth_error`）
+- `PermissionDeniedError` → `FatalLLMError`（`permission_denied`）
+- `BadRequestError`（含 `context_length`/`token`）→ `RecoverableLLMError`
+- `BadRequestError`（含 `content_filter`/`safety`）→ `RecoverableLLMError`
+- `BadRequestError`（其他）→ `FatalLLMError`（`bad_request`）
+- `NotFoundError` → `FatalLLMError`（`not_found`）
+- 其他未知错误 → `RetryableLLMError`（`unknown`）回退
 
 ### 重试机制
 
-`chat_with_retry()` 对 `RetryableLLMError` 使用指数退避重试：
+`chat_with_retry()` 通过 `with_retry()` 函数（`providers/retry.py`）实现可配置的重试策略：
 
 ```python
-async def chat_with_retry(self, messages, tools, model, max_tokens, temperature):
-    max_retries = 3
-    for attempt in range(max_retries + 1):
-        try:
-            return await self.chat(messages, tools, model, max_tokens, temperature)
-        except RetryableLLMError as e:
-            if attempt == max_retries:
-                raise  # 重试耗尽
-            delay = e.info.retry_after or (2 ** attempt)
-            await asyncio.sleep(delay)
+# providers/base.py:111-136
+async def chat_with_retry(self, messages, tools, model=None, *,
+                          max_tokens=None, temperature=None,
+                          retry_config: RetryConfig | None = None):
+    return await with_retry(
+        self.chat,
+        messages=messages, tools=tools, model=model,
+        max_tokens=max_tokens, temperature=temperature,
+        classify_error=self._classify_error,
+        config=retry_config,
+    )
+```
+
+`with_retry()` 对 `RetryableLLMError` 使用指数退避重试（默认最多 3 次），`RetryConfig` 控制退避参数：
+
+```python
+# providers/retry.py
+@dataclass
+class RetryConfig:
+    max_retries: int = 3
+    base_delay: float = 1.0     # 首次退避秒数
+    max_delay: float = 60.0     # 退避上限
+    jitter: bool = True          # 启用 ±50% 随机抖动避免惊群
 ```
 
 ## AgentCore 层：分类恢复
@@ -217,11 +234,15 @@ for (idx, tc), raw in zip(parallel_group, raw_results):
 
 `core/runner.py:245-252`
 
-当 Agent 步数达到 50 步时触发警告：
+当 Agent 步数达到 `max_iterations` 的 75%（默认 20 × 0.75 = 15 步，最少 10 步）时触发警告：
 
 ```python
-if step_count == _STALL_WARNING_STEPS:
-    logger.warning("Agent reached {} steps — possible stall or infinite loop", step_count)
+_stall_threshold = max(10, int(self.max_iterations * _STALL_WARNING_RATIO))
+if step_count == _stall_threshold:
+    logger.warning(
+        "Agent reached {} steps ({}% of max {}) — possible stall or infinite loop",
+        step_count, int(_STALL_WARNING_RATIO * 100), self.max_iterations,
+    )
     await bus.publish(AgentStallWarning(session_key=spec.session_key, step_count=step_count))
 ```
 

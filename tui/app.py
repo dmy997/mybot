@@ -3,42 +3,73 @@
 Replaces the prompt_toolkit loop + StreamRenderer with a full-screen
 Textual TUI.  ``Orchestrator.process_message()`` is unchanged — only
 the rendering layer is replaced.
+
+Layout::
+
+    Header (#header-bar)
+    VerticalScroll (#chat-area)
+      ├── <banner>
+      ├── Horizontal (ChatSpacer + UserMessage)    ← user on right
+      ├── Horizontal (AssistantMessage + ChatSpacer) ← agent on left
+      │     ├── StreamingMessage (inline updates)
+      │     └── ToolCallMessage (inline)
+      └── ...
+    Horizontal (#input-area)
+      Input (#user-input)
+    StatusFooter (#status-bar)
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
+from pathlib import Path
 from typing import Any
 
+from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Header, Input, Static
+from textual.widgets import Footer, Header, Input, Static
 
+from .screens import ConfirmScreen, SessionListScreen
 from .widgets import (
     AssistantMessage,
+    ChatSpacer,
     ErrorMessage,
     StatusFooter,
     StreamingMessage,
-    ToolCallMessage,
     UserMessage,
 )
+
+
+def _format_tool_args(args: dict[str, Any], max_len: int = 50) -> str:
+    """Format tool argument dict into a compact display string."""
+    if not args:
+        return ""
+    parts: list[str] = []
+    for k, v in args.items():
+        s = str(v)
+        if len(s) > max_len:
+            s = s[:max_len] + "..."
+        parts.append(f"{k}={s}")
+    return ", ".join(parts)
 
 
 class ChatApp(App):
     """Full-screen chat application powered by Textual.
 
-    Widget tree::
-
-        Header (#header-bar)
-        VerticalScroll (#chat-area) ← messages mounted dynamically
-        Horizontal (#input-area)
-          Input (#user-input)
-        StatusFooter (#status-bar)
+    Messages are wrapped in ``Horizontal`` rows so that user bubbles sit on the
+    right side and assistant responses sit on the left side.
     """
 
     CSS_PATH = "theme.css"
     BINDINGS = [
-        ("ctrl+c", "quit", "Quit"),
+        ("ctrl+c", "quit_or_copy", "Quit / Copy"),
+        Binding("escape", "cancel_message", "Cancel", show=False, priority=True),
+        Binding("up", "history_prev", "", show=False, priority=True),
+        Binding("down", "history_next", "", show=False, priority=True),
     ]
 
     def __init__(
@@ -53,6 +84,13 @@ class ChatApp(App):
         self._model = model
         self._is_resumed = is_resumed
         self._t_start = 0.0
+        self._input_history: list[str] = []
+        self._history_index: int = -1
+        self._saved_input: str = ""
+        self._current_stream: StreamingMessage | None = None
+        self._history_path: Path = (
+            self._orche.workspace / "sessions" / f"{session_key}_input_history.json"
+        )
         super().__init__()
 
     # -- composition ----------------------------------------------------------
@@ -63,11 +101,35 @@ class ChatApp(App):
         with Horizontal(id="input-area"):
             yield Input(placeholder="Type a message...", id="user-input")
         yield StatusFooter(id="status-bar")
+        yield Footer()
+
+    def _load_history(self) -> None:
+        """Load persisted input history from disk."""
+        try:
+            if self._history_path.exists():
+                data = json.loads(self._history_path.read_text(encoding="utf-8"))
+                if isinstance(data, list) and all(isinstance(v, str) for v in data):
+                    self._input_history = data[-1000:]  # keep last 1000 entries
+        except (json.JSONDecodeError, OSError):
+            self._history_path.unlink(missing_ok=True)
+
+    def _save_history(self) -> None:
+        """Persist input history to disk (fire-and-forget)."""
+        try:
+            self._history_path.parent.mkdir(parents=True, exist_ok=True)
+            self._history_path.write_text(
+                json.dumps(self._input_history, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     async def on_mount(self) -> None:
-        """Show welcome banner on first mount."""
+        """Show welcome banner, disable mouse capture, focus input."""
+        self._load_history()
         chat = self.query_one("#chat-area", VerticalScroll)
         mode = " (resumed)" if self._is_resumed else ""
+        from rich.panel import Panel
         from rich.text import Text
         banner = Text(
             f"mybot — {self._model}{mode}\n"
@@ -75,8 +137,45 @@ class ChatApp(App):
             f"type /help for commands, /exit to quit",
             style="dim",
         )
-        from rich.panel import Panel
         await chat.mount(Static(Panel(banner, border_style="dim blue", padding=(0, 1))))
+        # Mouse scroll scrolls the chat area; hold Shift to select text natively.
+        self.query_one("#user-input", Input).focus()
+
+    # -- helpers --------------------------------------------------------------
+
+    def _user_row(self, message: str) -> Horizontal:
+        """Right-aligned user bubble: [spacer | bubble]."""
+        return Horizontal(
+            ChatSpacer(classes="chat-spacer"),
+            UserMessage(message),
+            classes="chat-row",
+        )
+
+    def _assistant_row(self, content: str = "") -> Horizontal:
+        """Left-aligned assistant message: [content | spacer]."""
+        return Horizontal(
+            AssistantMessage(content),
+            ChatSpacer(classes="chat-spacer"),
+            classes="chat-row",
+        )
+
+    def _stream_row(self) -> tuple[Horizontal, StreamingMessage]:
+        """Left-aligned streaming row: [stream | spacer]."""
+        stream = StreamingMessage()
+        row = Horizontal(
+            stream,
+            ChatSpacer(classes="chat-spacer"),
+            classes="chat-row",
+        )
+        return row, stream
+
+    def _error_row(self, error_text: str) -> Horizontal:
+        """Left-aligned error row."""
+        return Horizontal(
+            ErrorMessage(error_text),
+            ChatSpacer(classes="chat-spacer"),
+            classes="chat-row",
+        )
 
     # -- input handling -------------------------------------------------------
 
@@ -87,7 +186,8 @@ class ChatApp(App):
 
         # --- slash commands ---
         if text.lower() in ("/exit", "/quit"):
-            self.exit()
+            self._confirm_exit()
+            event.input.clear()
             return
 
         if text.lower().startswith("/"):
@@ -95,66 +195,73 @@ class ChatApp(App):
             event.input.clear()
             return
 
+        # Save to input history (dedup consecutive identical entries)
+        if not self._input_history or self._input_history[-1] != text:
+            self._input_history.append(text)
+            self._save_history()
+        self._history_index = -1
+        self._saved_input = ""
+
         event.input.clear()
         event.input.disabled = True
-
         self._t_start = time.monotonic()
-        chat = self.query_one("#chat-area", VerticalScroll)
 
-        # --- mount user message ---
-        await chat.mount(UserMessage(text))
+        chat = self.query_one("#chat-area", VerticalScroll)
+        await chat.mount(self._user_row(text))
         chat.scroll_end(animate=False)
 
-        # --- mount streaming placeholder ---
-        stream = StreamingMessage()
-        await chat.mount(stream)
+        stream_row, stream = self._stream_row()
+        await chat.mount(stream_row)
+        self._current_stream = stream
 
-        # tool widget tracking (name → widget)
-        tool_widgets: dict[str, ToolCallMessage] = {}
+        # Delegate to worker — non-blocking, exclusive=cancel previous
+        self._run_chat(text, stream, chat)
 
-        # --- callbacks (sync — Textual widgets are thread-safe within asyncio) ---
+    @work(exclusive=True, group="chat")
+    async def _run_chat(
+        self, text: str, stream: StreamingMessage, chat: VerticalScroll,
+    ) -> None:
+        """Background worker: runs process_message and updates UI via callbacks."""
         _last_scroll_time = 0.0
 
         async def _on_delta(token: str) -> None:
             nonlocal _last_scroll_time
             stream.add_token(token)
-            # Throttled auto-scroll (every ~150ms) to keep latest content visible
             now = time.monotonic()
             if now - _last_scroll_time >= 0.15:
                 chat.scroll_end(animate=False)
                 _last_scroll_time = now
 
         async def _on_thinking(token: str) -> None:
-            pass  # spinner not needed — streaming widget is visible
+            pass
 
         async def _on_thinking_done() -> None:
             pass
 
-        async def _on_tool_start(name: str) -> None:
-            w = ToolCallMessage(name, "running")
-            await chat.mount(w)
-            tool_widgets[name] = w
+        async def _on_tool_start(name: str, args_brief: str = "") -> None:
+            pass  # handled by _on_tool_exec_start (SSE deltas unreliable)
 
         async def _on_tool_end(ev: dict[str, Any]) -> None:
-            name = ev.get("name", "")
-            status = ev.get("status", "ok")
-            if w := tool_widgets.get(name):
-                w.set_status(status)
+            pass
 
         async def _on_tool_exec_start(
             name: str, args: dict[str, Any], idx: int, total: int,
         ) -> None:
-            pass  # already shown by _on_tool_start
+            brief = _format_tool_args(args) if args else ""
+            label = f" ({brief})" if brief else ""
+            stream.add_token(f"\n\n● **{name}**{label}\n")
+            stream._refresh()
 
         async def _on_tool_exec_end(ev: dict[str, Any]) -> None:
-            pass  # _on_tool_end handles status
+            status = ev.get("status", "ok")
+            if status == "error":
+                detail = (ev.get("detail", "") or "")[:300].replace("\n", " ")
+                stream.add_token(f"  ✗ **{detail}**\n")
+                stream._refresh()
 
         async def _on_new_turn() -> None:
-            # In Textual the streaming widget stays mounted across turns.
-            # The VerticalScroll handles growing content correctly.
-            pass
+            stream.add_token("\n\n")
 
-        # --- run agent ---
         try:
             result = await self._orche.process_message(
                 session_key=self._session_key,
@@ -168,29 +275,52 @@ class ChatApp(App):
                 on_tool_execute_end=_on_tool_exec_end,
                 on_new_turn=_on_new_turn,
             )
-        except Exception as exc:
-            await chat.mount(ErrorMessage(str(exc)))
-            event.input.disabled = False
-            event.input.focus()
+        except asyncio.CancelledError:
+            stream.add_token("\n\n*[cancelled]*\n")
             return
+        except Exception as exc:
+            await chat.mount(self._error_row(str(exc)))
+            return
+        finally:
+            input_w = self.query_one("#user-input", Input)
+            input_w.disabled = False
+            input_w.focus()
 
         # --- finalize ---
         stream.finish()
         if not result.content and result.error:
-            await chat.mount(ErrorMessage(result.error))
+            await chat.mount(self._error_row(result.error))
 
         elapsed = (time.monotonic() - self._t_start) * 1000
         usage = result.usage or {}
         self.query_one("#status-bar", StatusFooter).set_usage(
+            session_key=self._session_key,
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             elapsed_ms=elapsed,
             paradigm=result.paradigm or "",
         )
-
         chat.scroll_end(animate=False)
-        event.input.disabled = False
-        event.input.focus()
+
+    def _confirm_exit(self) -> None:
+        """Show confirmation dialog before quitting."""
+        self.push_screen(
+            ConfirmScreen("Are you sure you want to quit?"),
+            lambda result: self.exit() if result else None,
+        )
+
+    def _confirm_clear(self) -> None:
+        """Show confirmation dialog before clearing the chat."""
+        def _on_result(result: bool) -> None:
+            if result:
+                chat = self.query_one("#chat-area", VerticalScroll)
+                for child in list(chat.children):
+                    child.remove()
+
+        self.push_screen(
+            ConfirmScreen("Are you sure you want to clear the chat?"),
+            _on_result,
+        )
 
     async def _handle_slash_command(self, text: str) -> None:
         """Process /commands."""
@@ -201,7 +331,6 @@ class ChatApp(App):
         cmd = parts[0].lower()
 
         if cmd == "/help":
-            from .widgets import UserMessage
             msg = RichText(
                 f"Session: {self._session_key}\nModel: {self._model}",
                 style="dim",
@@ -209,9 +338,7 @@ class ChatApp(App):
             await chat.mount(Static(msg))
 
         elif cmd == "/clear":
-            for child in list(chat.children):
-                await child.remove()
-            self.query_one("#status-bar", StatusFooter).set_usage()
+            self._confirm_clear()
 
         elif cmd == "/history":
             session = self._orche.ctx.session.get_session(self._session_key)
@@ -225,16 +352,65 @@ class ChatApp(App):
         elif cmd == "/sessions":
             try:
                 sessions = self._orche.ctx.session.list_sessions()
-                names = [s.get("key", str(s)) for s in (sessions or [])]
-                await chat.mount(Static(RichText(
-                    "Sessions:\n" + "\n".join(f"  • {n}" for n in names) if names
-                    else "No sessions found.",
-                    style="dim",
-                )))
+                self.push_screen(
+                    SessionListScreen(sessions or []),
+                    lambda _: None,
+                )
             except Exception:
                 await chat.mount(Static(RichText(
                     f"Session: {self._session_key}", style="dim"
                 )))
 
+    def action_history_prev(self) -> None:
+        """Navigate to the previous entry in input history."""
+        inp = self.query_one("#user-input", Input)
+        if not inp.has_focus or not self._input_history:
+            return
+
+        if self._history_index == -1:
+            self._saved_input = inp.value
+            self._history_index = len(self._input_history) - 1
+        elif self._history_index > 0:
+            self._history_index -= 1
+        else:
+            return
+
+        inp.value = self._input_history[self._history_index]
+        inp.cursor_position = len(inp.value)
+
+    def action_history_next(self) -> None:
+        """Navigate to the next entry in input history."""
+        inp = self.query_one("#user-input", Input)
+        if not inp.has_focus or self._history_index == -1:
+            return
+
+        if self._history_index < len(self._input_history) - 1:
+            self._history_index += 1
+            inp.value = self._input_history[self._history_index]
+        else:
+            self._history_index = -1
+            inp.value = self._saved_input
+
+        inp.cursor_position = len(inp.value)
+
+    def action_cancel_message(self) -> None:
+        """Cancel the current message processing (escape)."""
+        inp = self.query_one("#user-input", Input)
+        if inp.has_focus:
+            # Input has focus — clear it and let Textual handle escape internally
+            return
+        for w in self.workers:
+            if w.group == "chat" and not w.is_finished:
+                w.cancel()
+                break
+
     def action_quit(self) -> None:
         self.exit()
+
+    def action_quit_or_copy(self) -> None:
+        """Copy selected text to clipboard; quit if nothing is selected."""
+        selection = self.screen.get_selected_text()
+        if selection:
+            self.copy_to_clipboard(selection)
+        else:
+            self.exit()

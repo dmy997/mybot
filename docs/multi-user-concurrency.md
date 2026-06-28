@@ -252,7 +252,7 @@ async def _ensure_serve_task(session_key: str) -> None:
 
 ### serve() 内部循环
 
-`core/orchestrator.py:487-587`
+`core/orchestrator.py:529-630`
 
 ```python
 async def serve(self, bus_msg: MessageBus, session_key: str):
@@ -298,8 +298,8 @@ class SessionManager:
 
 | 调用位置 | 文件:行号 | 触发场景 |
 |---------|----------|---------|
-| `ContextManager.save_exchange()` | `context_manager.py:460` | 每次 process_message() 成功后 |
-| `ContextManager.save_session()` | `context_manager.py:477` | 替换整个消息列表 |
+| `ContextManager.save_exchange()` | `context_manager.py:473` | 每次 process_message() 成功后 |
+| `ContextManager.save_session()` | `context_manager.py:491` | 替换整个消息列表 |
 | `CompactionService.auto_compact()` | `compaction.py:254` | 空闲/运行时压缩 |
 | `CompactionService.full_compact()` | `compaction.py:322` | 用户触发压缩 |
 | `Orchestrator.process_message()` | `orchestrator.py:340,350` | CancelledError/KeyboardInterrupt 时保存部分状态 |
