@@ -14,6 +14,7 @@ Layout::
       │     ├── StreamingMessage (inline updates)
       │     └── ToolCallMessage (inline)
       └── ...
+    SessionStatus (#session-status)  ← blinking dot + phase text
     Horizontal (#input-area)
       Input (#user-input)
     StatusFooter (#status-bar)
@@ -38,14 +39,15 @@ from .widgets import (
     AssistantMessage,
     ChatSpacer,
     ErrorMessage,
+    SessionStatus,
     StatusFooter,
     StreamingMessage,
     UserMessage,
 )
 
 
-def _format_tool_args(args: dict[str, Any], max_len: int = 50) -> str:
-    """Format tool argument dict into a compact display string."""
+def _fmt_args(args: dict[str, Any], max_len: int = 60) -> str:
+    """Format tool arguments into a compact one-line string."""
     if not args:
         return ""
     parts: list[str] = []
@@ -98,6 +100,7 @@ class ChatApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield VerticalScroll(id="chat-area")
+        yield SessionStatus(id="session-status")
         with Horizontal(id="input-area"):
             yield Input(placeholder="Type a message...", id="user-input")
         yield StatusFooter(id="status-bar")
@@ -214,6 +217,9 @@ class ChatApp(App):
         await chat.mount(stream_row)
         self._current_stream = stream
 
+        # Activate session status bar
+        self.query_one("#session-status", SessionStatus).show("准备中...")
+
         # Delegate to worker — non-blocking, exclusive=cancel previous
         self._run_chat(text, stream, chat)
 
@@ -223,9 +229,21 @@ class ChatApp(App):
     ) -> None:
         """Background worker: runs process_message and updates UI via callbacks."""
         _last_scroll_time = 0.0
+        _bar = self.query_one("#session-status", SessionStatus)
+        _tool_count = 0
+        _phase = "生成回复中..."
+
+        def _render_bar() -> None:
+            if _tool_count > 0:
+                _bar.set_status(f"工具执行中 ({_tool_count})")
+            else:
+                _bar.set_status(_phase)
 
         async def _on_delta(token: str) -> None:
-            nonlocal _last_scroll_time
+            nonlocal _last_scroll_time, _phase
+            if _phase != "生成回复中...":
+                _phase = "生成回复中..."
+                _render_bar()
             stream.add_token(token)
             now = time.monotonic()
             if now - _last_scroll_time >= 0.15:
@@ -233,13 +251,20 @@ class ChatApp(App):
                 _last_scroll_time = now
 
         async def _on_thinking(token: str) -> None:
-            pass
+            nonlocal _phase
+            if _phase != "思考中...":
+                _phase = "思考中..."
+                _render_bar()
 
         async def _on_thinking_done() -> None:
-            pass
+            nonlocal _phase
+            _phase = "生成回复中..."
+            _render_bar()
 
         async def _on_tool_start(name: str, args_brief: str = "") -> None:
-            pass  # handled by _on_tool_exec_start (SSE deltas unreliable)
+            nonlocal _phase
+            _phase = "工具调用中..."
+            _render_bar()
 
         async def _on_tool_end(ev: dict[str, Any]) -> None:
             pass
@@ -247,20 +272,36 @@ class ChatApp(App):
         async def _on_tool_exec_start(
             name: str, args: dict[str, Any], idx: int, total: int,
         ) -> None:
-            brief = _format_tool_args(args) if args else ""
-            label = f" ({brief})" if brief else ""
-            stream.add_token(f"\n\n● **{name}**{label}\n")
+            nonlocal _tool_count
+            _tool_count += 1
+            _render_bar()
+            # Tool call indicator in chat — guaranteed visible via stream text
+            brief = _fmt_args(args)
+            label = f" ({idx}/{total})" if total > 1 else ""
+            line = f"\n\n  ⚙ **{name}**{label}"
+            if brief:
+                line += f"\n  _{brief}_"
+            line += "\n"
+            stream.add_token(line)
             stream._refresh()
 
         async def _on_tool_exec_end(ev: dict[str, Any]) -> None:
+            nonlocal _tool_count
+            if _tool_count > 0:
+                _tool_count -= 1
+            _render_bar()
             status = ev.get("status", "ok")
             if status == "error":
-                detail = (ev.get("detail", "") or "")[:300].replace("\n", " ")
-                stream.add_token(f"  ✗ **{detail}**\n")
-                stream._refresh()
+                detail = (ev.get("detail", "") or "")[:100].replace("\n", " ").strip()
+                if detail:
+                    stream.add_token(f"  ❌ {detail}\n")
+                    stream._refresh()
 
         async def _on_new_turn() -> None:
+            nonlocal _phase
             stream.add_token("\n\n")
+            _phase = "生成回复中..."
+            _render_bar()
 
         try:
             result = await self._orche.process_message(
@@ -282,6 +323,7 @@ class ChatApp(App):
             await chat.mount(self._error_row(str(exc)))
             return
         finally:
+            _bar.hide()
             input_w = self.query_one("#user-input", Input)
             input_w.disabled = False
             input_w.focus()

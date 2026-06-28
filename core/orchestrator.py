@@ -38,6 +38,37 @@ from .dispatcher import Dispatcher
 from .runner import AgentInput
 
 # ---------------------------------------------------------------------------
+# Helper — format tool args for inline display
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def _summarize_tool_args(args_json: str) -> str:
+    """Convert a JSON arguments string into a brief inline summary.
+
+    ``{"command": "ls -la", "workdir": "/tmp"}`` → ``command=ls -la``
+    """
+    if not args_json or not args_json.strip():
+        return ""
+    try:
+        args = _json.loads(args_json)
+        if not isinstance(args, dict):
+            s = str(args)
+            return (s[:47] + "...") if len(s) > 50 else s
+        parts = []
+        for k, v in args.items():
+            sv = str(v)
+            if len(sv) > 50:
+                sv = sv[:47] + "..."
+            parts.append(f"{k}={sv}")
+        return ", ".join(parts)
+    except (_json.JSONDecodeError, TypeError):
+        s = args_json.strip()
+        return (s[:77] + "...") if len(s) > 80 else s
+
+
+# ---------------------------------------------------------------------------
 # Result
 # ---------------------------------------------------------------------------
 
@@ -242,7 +273,7 @@ class Orchestrator:
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_done: Callable[[], Awaitable[None]] | None = None,
-        on_tool_start: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_start: Callable[[str, str], Awaitable[None]] | None = None,
         on_tool_end: Callable[[dict[str, str]], Awaitable[None]] | None = None,
         on_tool_execute_start: (
             Callable[[str, dict[str, Any], int, int], Awaitable[None]] | None
@@ -306,8 +337,19 @@ class Orchestrator:
                     _shown_tool_indices.add(idx)
                     fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
                     name = tc.get("name") or fn.get("name", "?")
+                    args_str = fn.get("arguments", "") if isinstance(fn, dict) else ""
+                    args_brief = _summarize_tool_args(args_str)
                     if on_tool_start:
-                        await on_tool_start(name)
+                        await on_tool_start(name, args_brief)
+
+                # Reset dedup index set on each new LLM turn so tool
+                # calls across multiple turns all get an on_tool_start.
+                _on_new_turn = on_new_turn
+
+                async def _on_new_turn_wrapper() -> None:
+                    _shown_tool_indices.clear()
+                    if _on_new_turn:
+                        await _on_new_turn()
 
                 spec = AgentInput(
                     init_messages=messages,
@@ -323,7 +365,7 @@ class Orchestrator:
                     on_tool_call_delta=_on_tool_call_delta,
                     on_tool_execute_start=on_tool_execute_start,
                     on_tool_execute_end=on_tool_execute_end,
-                    on_new_turn=on_new_turn,
+                    on_new_turn=_on_new_turn_wrapper,
                 )
 
                 # 5. Run agent (interruptible)
@@ -528,7 +570,7 @@ class Orchestrator:
                     await bus_msg.outbound.put(
                         OutboundMessage(session_key, cid, "thinking_done", None))
 
-                async def _on_tool_start(name: str) -> None:
+                async def _on_tool_start(name: str, args_brief: str = "") -> None:
                     await bus_msg.outbound.put(
                         OutboundMessage(session_key, cid, "tool_start", name))
 

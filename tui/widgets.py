@@ -8,6 +8,7 @@ from rich.console import RenderableType
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
+from textual.containers import Vertical
 from textual.reactive import reactive
 from textual.widgets import Static
 
@@ -108,36 +109,152 @@ class StreamingMessage(_Bubble):
 
 
 # ---------------------------------------------------------------------------
+# Session status — persistent status bar during turn execution
+# ---------------------------------------------------------------------------
+
+
+class SessionStatus(Static):
+    """Persistent status bar with blinking dot — shows between chat and input.
+
+    Visible only while a session turn is active.  Uses ``height: auto``
+    + empty content to collapse to zero height when idle, so no layout
+    shift occurs between turns.
+
+    States (set via :meth:`set_status`):
+    - ``"准备中..."`` — context building / compression
+    - ``"思考中..."`` — LLM extended-thinking phase
+    - ``"生成回复中..."`` — LLM streaming text
+    - ``"工具执行中 (N)"`` — N tools currently executing
+    """
+
+    DEFAULT_CSS = """
+    SessionStatus {
+        height: auto;
+        padding: 0 1;
+    }
+    """
+
+    _BLINK_INTERVAL = 0.5
+
+    def __init__(self, **kwargs) -> None:
+        self._dot_on = True
+        self._status = ""
+        self._active = False
+        super().__init__("", **kwargs)
+
+    def on_mount(self) -> None:
+        self._timer = self.set_interval(self._BLINK_INTERVAL, self._blink)
+
+    # -- public API ---------------------------------------------------------
+
+    def show(self, status: str = "准备中...") -> None:
+        """Make the bar visible and set initial status."""
+        self._active = True
+        self._status = status
+        self._dot_on = True
+        self._redraw()
+
+    def set_status(self, status: str) -> None:
+        """Update status text (e.g. ``"工具执行中 (3)"``)."""
+        self._status = status
+        self._redraw()
+
+    def hide(self) -> None:
+        """Collapse the bar — called when the turn finishes."""
+        self._active = False
+        self._status = ""
+        self.update(Text(""))
+
+    # -- internals ----------------------------------------------------------
+
+    def _blink(self) -> None:
+        if not self._active:
+            return
+        self._dot_on = not self._dot_on
+        self._redraw()
+
+    def _redraw(self) -> None:
+        if not self._active or not self._status:
+            self.update(Text(""))
+            return
+        dot = "●" if self._dot_on else "○"
+        text = Text(f"  {dot} ", style="bold white")
+        text.append(self._status, style="dim")
+        self.update(text)
+
+
+# ---------------------------------------------------------------------------
 # Tool status — blinking dot during execution
 # ---------------------------------------------------------------------------
 
 
 class ToolStatus(_Bubble):
-    """Tool execution indicator with a blinking white dot.
+    """Tool execution indicator — pre-mounted, activated per tool call.
 
-    The dot blinks via :meth:`set_interval` while the tool runs.
-    On success the widget is removed; on error it turns into a red
-    error message.
+    - Inactive: ``display: none`` (zero height)
+    - In progress: blinking ``●`` / ``○``
+    - Success: static ``●`` (white)
+    - Failure: static ``●`` (red) + error detail (max 100 chars) on a second line
     """
 
     DEFAULT_CSS = """
     ToolStatus {
         max-width: 88%;
+        height: auto;
     }
     """
 
     _BLINK_INTERVAL = 0.4
 
-    def __init__(self, name: str, args_brief: str = "", **kwargs) -> None:
-        self._tool_name = name
-        self._args_brief = args_brief
+    def __init__(self, **kwargs) -> None:
+        self._tool_name = ""
+        self._args_brief = ""
         self._dot_on = True
-        super().__init__(self._build(), **kwargs)
+        self._done = True
+        super().__init__("", **kwargs)
+        # Always visible — empty content + height:auto = zero height when idle
 
     def on_mount(self) -> None:
         self._timer = self.set_interval(self._BLINK_INTERVAL, self._blink)
 
+    # -- public API ---------------------------------------------------------
+
+    def activate(self, name: str, args_brief: str = "") -> None:
+        """Bind this slot to a tool — show widget and start blinking."""
+        self._tool_name = name
+        self._args_brief = args_brief
+        self._dot_on = True
+        self._done = False
+        self.update(self._build())
+
+    def deactivate(self) -> None:
+        """Reset slot to invisible idle state (empty content → height:auto → 0)."""
+        self._done = True
+        self._tool_name = ""
+        self._args_brief = ""
+        self.update(Text(""))
+
+    async def mark_done(self) -> None:
+        """Stop blinking, keep ● as static white dot."""
+        self._done = True
+        self._dot_on = True
+        self.update(self._build())
+
+    async def mark_error(self, detail: str = "") -> None:
+        """Stop blinking, turn ● red with error detail below (max 100 chars)."""
+        self._done = True
+        text = Text("  ● ", style="bold red")
+        text.append(self._tool_name, style="bold red")
+        d = detail[:100].replace("\n", " ").strip()
+        if d:
+            text.append(f"\n     {d}", style="red")
+        self.update(text)
+
+    # -- internals ----------------------------------------------------------
+
     def _blink(self) -> None:
+        if self._done:
+            return
         self._dot_on = not self._dot_on
         self.update(self._build())
 
@@ -149,28 +266,24 @@ class ToolStatus(_Bubble):
             text.append(f" ({self._args_brief})", style="dim")
         return text
 
-    def set_args(self, args_brief: str) -> None:
-        """Update the argument display (called when full args are available)."""
-        self._args_brief = args_brief
-        self.update(self._build())
 
-    async def mark_done(self) -> None:
-        """Stop blinking and remove the widget (tool succeeded)."""
-        if hasattr(self, "_timer"):
-            self._timer.stop()
-        await self.remove()
+class ToolDock(Vertical):
+    """Pre-mounted container for :class:`ToolStatus` slots.
 
-    async def mark_error(self, detail: str = "") -> None:
-        """Stop blinking and show red error text (tool failed)."""
-        if hasattr(self, "_timer"):
-            self._timer.stop()
-        text = Text("  ✗ ", style="bold red")
-        text.append(self._tool_name, style="bold red")
-        if detail:
-            d = detail[:400].replace("\n", " ").strip()
-            if d:
-                text.append(f"  {d}", style="red")
-        self.update(text)
+    Lives between the chat area and the input bar in the main layout.
+    Children are pre-allocated so activating a slot is a pure
+    ``update()`` — no DOM mount needed, so rendering is immediate
+    even from ``@work`` context.
+    """
+
+    DEFAULT_CSS = """
+    ToolDock {
+        height: auto;
+        max-height: 14;
+        padding: 0 1;
+        overflow-y: auto;
+    }
+    """
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ class LogConfig:
     log_dir: Path | None = None  # 日志文件目录
     rotation: str = "10 MB"      # 轮转大小
     retention: str = "7 days"    # 保留时间
+    json_format: bool = False    # 文件日志是否为 JSON 格式
 
 def init_logging(config=None):
     # 控制台: 彩色输出，格式 = "时间 | 级别 | 事件类型 | 消息"

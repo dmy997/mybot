@@ -145,11 +145,14 @@ async def run(self) -> bool:
     user = self.store.read_user()
     current_memory = self.store.read_memory_file()
 
-    # 4. 更新 MEMORY.md 行龄注释（如果日期变更）
+    # 4. 更新 MEMORY.md 行龄注释（如果日期变更），立即写回磁盘
     today = date.today().isoformat()
     last_date = self.store.get_dream_date()
     if last_date and last_date != today:
         updated_memory = self._update_age_annotations(current_memory, last_date, today)
+        if updated_memory is not None:
+            current_memory = updated_memory
+            self.store.write_memory_file(current_memory)
 
     # 5. Phase 1 — LLM 分析 → 结构化指令
     directives = await self._call_llm(soul, user, current_memory, new_entries)
@@ -169,7 +172,7 @@ async def run(self) -> bool:
 
 ### Phase 1 — LLM 分析
 
-调用 LLM（使用 `dream_phase1.md` 提示词模板），输入：SOUL.md、USER.md、MEMORY.md、新历史摘要条目。
+调用 LLM（使用 `dream_phase1.md` 作为 system prompt，`dream_user.md` 作为 user message 模板），输入：SOUL.md、USER.md、MEMORY.md、新历史摘要条目。
 
 输出格式：
 

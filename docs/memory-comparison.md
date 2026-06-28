@@ -97,6 +97,7 @@ workspace/
 │   ├── history.jsonl            # 追加式对话摘要（Consolidator 写入）
 │   ├── .cursor                  # Consolidator 写入游标
 │   ├── .dream_cursor            # Dream 消费游标
+│   ├── .dream_date              # Dream 上次运行日期（用于行龄注释）
 ├── cron/
 │   └── cron_state.json          # Cron 调度器状态
 └── sessions/                    # 会话 JSON 文件

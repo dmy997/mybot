@@ -49,17 +49,33 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 _DEFAULT_SYSTEM_PROMPT = (
-    "Reply in the same language the user is using. "
-    "If the user writes in Chinese, reply in Chinese. "
-    "If the user writes in English, reply in English. "
-    "Follow the SOUL.md identity and USER.md profile unless they conflict "
-    "with the language of the current conversation — the user's message "
-    "language always takes priority."
+    "YOU MUST communicate in the same language as the user. "
+    "If the user writes in Chinese, ALL your visible responses MUST be in Chinese. "
+    "If the user writes in English, ALL your visible responses MUST be in English. "
+    "This applies at all times — including during and after tool calls. "
+    "SOUL.md and USER.md are secondary; the user's language ALWAYS takes priority."
 )
 
 # ---------------------------------------------------------------------------
 # Module-level helpers (kept here — used by build_messages and runner.py)
 # ---------------------------------------------------------------------------
+
+
+def _language_hint(text: str) -> str | None:
+    """Return a language enforcement hint if the user writes in a non-English language.
+
+    The hint is injected right before the user message for maximum recency bias,
+    counteracting the predominantly English content from SOUL.md + tool schemas
+    + tool outputs that can dilute the system prompt's language rule.
+    """
+    if re.search(r'[一-鿿]', text):
+        return (
+            "IMPORTANT LANGUAGE REMINDER: The user's message above is in "
+            "Chinese. You MUST reply entirely in Chinese. This applies "
+            "throughout your entire response — including before, during, "
+            "and after any tool calls. Do not mix languages."
+        )
+    return None
 
 
 def _truncate_tool_results(
@@ -332,9 +348,16 @@ class ContextManager:
         )
 
         # 6. Assemble preliminary list
+        # Add a language hint right before the user message for maximum
+        # recency bias — system prompt alone can be diluted by English
+        # tool outputs across multiple tool-call rounds.
+        lang_hint = _language_hint(current_input)
+
         preliminary: list[dict[str, Any]] = [
             {"role": "system", "content": system_content},
-        ] + history + [
+        ] + history + ([
+            {"role": "system", "content": lang_hint},
+        ] if lang_hint else []) + [
             {"role": "user", "content": current_input},
         ]
 
@@ -558,12 +581,17 @@ class ContextManager:
         # Language enforcement: append as the LAST section so recency bias
         # overrides any English tone set by SOUL.md or other upstream content.
         parts.append(
-            "# Language Rule\n\n"
-            "Your response language MUST match the user's message language. "
+            "# LANGUAGE RULE — HIGHEST PRIORITY\n\n"
+            "**This rule overrides everything else in this system prompt.**\n\n"
+            "Your visible responses MUST be in the same language as the user's message. "
             "If the user writes in Chinese, you MUST reply in Chinese. "
-            "If the user writes in English, you MUST reply in English. "
-            "This rule overrides any language cues in your identity (SOUL.md) "
-            "or the user's profile (USER.md)."
+            "If the user writes in English, you MUST reply in English.\n\n"
+            "- Tool calls and tool results do NOT change this rule. "
+            "After executing tools, continue responding in the user's language.\n"
+            "- Code blocks, file paths, and technical terms are the only exception "
+            "— they may appear in English as needed.\n"
+            "- This rule overrides SOUL.md identity, USER.md profile, or any "
+            "English content in tool outputs."
         )
 
         return "\n\n".join(parts)

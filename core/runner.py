@@ -984,7 +984,7 @@ class AgentCore:
             return {
                 "name": tc.name,
                 "status": "ok" if result.success else "error",
-                "detail": (result.content or result.error or "")[:200],
+                "detail": (result.content or result.error or "")[:400],
                 "duration_ms": round(duration_ms, 1),
                 "arguments": args_preview,
             }
