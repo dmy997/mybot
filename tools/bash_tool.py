@@ -2,17 +2,20 @@
 
 Commands are validated against a blocklist of dangerous patterns, run with a
 timeout, and their output is capped to prevent context pollution.
+
+Execution is delegated to a :class:`~tools.sandbox.base.SandboxBackend`
+so the OS-level isolation strategy (none, bubblewrap, docker) is pluggable.
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from .guard import Capability
+from .sandbox import SandboxBackend, create_sandbox
 from .tool import Tool, ToolResult
 
 # ---------------------------------------------------------------------------
@@ -153,9 +156,11 @@ class BashTool(Tool):
         workspace: str | Path,
         *,
         timeout: int = DEFAULT_TIMEOUT,
+        sandbox: SandboxBackend | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self._timeout = timeout
+        self._sandbox = sandbox or create_sandbox(workspace=str(self.workspace))
 
     # -- execute ---------------------------------------------------------------
 
@@ -180,55 +185,44 @@ class BashTool(Tool):
                 error=f"dangerous pattern blocked: {blocked}",
             )
 
-        # 2. Execute
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "bash",
-                "-c",
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(self.workspace),
-                env=_build_sandbox_env(),
-            )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=self._timeout
-            )
-        except asyncio.TimeoutError:
+        # 2. Execute via sandbox backend
+        result = await self._sandbox.execute(
+            command,
+            cwd=str(self.workspace),
+            env=_build_sandbox_env(),
+            timeout=self._timeout,
+        )
+
+        if result.timed_out:
             return ToolResult(
                 success=False,
                 content="",
                 error=f"command timed out after {self._timeout}s",
             )
-        except FileNotFoundError:
+
+        if result.exit_code == -1 and not result.success:
             return ToolResult(
                 success=False,
                 content="",
-                error="bash executable not found on PATH",
-            )
-        except OSError as exc:
-            return ToolResult(
-                success=False,
-                content="",
-                error=f"Cannot execute command: {exc}",
+                error=result.stderr.strip() or "sandbox execution failed",
             )
 
-        # 3. Decode & truncate
+        # 3. Truncate output
         parts: list[str] = []
-        if stdout_bytes:
-            out = stdout_bytes.decode("utf-8", errors="replace")
+        if result.stdout:
+            out = result.stdout
             if len(out) > MAX_OUTPUT_LENGTH:
                 out = out[:MAX_OUTPUT_LENGTH] + "\n... (output truncated)"
             parts.append(out)
-        if stderr_bytes:
-            err = stderr_bytes.decode("utf-8", errors="replace")
+        if result.stderr:
+            err = result.stderr
             if len(err) > MAX_STDERR_LENGTH:
                 err = err[:MAX_STDERR_LENGTH] + "\n... (stderr truncated)"
             parts.append(f"[stderr]\n{err}")
 
         content = "\n".join(parts) if parts else "(no output)"
         return ToolResult(
-            success=proc.returncode == 0,
+            success=result.success,
             content=content,
-            error=None if proc.returncode == 0 else f"exit code: {proc.returncode}",
+            error=None if result.success else f"exit code: {result.exit_code}",
         )
