@@ -2,6 +2,7 @@
 
 from .compaction import (
     CompactionService,
+    _count_tokens,
     _estimate_message_tokens,
 )
 from .context_manager import ContextManager
@@ -14,5 +15,6 @@ __all__ = [
     "Session",
     "SessionManager",
     "TokenBudget",
+    "_count_tokens",
     "_estimate_message_tokens",
 ]

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from context.compaction import _count_tokens, _estimate_message_tokens
 from utils import render_template
 
 if TYPE_CHECKING:
@@ -118,12 +119,12 @@ class Consolidator:
         if build_messages_fn is not None:
             try:
                 assembled = await build_messages_fn()
-                estimated = self._estimate_tokens(assembled)
+                estimated = _estimate_message_tokens(assembled)
             except Exception:
                 logger.exception("Token estimation failed, using fallback")
-                estimated = self._estimate_tokens(unconsolidated)
+                estimated = _estimate_message_tokens(unconsolidated)
         else:
-            estimated = self._estimate_tokens(unconsolidated)
+            estimated = _estimate_message_tokens(unconsolidated)
 
         budget = self._input_token_budget
         target = int(budget * self.consolidation_ratio)
@@ -170,11 +171,11 @@ class Consolidator:
             if build_messages_fn is not None:
                 try:
                     assembled = await build_messages_fn()
-                    estimated = self._estimate_tokens(assembled)
+                    estimated = _estimate_message_tokens(assembled)
                 except Exception:
-                    estimated = self._estimate_tokens(unconsolidated)
+                    estimated = _estimate_message_tokens(unconsolidated)
             else:
-                estimated = self._estimate_tokens(unconsolidated)
+                estimated = _estimate_message_tokens(unconsolidated)
 
         return True
 
@@ -210,7 +211,6 @@ class Consolidator:
                     {"role": "user", "content": formatted},
                 ],
                 tools=[],
-                tool_choice=None,
             )
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
@@ -219,7 +219,7 @@ class Consolidator:
                                       session_key=session_key)
             return summary
         except Exception:
-            logger.warning("Consolidation LLM call failed, raw-archiving")
+            logger.opt(exception=True).warning("Consolidation LLM call failed, raw-archiving")
             self.store.raw_archive(messages, session_key=session_key)
             return None
 
@@ -229,21 +229,6 @@ class Consolidator:
     def _input_token_budget(self) -> int:
         """Available input token budget for the main LLM."""
         return self.context_window_tokens - _SAFETY_BUFFER
-
-    @staticmethod
-    def _estimate_tokens(messages: list[dict]) -> int:
-        """Rough token estimate: ~4 chars per token."""
-        total = 0
-        for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                total += max(0, len(content) // 4)
-            elif isinstance(content, list):
-                # Multi-modal content array
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        total += max(0, len(part.get("text", "")) // 4)
-        return total
 
     @staticmethod
     def _pick_boundary(
@@ -259,7 +244,7 @@ class Consolidator:
 
         for i, msg in enumerate(messages):
             content = msg.get("content", "")
-            msg_tokens = len(content) // 4 if isinstance(content, str) else 0
+            msg_tokens = _count_tokens(content) if isinstance(content, str) else 0
             accumulated += msg_tokens
 
             if msg.get("role") == "user":

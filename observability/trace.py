@@ -49,6 +49,10 @@ class Span:
     status: str = "ok"
     attributes: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
+    input: dict[str, Any] | None = None
+    """Structured input data (e.g. LLM messages, tool arguments)."""
+    output: dict[str, Any] | None = None
+    """Structured output data (e.g. LLM response, tool result)."""
     _parent: Span | None = field(default=None, repr=False)
 
     @property

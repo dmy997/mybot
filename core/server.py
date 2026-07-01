@@ -163,6 +163,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
 
         model = body.get("model")
         temperature = body.get("temperature")
+        goal = body.get("goal")
         cid = uuid.uuid4().hex
 
         async def event_stream():
@@ -175,6 +176,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                 correlation_id=cid,
                 model=model,
                 temperature=temperature,
+                goal=goal,
             ))
 
             try:
@@ -249,6 +251,13 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
             if s.get("key") == key:
                 return JSONResponse(s)
         return JSONResponse({"error": "session not found"}, status_code=404)
+
+    async def get_session_messages(request: Request) -> JSONResponse:
+        if not _check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        key = request.path_params.get("session_id", "")
+        history = orchestrator.ctx.session.get_session_history(key)
+        return JSONResponse(history)
 
     async def delete_session(request: Request) -> JSONResponse:
         if not _check_auth(request):
@@ -419,6 +428,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         Route("/chat/{session_id}", chat_sse, methods=["POST"]),
         Route("/sessions", list_sessions, methods=["GET"]),
         Route("/sessions/{session_id}", get_session, methods=["GET"]),
+        Route("/sessions/{session_id}/messages", get_session_messages, methods=["GET"]),
         Route("/sessions/{session_id}", delete_session, methods=["DELETE"]),
         WebSocketRoute("/ws/{session_id}", ws_endpoint),
     ])

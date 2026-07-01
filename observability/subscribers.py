@@ -45,7 +45,7 @@ async def _on_llm_response(event: LLMResponseReady) -> None:
         tokens_total=event.tokens_total,
         finish_reason=event.finish_reason,
         error=event.error,
-    ))
+    ), session_key=event.session_key)
 
 
 async def _on_tool_completed(event: ToolExecutionCompleted) -> None:
@@ -60,7 +60,7 @@ async def _on_tool_completed(event: ToolExecutionCompleted) -> None:
         success=event.success,
         latency_ms=event.latency_ms,
         error=event.error,
-    ))
+    ), session_key=event.session_key)
 
 
 async def _on_agent_completed(event: AgentCompleted) -> None:

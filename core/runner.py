@@ -17,8 +17,8 @@ from loguru import logger
 from context.context_manager import _estimate_message_tokens
 from core.events import (
     AgentCompleted,
-    AgentStarted,
     AgentStallWarning,
+    AgentStarted,
     AgentStepStarted,
     LLMResponseReady,
     ToolExecutionCompleted,
@@ -106,6 +106,78 @@ def _summarize_args(args: dict[str, Any] | None, max_chars: int = 120) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars - 3] + "..."
+
+
+# ---------------------------------------------------------------------------
+# Span I/O capture helpers — snapshot input/output for trace debugging
+# ---------------------------------------------------------------------------
+
+_MAX_INPUT_CHARS = 3_000
+_MAX_OUTPUT_CHARS = 5_000
+_MAX_THINKING_CHARS = 2_000
+
+
+def _capture_llm_input(messages: list[dict[str, Any]], model: str) -> dict[str, Any]:
+    """Capture the last user message + model for the LLM span input."""
+    last_user = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            last_user = content if isinstance(content, str) else str(content)
+            break
+    if len(last_user) > _MAX_INPUT_CHARS:
+        last_user = last_user[:_MAX_INPUT_CHARS] + "..."
+    return {
+        "model": model,
+        "messages_count": len(messages),
+        "last_user_message": last_user,
+    }
+
+
+def _capture_llm_output(response: Any) -> dict[str, Any]:
+    """Capture LLM response content, thinking, and tool calls."""
+    output: dict[str, Any] = {}
+    content = response.content or ""
+    if content:
+        output["content"] = (
+            content[:_MAX_OUTPUT_CHARS] + "..."
+            if len(content) > _MAX_OUTPUT_CHARS
+            else content
+        )
+    thinking = getattr(response, "reasoning_content", "") or ""
+    if thinking:
+        output["thinking"] = (
+            thinking[:_MAX_THINKING_CHARS] + "..."
+            if len(thinking) > _MAX_THINKING_CHARS
+            else thinking
+        )
+    if response.tool_calls:
+        output["tool_calls"] = [
+            {"name": tc.name, "args": _summarize_args(tc.arguments, 200)}
+            for tc in response.tool_calls
+        ]
+    output["finish_reason"] = response.finish_reason
+    return output
+
+
+def _capture_tool_input(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    """Capture tool name and arguments for the tool span input."""
+    args_str = str(arguments or {})
+    if len(args_str) > _MAX_INPUT_CHARS:
+        args_str = args_str[:_MAX_INPUT_CHARS] + "..."
+    return {"tool": name, "arguments": args_str}
+
+
+def _capture_tool_output(result: Any) -> dict[str, Any]:
+    """Capture tool result for the tool span output."""
+    content = result.content or ""
+    if len(content) > _MAX_OUTPUT_CHARS:
+        content = content[:_MAX_OUTPUT_CHARS] + "..."
+    return {
+        "success": result.success,
+        "content": content,
+        "error": result.error,
+    }
 
 
 def _dump_llm_messages(
@@ -739,6 +811,10 @@ class AgentCore:
                     span.attributes["tokens_out"] = tokens_out
                     span.attributes["tokens_total"] = tokens_total
 
+                    # I/O capture for trace debugging
+                    span.input = _capture_llm_input(messages, model)
+                    span.output = _capture_llm_output(response)
+
                 await bus.publish(LLMResponseReady(
                     session_key=spec.session_key,
                     step_count=0,  # caller should set this via ctx if needed
@@ -954,6 +1030,10 @@ class AgentCore:
                     with tracer.span("tool.execute", tool_name=c.tool_name):
                         result = await tools.execute(c.tool_name, c.tool_arguments)
                         c.tool_result = result
+                        _span = tracer.current_span()
+                        if _span is not None:
+                            _span.input = _capture_tool_input(c.tool_name, c.tool_arguments)
+                            _span.output = _capture_tool_output(result)
                         return result
 
                 result = await mw.run_tool_execute(ctx, _tool_handler)
@@ -969,6 +1049,10 @@ class AgentCore:
 
             with tracer.span("tool.execute", tool_name=tc.name):
                 result = await tools.execute(tc.name, tc.arguments)
+                _span = tracer.current_span()
+                if _span is not None:
+                    _span.input = _capture_tool_input(tc.name, tc.arguments)
+                    _span.output = _capture_tool_output(result)
                 latency_ms = (time.monotonic() - t0) * 1000
                 await bus.publish(ToolExecutionCompleted(
                     session_key=spec.session_key,

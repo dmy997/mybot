@@ -163,13 +163,15 @@ class AgentRunEvent:
 # ---------------------------------------------------------------------------
 
 
-def emit(event: Any, *, level: str = "INFO") -> None:
+def emit(event: Any, *, level: str = "INFO", session_key: str | None = None) -> None:
     """Emit a structured event through loguru.
 
     Event fields are bound to the log record's ``extra`` dict so they
     appear as top-level keys in JSON output.
     """
     data = _to_dict(event)
+    if session_key is not None:
+        data["session_key"] = session_key
     event_type = type(event).__name__
     # Build a one-line summary for console readability
     summary = ", ".join(f"{k}={v!r}" for k, v in data.items())

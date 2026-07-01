@@ -86,6 +86,7 @@ class ChatApp(App):
         self._model = model
         self._is_resumed = is_resumed
         self._t_start = 0.0
+        self._goal: str | None = None
         self._input_history: list[str] = []
         self._history_index: int = -1
         self._saved_input: str = ""
@@ -307,6 +308,7 @@ class ChatApp(App):
             result = await self._orche.process_message(
                 session_key=self._session_key,
                 user_input=text,
+                goal=self._goal,
                 on_delta=_on_delta,
                 on_thinking=_on_thinking,
                 on_thinking_done=_on_thinking_done,
@@ -372,9 +374,20 @@ class ChatApp(App):
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
 
-        if cmd == "/help":
+        if cmd == "/goal":
+            goal_text = parts[1].strip() if len(parts) > 1 else ""
+            if goal_text:
+                self._goal = goal_text
+                msg = RichText(f"Goal set: {goal_text}", style="bold green")
+            else:
+                self._goal = None
+                msg = RichText("Goal cleared.", style="dim")
+            await chat.mount(Static(msg))
+
+        elif cmd == "/help":
             msg = RichText(
-                f"Session: {self._session_key}\nModel: {self._model}",
+                f"Session: {self._session_key}\nModel: {self._model}\n"
+                f"Goal: {self._goal or '(none)'}",
                 style="dim",
             )
             await chat.mount(Static(msg))

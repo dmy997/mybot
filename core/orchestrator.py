@@ -18,30 +18,29 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from core.middleware import MiddlewareChain
 
+# ---------------------------------------------------------------------------
+# Helper — format tool args for inline display
+# ---------------------------------------------------------------------------
+import json as _json
+
 from loguru import logger
 
 from context.context_manager import ContextManager
 from core.events import SessionCreated, SessionDeleted, bus
 from core.message_bus import InboundMessage, MessageBus, OutboundMessage
+from memory.dream import Dream
 from observability import LogConfig, init_logging
 from observability.otel_bridge import auto_install as auto_install_otel
 from observability.subscribers import install as install_subscribers
 from observability.trace import tracer
+from services.cron import CronScheduler
+from services.xiaohongshu import XiaohongshuService
 from tools import ToolRegistry
 from tools.mcp.client_manager import MCPClientManager
 from tools.tool import Tool
 
-from services.cron import CronScheduler
-from memory.dream import Dream
-
 from .dispatcher import Dispatcher
 from .runner import AgentInput
-
-# ---------------------------------------------------------------------------
-# Helper — format tool args for inline display
-# ---------------------------------------------------------------------------
-
-import json as _json
 
 
 def _summarize_tool_args(args_json: str) -> str:
@@ -183,6 +182,9 @@ class Orchestrator:
         )
         self.cron.register_job("dream", interval_hours=2)
 
+        self._xiaohongshu = XiaohongshuService(workspace=self.workspace)
+        self.cron.register_job("xiaohongshu", interval_hours=24)
+
     def _register_default_tools(self) -> None:
         """Auto-discover and register tools available in the ``"core"`` scope."""
         from tools import discover_tools
@@ -208,7 +210,7 @@ class Orchestrator:
 
     def _setup_mcp(self) -> None:
         """Load MCP config (if any) and create the client manager but don't connect yet."""
-        from tools.mcp.client_manager import load_mcp_config, MCPServerConfig  # noqa: F811
+        from tools.mcp.client_manager import load_mcp_config  # noqa: F811
 
         config_path = self._mcp_config_path
         if config_path is None:
@@ -245,6 +247,8 @@ class Orchestrator:
         """Route cron job *name* to the appropriate handler."""
         if name == "dream":
             await self._dream.run()
+        if name == "xiaohongshu":
+            await self._xiaohongshu.on_cron_trigger(self)
 
     async def start_services(self) -> None:
         """Start background services (MCP + cron)."""
@@ -701,8 +705,8 @@ def main() -> None:
     from datetime import datetime
 
     from config import Config
-    from tui import ChatApp
     from providers.openai_compatible_provider import OpenAICompatibleProvider
+    from tui import ChatApp
 
     # -- CLI flags -----------------------------------------------------------
     do_continue = "-c" in sys.argv or "--continue" in sys.argv

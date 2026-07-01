@@ -183,20 +183,90 @@ input { font-family: inherit; }
 .log-entry .type { color: var(--accent); font-weight: 600; margin-right: 8px; }
 .log-entry .data { color: var(--text); word-break: break-all; }
 
-/* Trace spans */
-.span-entry {
-  padding: 8px 12px; margin-bottom: 6px; border-radius: 6px;
+/* Trace cards (Jaeger-style waterfall) */
+.trace-card {
   background: var(--surface); border: 1px solid var(--border);
-  font-size: 12px;
+  border-radius: 10px; margin-bottom: 16px; overflow: hidden;
 }
-.span-entry .name { font-weight: 600; color: var(--text); }
-.span-entry .meta { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
-.span-entry .meta span { margin-right: 12px; }
-.span-entry .attr { color: var(--text-muted); font-size: 11px; margin-top: 4px; }
-.span-entry .attr code { color: var(--ok); background: rgba(255,255,255,.05); padding: 1px 4px; border-radius: 3px; }
-.span-entry.status-error { border-left: 3px solid var(--danger); }
-.span-entry.status-ok { border-left: 3px solid var(--ok); }
-.span-tree { margin-left: 16px; border-left: 1px dashed var(--border); padding-left: 12px; }
+.trace-card-header {
+  padding: 10px 16px; background: rgba(255,255,255,.03);
+  border-bottom: 1px solid var(--border);
+  display: flex; gap: 20px; font-size: 12px; color: var(--text-muted); align-items: center;
+}
+.trace-card-header .trace-id { color: var(--accent); font-weight: 600; font-size: 13px; }
+.trace-spans { padding: 8px 0; }
+
+/* Span row */
+.span-row { border-bottom: 1px solid rgba(255,255,255,.025); }
+.span-row:last-child { border-bottom: none; }
+.span-row-header {
+  display: flex; align-items: center; gap: 8px; padding: 5px 12px;
+  min-height: 32px;
+}
+.span-row-header.clickable { cursor: pointer; }
+.span-row-header.clickable:hover { background: rgba(255,255,255,.03); }
+.span-expand-icon {
+  font-size: 9px; color: var(--text-muted); width: 14px; flex-shrink: 0;
+  text-align: center; transition: transform .15s; line-height: 1;
+}
+.span-row.expanded > .span-row-header .span-expand-icon { transform: rotate(90deg); }
+
+/* Duration bar track */
+.span-bar-track {
+  flex: 1; height: 22px; background: rgba(255,255,255,.04);
+  border-radius: 4px; position: relative; overflow: hidden; min-width: 80px;
+}
+.span-bar {
+  position: absolute; top: 0; height: 100%; border-radius: 4px;
+  opacity: .7; min-width: 2px;
+}
+.span-row-header.clickable:hover .span-bar { opacity: .9; }
+.span-bar-llm     { background: var(--accent); }
+.span-bar-tool    { background: var(--ok); }
+.span-bar-orch    { background: #f0a040; }
+.span-bar-agent   { background: #a78bfa; }
+.span-bar-default { background: #6b7280; }
+
+.span-bar-label {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: space-between; padding: 0 8px;
+  font-size: 11px; color: var(--text); pointer-events: none;
+}
+.span-bar-label .span-dur { color: var(--text-muted); font-size: 10px; margin-left: 16px; }
+.span-status-err {
+  color: var(--danger); font-weight: 700; font-size: 12px;
+  width: 16px; text-align: center; flex-shrink: 0; title: "error";
+}
+
+/* Span expandable details */
+.span-details { display: none; padding: 0 12px 8px 46px; }
+.span-row.expanded > .span-details { display: block; }
+.span-detail-section {
+  margin-top: 6px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+}
+.span-detail-label {
+  padding: 5px 10px; font-size: 11px; font-weight: 600;
+  color: var(--accent); background: rgba(255,255,255,.03);
+  border-bottom: 1px solid var(--border);
+}
+.span-detail-section table {
+  width: 100%; border-collapse: collapse; font-size: 11px;
+}
+.span-detail-section td {
+  padding: 3px 10px; vertical-align: top;
+}
+.span-detail-section td:first-child {
+  color: var(--text-muted); width: 120px; white-space: nowrap;
+}
+.span-detail-section td:last-child {
+  color: var(--text); word-break: break-all; font-family: monospace; font-size: 10px;
+}
+.span-detail-section pre {
+  margin: 0; padding: 10px; font-size: 10px; line-height: 1.45;
+  color: var(--text); background: rgba(0,0,0,.25);
+  overflow-x: auto; max-height: 260px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-all;
+}
 
 /* Loading dots */
 .loading-dots { display: inline-flex; gap: 3px; padding: 4px 0; }
@@ -233,11 +303,12 @@ input { font-family: inherit; }
   <div id="chat-view">
     <div id="chat-header">
       Session: <strong id="current-session-name">default</strong>
+      <span id="goal-badge" style="display:none;margin-left:8px;padding:2px 8px;background:#3b82f6;color:#fff;border-radius:10px;font-size:12px;cursor:pointer" title="Click to clear goal" onclick="setGoal(null)"></span>
     </div>
     <div id="messages"></div>
     <div id="input-area">
       <input id="message-input" type="text" placeholder="Type a message..." autofocus
-             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}">
+             onkeydown="handleInputKey(event)">
       <button id="send-btn" onclick="sendMessage()">Send</button>
     </div>
   </div>
@@ -256,6 +327,37 @@ let currentSession = 'default';
 let isStreaming = false;
 let activeObsView = null;
 let obsRefreshTimer = null;
+let expandedSpanIds = new Set();
+let messageHistory = [];
+let historyIndex = -1;
+let historyDraft = '';
+let currentGoal = null;
+
+const _HISTORY_MAX = 200;
+
+function _historyKey(sessionKey) {
+  return 'mybot_history_' + sessionKey;
+}
+
+function _loadMessageHistory(sessionKey) {
+  try {
+    const raw = localStorage.getItem(_historyKey(sessionKey));
+    messageHistory = raw ? JSON.parse(raw) : [];
+  } catch {
+    messageHistory = [];
+  }
+  historyIndex = messageHistory.length;
+  historyDraft = '';
+}
+
+function _saveMessageHistory(sessionKey) {
+  if (messageHistory.length > _HISTORY_MAX) {
+    messageHistory = messageHistory.slice(-_HISTORY_MAX);
+  }
+  try {
+    localStorage.setItem(_historyKey(sessionKey), JSON.stringify(messageHistory));
+  } catch { /* storage full — ignore */ }
+}
 
 // =========================================================================
 // Session management
@@ -265,32 +367,76 @@ async function loadSessions() {
   const sessions = await resp.json();
   const list = document.getElementById('session-list');
   list.innerHTML = '';
-  sessions.forEach(s => {
-    const div = document.createElement('div');
-    div.className = 'session-item' + (s.key === currentSession ? ' active' : '');
-    div.onclick = (e) => { if (!e.target.closest('.del-btn')) selectSession(s.key); };
-    div.innerHTML = `
-      <span class="name">${esc(s.key)}</span>
-      <span class="count">${s.message_count || 0}</span>
-      <button class="del-btn" title="Delete">x</button>`;
-    div.querySelector('.del-btn').onclick = async (e) => {
-      e.stopPropagation();
-      if (confirm('Delete session "' + s.key + '"?')) {
-        await fetch('/sessions/' + s.key, { method: 'DELETE' });
-        if (currentSession === s.key) selectSession('default');
-        loadSessions();
-      }
-    };
-    list.appendChild(div);
+
+  // Sort by updated_at descending
+  sessions.sort((a, b) => {
+    const da = a.updated_at ? new Date(a.updated_at) : new Date(0);
+    const db = b.updated_at ? new Date(b.updated_at) : new Date(0);
+    return db - da;
   });
+
+  // Group by date
+  const groups = {};
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1);
+
+  sessions.forEach(s => {
+    const label = s.updated_at ? dateGroupLabel(new Date(s.updated_at), today, yesterday) : 'Unknown';
+    if (!groups[label]) groups[label] = [];
+    groups[label].push(s);
+  });
+
+  const groupOrder = ['Today', 'Yesterday'];
+  Object.keys(groups).sort((a, b) => {
+    const ai = groupOrder.indexOf(a), bi = groupOrder.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1;
+    if (bi !== -1) return 1;
+    return b.localeCompare(a);
+  }).forEach(label => {
+    const header = document.createElement('div');
+    header.style.cssText = 'padding:10px 12px 4px;font-size:10px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;';
+    header.textContent = label;
+    list.appendChild(header);
+
+    groups[label].forEach(s => {
+      const div = document.createElement('div');
+      div.className = 'session-item' + (s.key === currentSession ? ' active' : '');
+      div.onclick = (e) => { if (!e.target.closest('.del-btn')) selectSession(s.key); };
+      div.innerHTML = `
+        <span class="name">${esc(s.key)}</span>
+        <span class="count">${s.message_count || 0}</span>
+        <button class="del-btn" title="Delete">x</button>`;
+      div.querySelector('.del-btn').onclick = async (e) => {
+        e.stopPropagation();
+        if (confirm('Delete session "' + s.key + '"?')) {
+          await fetch('/sessions/' + s.key, { method: 'DELETE' });
+          if (currentSession === s.key) selectSession('default');
+          loadSessions();
+        }
+      };
+      list.appendChild(div);
+    });
+  });
+  return sessions;
+}
+
+function dateGroupLabel(date, today, yesterday) {
+  if (date.toDateString() === today.toDateString()) return 'Today';
+  if (date.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  const diffDays = Math.round((today - date) / 86400000);
+  if (diffDays < 7) return date.toLocaleDateString('en-US', { weekday: 'long' });
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
 function selectSession(key) {
   currentSession = key;
   document.getElementById('current-session-name').textContent = key;
-  document.getElementById('messages').innerHTML = '';
+  _loadMessageHistory(key);
   switchView('chat');
   loadSessions();
+  loadHistory(key);
 }
 
 function newSession() {
@@ -298,7 +444,83 @@ function newSession() {
   if (name && name.trim()) selectSession(name.trim());
 }
 
+async function loadHistory(sessionKey) {
+  const container = document.getElementById('messages');
+  container.innerHTML = '<div style="color:var(--text-muted);padding:20px;text-align:center;">Loading...</div>';
+
+  try {
+    const resp = await fetch('/sessions/' + encodeURIComponent(sessionKey) + '/messages');
+    if (!resp.ok) throw new Error(resp.statusText);
+
+    const messages = await resp.json();
+    container.innerHTML = '';
+
+    if (!messages.length) {
+      container.innerHTML = '<div style="color:var(--text-muted);padding:20px;text-align:center;font-size:13px;">No messages yet. Start a conversation!</div>';
+      return;
+    }
+
+    // Build tool_call_id -> result map from tool messages
+    const toolResults = {};
+    messages.forEach(m => {
+      if (m.role === 'tool' && m.tool_call_id) {
+        toolResults[m.tool_call_id] = m.content || '';
+      }
+    });
+
+    messages.forEach(m => {
+      if (m.role === 'user') {
+        const div = addBubble('user', '');
+        div.querySelector('.msg-content').innerHTML = marked.parse(m.content || '');
+      } else if (m.role === 'assistant') {
+        const asstEl = addBubble('assistant', '');
+        const contentEl = asstEl.querySelector('.msg-content');
+        if (m.content) contentEl.innerHTML = marked.parse(m.content);
+
+        // Render tool calls
+        if (m.tool_calls) {
+          m.tool_calls.forEach(tc => {
+            const fn = tc.function || {};
+            const name = fn.name || tc.name || 'unknown';
+            const args = fn.arguments || '';
+            const block = document.createElement('div');
+            block.className = 'tool-block';
+            block.innerHTML =
+              '<div class="tool-summary" onclick="this.parentElement.classList.toggle(\'open\')">'
+              + '<span class="arrow">&#9654;</span> Tool: ' + esc(name) + '</div>'
+              + '<div class="tool-body">' + esc(String(args).substring(0, 2000)) + '</div>';
+            // Attach result if available
+            if (toolResults[tc.id]) {
+              const resDiv = document.createElement('div');
+              resDiv.style.cssText = 'padding:4px 12px 8px;font-size:11px;color:var(--text-muted);border-top:1px solid var(--border);';
+              resDiv.textContent = 'Result: ' + toolResults[tc.id].substring(0, 500);
+              block.appendChild(resDiv);
+            }
+            asstEl.appendChild(block);
+          });
+        }
+      }
+      // system and tool messages are handled above
+    });
+
+    scrollDown();
+  } catch (err) {
+    container.innerHTML = '<div class="message error">Failed to load history: ' + esc(err.message) + '</div>';
+  }
+}
+
 // =========================================================================
+function setGoal(text) {
+  currentGoal = text;
+  const badge = document.getElementById('goal-badge');
+  if (text) {
+    badge.textContent = 'Goal: ' + text;
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
 // View switching
 // =========================================================================
 function switchView(view) {
@@ -318,7 +540,8 @@ function switchView(view) {
     chatView.classList.add('hidden');
     obsView.classList.add('active');
     document.getElementById('obs-title').textContent =
-      view === 'metrics' ? 'Metrics' : view === 'logs' ? 'Log' : 'Trace';
+      (view === 'metrics' ? 'Metrics' : view === 'logs' ? 'Log' : 'Trace')
+      + (currentSession !== 'default' ? ' [' + currentSession + ']' : '');
     navBtns.forEach(b => b.classList.toggle('active', b.dataset.view === view));
     refreshObsView();
     obsRefreshTimer = setInterval(refreshObsView, 5000);
@@ -345,9 +568,15 @@ async function showMetrics() {
     const { counters, gauges, histograms } = data;
 
     el.innerHTML = `
+      ${currentSession !== 'default' ? `<div class="metric-card" style="margin-bottom:16px;border-color:var(--accent);">
+        <h3>Session: ${esc(currentSession)}</h3>
+        <table>
+          <tr><td>Active</td><td>&#10003;</td></tr>
+        </table>
+      </div>` : ''}
       <div class="metrics-grid">
         <div class="metric-card">
-          <h3>LLM</h3>
+          <h3>LLM (global)</h3>
           <table>
             <tr><td>Calls</td><td>${counters.llm_calls_total || 0}</td></tr>
             <tr><td>Errors</td><td class="${counters.llm_calls_errors_total ? 'err' : ''}">${counters.llm_calls_errors_total || 0}</td></tr>
@@ -359,7 +588,7 @@ async function showMetrics() {
           </table>
         </div>
         <div class="metric-card">
-          <h3>Tools</h3>
+          <h3>Tools (global)</h3>
           <table>
             <tr><td>Calls</td><td>${counters.tool_calls_total || 0}</td></tr>
             <tr><td>Errors</td><td class="${counters.tool_calls_errors_total ? 'err' : ''}">${counters.tool_calls_errors_total || 0}</td></tr>
@@ -370,7 +599,7 @@ async function showMetrics() {
           </table>
         </div>
         <div class="metric-card">
-          <h3>Agent</h3>
+          <h3>Agent (global)</h3>
           <table>
             <tr><td>Steps (avg)</td><td>${histograms.agent_steps?.avg?.toFixed(1) || '-'}</td></tr>
             <tr><td>Steps (max)</td><td>${histograms.agent_steps?.max?.toFixed(0) || '-'}</td></tr>
@@ -392,10 +621,19 @@ async function showLogs() {
   const el = document.getElementById('obs-content');
   try {
     const resp = await fetch('/logs?limit=200');
-    const logs = await resp.json();
+    let logs = await resp.json();
+
+    // Filter by session if selected
+    if (currentSession !== 'default') {
+      logs = logs.filter(e => e.data && e.data.session_key === currentSession);
+    }
 
     if (!logs.length) {
-      el.innerHTML = '<div style="color:var(--text-muted);padding:20px;">No log events yet. Send a message to generate events.</div>';
+      el.innerHTML = '<div style="color:var(--text-muted);padding:20px;">'
+        + (currentSession !== 'default'
+          ? 'No logs for this session yet. Send a message to generate events.'
+          : 'No log events yet. Send a message to generate events.')
+        + '</div>';
       return;
     }
 
@@ -424,11 +662,32 @@ async function showLogs() {
 async function showTraces() {
   const el = document.getElementById('obs-content');
   try {
+    // Save expanded span IDs before re-render
+    el.querySelectorAll('.span-row.expanded').forEach(r => {
+      expandedSpanIds.add(r.dataset.spanId);
+    });
+
     const resp = await fetch('/traces?limit=100');
-    const spans = await resp.json();
+    let spans = await resp.json();
+
+    // Filter by session: keep only traces whose root span matches
+    if (currentSession !== 'default') {
+      const matchingTraceIds = new Set();
+      spans.forEach(s => {
+        if (!s.parent_span_id && s.attributes && s.attributes.session_key === currentSession) {
+          matchingTraceIds.add(s.trace_id);
+        }
+      });
+      spans = spans.filter(s => matchingTraceIds.has(s.trace_id));
+    }
 
     if (!spans.length) {
-      el.innerHTML = '<div style="color:var(--text-muted);padding:20px;">No trace spans yet. Send a message to generate traces.</div>';
+      expandedSpanIds.clear();
+      el.innerHTML = '<div style="color:var(--text-muted);padding:20px;">'
+        + (currentSession !== 'default'
+          ? 'No traces for this session yet. Send a message to generate traces.'
+          : 'No trace spans yet. Send a message to generate traces.')
+        + '</div>';
       return;
     }
 
@@ -444,47 +703,153 @@ async function showTraces() {
       return mb - ma;
     });
 
-    el.innerHTML = traceIds.slice(0, 20).map(tid => {
-      const spans = traces[tid];
-      const roots = spans.filter(s => !s.parent_span_id);
-      const children = {};
-      spans.forEach(s => {
-        if (s.parent_span_id) {
-          if (!children[s.parent_span_id]) children[s.parent_span_id] = [];
-          children[s.parent_span_id].push(s);
-        }
-      });
+    el.innerHTML = traceIds.slice(0, 20).map(tid => renderTraceCard(tid, traces[tid])).join('');
 
-      function renderSpan(s, depth) {
-        const indent = depth > 0 ? ' class="span-tree"' : '';
-        const statusCls = s.status === 'error' ? ' status-error' : ' status-ok';
-        const dur = s.latency_ms != null ? fmtMs(s.latency_ms) : '?';
-        const attrs = Object.entries(s.attributes || {}).slice(0, 6).map(([k,v]) =>
-          `<code>${esc(k)}: ${esc(String(v))}</code>`
-        ).join(' ');
-
-        let html = `<div${indent}><div class="span-entry${statusCls}">
-          <div class="name">${esc(s.name)} <span style="color:var(--text-muted);font-weight:400">${dur}</span></div>
-          <div class="meta"><span>trace: ${esc(s.trace_id.substring(0, 8))}...</span><span>span: ${esc(s.span_id)}</span></div>`;
-        if (attrs) html += `<div class="attr">${attrs}</div>`;
-        html += '</div>';
-
-        const kids = children[s.span_id] || [];
-        kids.forEach(k => { html += renderSpan(k, depth + 1); });
-        html += '</div>';
-        return html;
-      }
-
-      return roots.map(r => renderSpan(r, 0)).join('');
-    }).join('');
+    // Restore expanded state
+    expandedSpanIds.forEach(id => {
+      const row = el.querySelector(`.span-row[data-span-id="${id}"]`);
+      if (row) row.classList.add('expanded');
+    });
   } catch (e) {
     el.innerHTML = '<div class="error-msg">Failed to load traces</div>';
+  }
+}
+
+function renderTraceCard(tid, spans) {
+  const roots = spans.filter(s => !s.parent_span_id);
+  const children = {};
+  spans.forEach(s => {
+    if (s.parent_span_id) {
+      if (!children[s.parent_span_id]) children[s.parent_span_id] = [];
+      children[s.parent_span_id].push(s);
+    }
+  });
+
+  const startTimes = spans.map(s => s.start_time).filter(Boolean);
+  const endTimes = spans.map(s => s.end_time).filter(Boolean);
+  if (!startTimes.length || !endTimes.length) return '';
+  const traceStart = Math.min(...startTimes);
+  const traceEnd = Math.max(...endTimes);
+  const traceDur = Math.max(traceEnd - traceStart, 0.001);
+  const totalDur = (traceEnd - traceStart) * 1000;
+  const errors = spans.filter(s => s.status === 'error').length;
+
+  const renderSpan = (s, depth) => {
+    const offsetPct = ((s.start_time - traceStart) / traceDur * 100).toFixed(2);
+    const widthPct = Math.max((s.latency_ms || 0) / 1000 / traceDur * 100, 0.6).toFixed(2);
+    const dur = s.latency_ms != null ? fmtMs(s.latency_ms) : '?';
+    const type = getSpanType(s.name);
+    const hasDetails = (s.attributes && Object.keys(s.attributes).length > 0)
+      || (s.input && Object.keys(s.input).length > 0)
+      || (s.output && Object.keys(s.output).length > 0);
+    const rowCls = hasDetails ? ' clickable' : '';
+
+    let html = `<div class="span-row" data-span-id="${s.span_id}">
+      <div class="span-row-header${rowCls}"${hasDetails ? ' onclick="toggleSpanDetails(this.parentElement)"' : ''}>
+        <span class="span-expand-icon">${hasDetails ? '▶' : ''}</span>
+        <span class="span-bar-track" style="margin-left: ${depth * 20}px">
+          <span class="span-bar span-bar-${type}" style="margin-left: ${offsetPct}%; width: ${widthPct}%;"></span>
+          <span class="span-bar-label">${esc(s.name)} <span class="span-dur">${dur}</span></span>
+        </span>`;
+    if (s.status === 'error') html += '<span class="span-status-err" title="error">!</span>';
+    html += '</div>';
+
+    if (hasDetails) {
+      html += '<div class="span-details">';
+      if (s.attributes && Object.keys(s.attributes).length > 0) {
+        html += '<div class="span-detail-section"><div class="span-detail-label">Attributes</div><table>';
+        for (const [k, v] of Object.entries(s.attributes))
+          html += `<tr><td>${esc(k)}</td><td>${esc(String(v).substring(0, 500))}</td></tr>`;
+        html += '</table></div>';
+      }
+      if (s.input && Object.keys(s.input).length > 0) {
+        html += '<div class="span-detail-section"><div class="span-detail-label">Input</div>'
+          + '<pre>' + esc(JSON.stringify(s.input, null, 2).substring(0, 5000)) + '</pre></div>';
+      }
+      if (s.output && Object.keys(s.output).length > 0) {
+        html += '<div class="span-detail-section"><div class="span-detail-label">Output</div>'
+          + '<pre>' + esc(JSON.stringify(s.output, null, 2).substring(0, 5000)) + '</pre></div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+
+    const kids = children[s.span_id] || [];
+    kids.forEach(k => { html += renderSpan(k, depth + 1); });
+    return html;
+  };
+
+  return `<div class="trace-card">
+    <div class="trace-card-header">
+      <span class="trace-id">${esc(tid.substring(0, 16))}...</span>
+      <span>${spans.length} spans</span>
+      <span>${fmtMs(totalDur)}</span>
+      ${errors > 0 ? `<span style="color:var(--danger)">${errors} errors</span>` : ''}
+    </div>
+    <div class="trace-spans">${roots.map(r => renderSpan(r, 0)).join('')}</div>
+  </div>`;
+}
+
+function getSpanType(name) {
+  if (name.startsWith('llm.')) return 'llm';
+  if (name.startsWith('tool.')) return 'tool';
+  if (name.startsWith('orchestrator.')) return 'orch';
+  if (name.startsWith('agent.')) return 'agent';
+  return 'default';
+}
+
+function toggleSpanDetails(row) {
+  row.classList.toggle('expanded');
+  if (row.classList.contains('expanded')) {
+    expandedSpanIds.add(row.dataset.spanId);
+  } else {
+    expandedSpanIds.delete(row.dataset.spanId);
   }
 }
 
 // =========================================================================
 // Chat
 // =========================================================================
+function handleInputKey(event) {
+  const input = document.getElementById('message-input');
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (text.startsWith('/goal')) {
+      const goalText = text.slice(5).trim();
+      setGoal(goalText || null);
+      input.value = '';
+      return;
+    }
+    sendMessage();
+    return;
+  }
+  if (event.key === 'ArrowUp') {
+    if (historyIndex === messageHistory.length) {
+      historyDraft = input.value;
+    }
+    if (historyIndex > 0) {
+      historyIndex--;
+      input.value = messageHistory[historyIndex];
+      // Move cursor to end
+      setTimeout(() => { input.selectionStart = input.selectionEnd = input.value.length; }, 0);
+    }
+    event.preventDefault();
+    return;
+  }
+  if (event.key === 'ArrowDown') {
+    if (historyIndex < messageHistory.length) {
+      historyIndex++;
+      input.value = historyIndex < messageHistory.length
+        ? messageHistory[historyIndex]
+        : historyDraft;
+      setTimeout(() => { input.selectionStart = input.selectionEnd = input.value.length; }, 0);
+    }
+    event.preventDefault();
+    return;
+  }
+}
+
 async function sendMessage() {
   if (activeObsView) switchView('chat');
 
@@ -493,6 +858,10 @@ async function sendMessage() {
   const message = input.value.trim();
   if (!message || isStreaming) return;
 
+  messageHistory.push(message);
+  historyIndex = messageHistory.length;
+  historyDraft = '';
+  _saveMessageHistory(currentSession);
   input.value = '';
   isStreaming = true;
   btn.disabled = true;
@@ -511,7 +880,7 @@ async function sendMessage() {
     const resp = await fetch('/chat/' + currentSession, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, goal: currentGoal }),
     });
 
     if (!resp.ok) {
@@ -668,7 +1037,13 @@ function fmtMs(v) {
   return v.toFixed(0) + 'ms';
 }
 
-loadSessions();
+(async function() {
+  _loadMessageHistory('default');
+  const sessions = await loadSessions();
+  const recent = sessions.find(s => s.message_count > 0);
+  if (recent) selectSession(recent.key);
+  else loadHistory('default');
+})();
 </script>
 </body>
 </html>

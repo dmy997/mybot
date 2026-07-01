@@ -34,6 +34,8 @@ class SpanEntry:
     status: str
     attributes: dict[str, Any]
     events: list[dict[str, Any]]
+    input: dict[str, Any] | None = None
+    output: dict[str, Any] | None = None
 
 
 class RecentStore:
@@ -74,6 +76,8 @@ class RecentStore:
             status=span.status,
             attributes=dict(span.attributes),
             events=list(span.events),
+            input=dict(span.input) if span.input else None,
+            output=dict(span.output) if span.output else None,
         ))
 
     def get_spans(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -90,6 +94,8 @@ class RecentStore:
                 "status": e.status,
                 "attributes": e.attributes,
                 "events": e.events,
+                "input": e.input,
+                "output": e.output,
             }
             for e in entries
         ]

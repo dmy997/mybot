@@ -180,6 +180,10 @@ class SessionManager:
         for path in sorted(self.sessions_dir.glob("*.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    result.append({"key": path.stem, "message_count": 0,
+                                   "error": f"unexpected type: {type(data).__name__}"})
+                    continue
                 result.append({
                     "key": data.get("key", path.stem),
                     "message_count": len(data.get("messages", [])),
