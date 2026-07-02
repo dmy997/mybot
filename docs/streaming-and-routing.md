@@ -31,7 +31,7 @@ LLMProvider.chat_stream_with_retry()  (providers/base.py:138-168)
   │  RetryableLLMError 时重新调用 chat_stream
   │
   ▼
-AgentCore._call_llm()  (core/runner.py:677-812)
+AgentCore._call_llm()  (core/runner.py:749-831)
   │  if spec.on_content_delta or spec.on_tool_call_delta or spec.on_thinking_delta:
   │      response = await provider.chat_stream_with_retry(
   │          on_content_delta=spec.on_content_delta,    ← 直接透传
@@ -69,7 +69,7 @@ AgentCore._call_llm()  (core/runner.py:677-812)
 │    └── finish() → 最终刷新，完整 Markdown 渲染                       │
 └──────────────────────────────────────────────────────────────────────┘
 
-┌─── HTTP/WS 路径 (orchestrator.py:517-564) ──────────────────────────┐
+┌─── HTTP/WS 路径 (orchestrator.py:541-656) ──────────────────────────┐
 │                                                                      │
 │  async def _on_delta(token):                                         │
 │      await bus_msg.outbound.put(OutboundMessage(                     │
@@ -125,7 +125,7 @@ if c or r or tc_list:
 
 ### 非流式降级
 
-`core/runner.py:707-727`
+`core/runner.py:793`
 
 当 `AgentInput` 没有设置任何流式回调时（如子 agent 内部调用），`_call_llm()` 自动走非流式路径：
 
@@ -229,11 +229,11 @@ class OutboundMessage:
 ```
 一次 HTTP POST /chat/session_abc 请求的完整时间线
 
-1. POST 到达 → chat_sse()  (server.py:128)
+1. POST 到达 → chat_sse()  (server.py:159)
    │
 2. 生成 cid = uuid4().hex  ("a1b2c3d4e5")
    │
-3. _ensure_serve_task("session_abc")  (server.py:114-119)
+3. _ensure_serve_task("session_abc")  (server.py:118-131)
    │  检查是否有活跃的 serve task，没有则创建：
    │  asyncio.create_task(orchestrator.serve(bus_msg, "session_abc"))
    │
@@ -242,13 +242,13 @@ class OutboundMessage:
         content="你好",
         source="http",
         correlation_id="a1b2c3d4e5",
-    ))                                   (server.py:149-156)
+    ))                                   (server.py:181-189)
    │
-5. Orchestrator.serve() 后台 task（从步骤 3 开始运行） (orchestrator.py:485-580)
+5. Orchestrator.serve() 后台 task（从步骤 3 开始运行） (orchestrator.py:541-656)
    │  inbound = await bus_msg.inbound("session_abc").get()
    │  取出 InboundMessage
    │
-   │  构造回调 (orchestrator.py:517-547)：
+   │  构造回调 (orchestrator.py:595-621)：
    │    _on_delta(token)        → outbound.put(OutboundMessage(..., "delta", token))
    │    _on_thinking(token)     → outbound.put(OutboundMessage(..., "thinking", token))
    │    _on_tool_start(name)    → outbound.put(OutboundMessage(..., "tool_start", name))
@@ -260,16 +260,16 @@ class OutboundMessage:
    │      session_key, content,
    │      on_delta=_on_delta,
    │      on_tool_start=_on_tool_start, ...
-   │  )                                (orchestrator.py:550-565)
+   │  )                                (orchestrator.py:625-641)
    │
-   │  发送最终消息 (orchestrator.py:566-575)：
+   │  发送最终消息 (orchestrator.py:642-648)：
    │  outbound.put(OutboundMessage(..., "final", {
    │      content, usage, stop_reason, paradigm, elapsed_ms
    │  }))
    │
    │  循环回步骤 5，等待下一条入站消息
    │
-6. event_stream() SSE 消费者（步骤 1 返回的 StreamingResponse） (server.py:146-198)
+6. event_stream() SSE 消费者（步骤 1 返回的 StreamingResponse） (server.py:178-236)
    │  while True:
    │    out = await bus_msg.outbound.get()
    │    if out.correlation_id != "a1b2c3d4e5": continue  ← 过滤其他请求

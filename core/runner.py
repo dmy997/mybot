@@ -91,7 +91,7 @@ _STALL_WARNING_RATIO = 0.75  # fraction of max_iterations at which stall warning
 _CHECKPOINT_VERSION = 1
 
 # Lightweight compaction (fallback when CompactionService is not injected)
-_LW_COMPACT_MAX_TOKENS = 128_000
+_LW_COMPACT_MAX_TOKENS = 200_000
 _LW_COMPACT_TRIGGER_RATIO = 0.8
 _LW_COMPACT_KEEP_TURNS = 2
 _LW_COMPACT_SUMMARY_CHARS = 200

@@ -152,7 +152,7 @@ class TestConsolidator:
     @pytest.mark.asyncio
     async def test_maybe_consolidate_idle_when_under_budget(self, store, mock_provider, session):
         """When token estimate is under budget, no consolidation happens."""
-        c = Consolidator(store, mock_provider, "test-model", context_window_tokens=128_000)
+        c = Consolidator(store, mock_provider, "test-model", context_window_tokens=200_000)
         result = await c.maybe_consolidate(session, build_messages_fn=None)
         assert result is False
         mock_provider.chat_with_retry.assert_not_called()
@@ -160,7 +160,7 @@ class TestConsolidator:
     @pytest.mark.asyncio
     async def test_maybe_consolidate_skips_when_no_provider(self, store, session):
         """No consolidation when provider is None."""
-        c = Consolidator(store, provider=None, context_window_tokens=128_000)
+        c = Consolidator(store, provider=None, context_window_tokens=200_000)
         result = await c.maybe_consolidate(session, build_messages_fn=None)
         assert result is False
 

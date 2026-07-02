@@ -113,10 +113,19 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
 
     # Per-session serve tasks (lazy-started on first request)
     _serve_tasks: dict[str, asyncio.Task[None]] = {}
+    _serve_lock = asyncio.Lock()
 
     async def _ensure_serve_task(session_key: str) -> None:
         """Start a serve() background task for *session_key* if not already running."""
-        if session_key not in _serve_tasks or _serve_tasks[session_key].done():
+        task = _serve_tasks.get(session_key)
+        if task is not None and not task.done():
+            return  # fast path — no lock needed
+
+        async with _serve_lock:
+            # Re-check under lock to prevent TOCTOU race
+            task = _serve_tasks.get(session_key)
+            if task is not None and not task.done():
+                return
             _serve_tasks[session_key] = asyncio.create_task(
                 orchestrator.serve(bus_msg, session_key)
             )
@@ -460,6 +469,7 @@ def main() -> None:
     orchestrator = Orchestrator(
         workspace=Config.workspace,
         provider=provider,
+        max_context_tokens=Config.context_window,
         compress_model=Config.light_model,
     )
 

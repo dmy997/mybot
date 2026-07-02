@@ -123,16 +123,16 @@ class OutboundMessage:
 1. 客户端发起请求
 ═══════════════════════════════════════════════════════════════════════════
 
-HTTP: POST /chat/{session_id}  →  chat_sse()           (server.py:128)
-WS:   {"type":"chat", ...}     →  ws_endpoint()        (server.py:238)
+HTTP: POST /chat/{session_id}  →  chat_sse()           (server.py:159)
+WS:   {"type":"chat", ...}     →  ws_endpoint()        (server.py:284)
 
    ├── 认证检查: _check_auth(request) / _ws_check_auth(headers)
    │     MYBOT_API_KEY 为空 → 跳过认证
    │     MYBOT_API_KEY 设置 → 校验 Authorization: Bearer <key>
    │
-   ├── 生成 correlation_id = uuid4().hex                  (server.py:144)
+   ├── 生成 correlation_id = uuid4().hex                  (server.py:176)
    │
-   ├── _ensure_serve_task(session_id)                     (server.py:114-119)
+   ├── _ensure_serve_task(session_id)                     (server.py:118-131)
    │     if session_id not in _serve_tasks or _serve_tasks[session_id].done():
    │         _serve_tasks[session_id] = asyncio.create_task(
    │             orchestrator.serve(bus_msg, session_id)
@@ -144,13 +144,13 @@ WS:   {"type":"chat", ...}     →  ws_endpoint()        (server.py:238)
            source="http" | "websocket",
            correlation_id=cid,
            model=..., temperature=...,
-       ))
+       ))                                     (server.py:181-189)
 
 ═══════════════════════════════════════════════════════════════════════════
 2. Orchestrator.serve() 消费入站消息
 ═══════════════════════════════════════════════════════════════════════════
 
-Orchestrator.serve(bus_msg, session_key)                 (orchestrator.py:487-587)
+Orchestrator.serve(bus_msg, session_key)                 (orchestrator.py:541-656)
 
   while self._running:
       inbound = await bus_msg.inbound(session_key).get()   # 阻塞等待
@@ -176,7 +176,7 @@ Orchestrator.serve(bus_msg, session_key)                 (orchestrator.py:487-58
 3. 消费者从共享 outbound 队列读取
 ═══════════════════════════════════════════════════════════════════════════
 
-SSE event_stream():                                      (server.py:159-195)
+SSE event_stream():                                      (server.py:178-236)
   while True:
       out = await bus_msg.outbound.get()
       if out.correlation_id != cid: continue    ← 过滤其他请求
@@ -187,7 +187,7 @@ SSE event_stream():                                      (server.py:159-195)
       if out.msg_type == "final":     → SSE event: done → break
       if out.msg_type == "error":     → SSE event: error → break
 
-WS _run():                                               (server.py:269-287)
+WS _run():                                               (server.py:301-360)
   while True:
       out = await bus_msg.outbound.get()
       if out.correlation_id != cid: continue    ← 相同过滤逻辑
@@ -232,7 +232,7 @@ WS _run():                                               (server.py:269-287)
 
 ## Serve Task 生命周期管理
 
-`core/server.py:112-119`
+`core/server.py:118-131`
 
 ```python
 # 模块级字典（create_app() 闭包内）
@@ -252,7 +252,7 @@ async def _ensure_serve_task(session_key: str) -> None:
 
 ### serve() 内部循环
 
-`core/orchestrator.py:529-630`
+`core/orchestrator.py:541-656`
 
 ```python
 async def serve(self, bus_msg: MessageBus, session_key: str):
@@ -300,18 +300,18 @@ class SessionManager:
 |---------|----------|---------|
 | `ContextManager.save_exchange()` | `context_manager.py:473` | 每次 process_message() 成功后 |
 | `ContextManager.save_session()` | `context_manager.py:491` | 替换整个消息列表 |
-| `CompactionService.auto_compact()` | `compaction.py:254` | 空闲/运行时压缩 |
-| `CompactionService.full_compact()` | `compaction.py:322` | 用户触发压缩 |
-| `Orchestrator.process_message()` | `orchestrator.py:340,350` | CancelledError/KeyboardInterrupt 时保存部分状态 |
+| `CompactionService.auto_compact()` | `compaction.py:187` | 空闲/运行时压缩 |
+| `CompactionService.full_compact()` | `compaction.py:276` | 用户触发压缩 |
+| `Orchestrator.process_message()` | `orchestrator.py:379,389` | CancelledError/KeyboardInterrupt 时保存部分状态 |
 
 ### 其他锁机制
 
 | 锁 | 位置 | 粒度 | 作用 |
 |----|------|------|------|
 | SessionManager._write_locks | `session.py:45` | per-session | 保护会话数据写入 |
-| Consolidator._locks | `consolidator.py:69` | per-session | 防止重复合并 |
+| Consolidator._locks | `consolidator.py:70` | per-session | 防止重复合并 |
 | Provider._client_lock | `openai_compatible_provider.py:64` | 全局（单例） | 保护 AsyncOpenAI 客户端惰性初始化 |
-| CronScheduler._locks | `cron.py:215` | per-job | 防止 cron job 并发执行 |
+| CronScheduler._locks | `cron.py:78` | per-job | 防止 cron job 并发执行 |
 | EventBus._lock | `events.py:190` | 全局 | 保护订阅者列表修改 |
 
 ### 读取不加锁
@@ -354,7 +354,7 @@ def get_session_history(self, key: str) -> list[dict]:
 
 ## 共享 Outbound 队列的竞态条件
 
-`core/server.py:160-164`
+`core/server.py:192-197`
 
 ```python
 # 所有消费者都从同一个共享队列读取
@@ -375,7 +375,7 @@ while True:
 
 ## WebSocket 的请求取消
 
-`core/server.py:323-328`
+`core/server.py:373-388`
 
 ```python
 # ws_endpoint() 中

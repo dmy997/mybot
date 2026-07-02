@@ -101,9 +101,9 @@ class TokenBudget:
 
     # 四级阈值（计算属性）
     effective_window: int                  # context_window - max_output_tokens
-    warning_threshold: int                 # effective_window - 20_000
-    auto_compact_threshold: int            # effective_window - 13_000
-    block_threshold: int                   # effective_window - 3_000
+    warning_threshold: int                 # effective_window * (1 - 0.11)
+    auto_compact_threshold: int            # effective_window * (1 - 0.072)
+    block_threshold: int                   # effective_window * (1 - 0.017)
 
     # 各阶段截断限制
     history_tool_result_max_chars: int = 4_000  # 历史工具结果（micro_compact 使用）
@@ -182,7 +182,7 @@ Consolidator 负责**跨会话的事实提取和 LLM 摘要**（`memory/history.
 ```python
 class Consolidator:
     def __init__(self, store, provider=None, model="", *,
-                 context_window_tokens=128_000, consolidation_ratio=0.7): ...
+                 context_window_tokens=200_000, consolidation_ratio=0.7): ...
 
     async def maybe_consolidate(session, build_messages_fn=None) -> bool:
         """Token 预算检查 → LLM 摘要 → memory/history.jsonl"""
@@ -230,6 +230,156 @@ async def save_exchange(self, session_key, user_input, assistant_messages, *,
 1. assistant 发出了 tool_call 但 agent 在工具执行前崩溃 → 补全 tool_result
 2. 工具正在执行时中断 → 补全结果
 3. 收到 user 输入但 agent 还未响应 → 追加中断提示
+
+## 代码调用链
+
+### 请求入口：完整上下文组装
+
+```
+Orchestrator.process_message()                          # orchestrator.py:269
+  │
+  ├── 确定 skill 列表                                  # orchestrator.py:311
+  │     active_skills = list(skills or [])
+  │
+  ├── messages = await self.ctx.build_messages(         # orchestrator.py:317
+  │       session_key, user_input,
+  │       tools=self._tools,
+  │       skills=active_skills or None,
+  │   )
+  │
+  └── spec = AgentInput(init_messages=messages, ...)     # orchestrator.py:358
+        └── self._runner.run(spec)                      # orchestrator.py:388
+```
+
+### ContextManager.build_messages() — 消息组装与压缩
+
+```
+ContextManager.build_messages()                          # context_manager.py:295
+  │
+  ├── 1. _repair_messages(session_messages)              # context_manager.py:305 → :713
+  │     检测 3 种中断模式：未匹配 tool_call / 中断的工具执行 / 未响应的用户输入
+  │
+  ├── 2. micro_compact(session_messages, ...)            # context_manager.py:306
+  │     └── CompactionService.micro_compact()            # compaction.py:111
+  │           三步规则压缩：清除旧工具结果 / 移除孤立 tool_result / 补全缺失 tool_result
+  │
+  ├── 3. 过滤历史中的 system 角色消息                     # context_manager.py:308-311
+  │
+  ├── 4. 按 TokenBudget 截断历史工具结果和参数             # context_manager.py:313-325
+  │     使用 budget.history_tool_result_max_chars (4_000)
+  │     使用 budget.tool_call_args_max_chars (10_000)
+  │
+  ├── 5. _build_system_prompt(session_key, tools, skills, query, messages)
+  │     │                                                # context_manager.py:345 → :524
+  │     │
+  │     ├── Layer 1: _build_static_prompt(tools, skills) # context_manager.py:548 → :612
+  │     │     ├── 基础 system prompt 模板
+  │     │     ├── SkillsLoader.build_skills_summary()     # skills.py:111
+  │     │     ├── SkillsLoader.load_skills_for_context()  # skills.py:94
+  │     │     └── 工具列表（name + description）
+  │     │     # 无限期缓存，仅 _invalidate_static() 时重建
+  │     │
+  │     ├── Layer 2: _build_memory_context()              # context_manager.py:558 → :815
+  │     │     ├── store.read_soul()      → "Identity" 段落
+  │     │     ├── store.read_user()      → "User Profile" 段落
+  │     │     └── store.get_memory_context() → "Long-term Memory" 段落
+  │     │     # 按 (session, query_bucket) 缓存，remember/forget 时失效
+  │     │
+  │     ├── Dynamic: _extract_file_context(messages)      # context_manager.py:571 → :770
+  │     │     从最近消息中提取文件路径引用并读取
+  │     │
+  │     └── Dynamic: _build_history_context(max_entries=20, max_chars=16_000)
+  │           │                                          # context_manager.py:577 → :599
+  │           ├── store.get_dream_cursor()
+  │           ├── store.read_history(since_cursor=dream_cursor)
+  │           └── 格式化为 "Recent History" 段落（Dream 尚未处理的摘要）
+  │
+  ├── 6. 组装最终消息列表: [system, ...history, user]     # context_manager.py:356-408
+  │     preliminary = [{"role": "system", "content": ...}] + history + [{"role": "user": ...}]
+  │
+  └── 7. 多级 token 预算检查                              # context_manager.py:375-403
+        ├── > block_threshold → raise RuntimeError("Context length exceeds block threshold")
+        ├── > auto_compact_threshold → auto_compact()
+        │     └── CompactionService.auto_compact()        # compaction.py:187
+        │           ├── _adjust_split() → 对齐 tool_call/tool_result 边界
+        │           └── session.consolidated_cursor += N  # 推进游标（非破坏性）
+        └── > warning_threshold → logger.warning()
+```
+
+### 对话后持久化与 Consolidation
+
+```
+Orchestrator.process_message() 续                          # orchestrator.py:269
+  │
+  ├── ctx.save_exchange(session_key, user_input, assistant_msgs)
+  │     │                                                # orchestrator.py:411 → context_manager.py:473
+  │     ├── SessionManager.lock_session(session_key)      # session.py:102
+  │     │     └── asyncio.Lock — per-session 写锁
+  │     ├── session.messages.append(user_msg)
+  │     ├── session.messages.extend(assistant_msgs)
+  │     └── SessionManager.save_session(session)          # session.py:140
+  │           └── 原子写入 sessions/{key}.json (tmp + os.replace)
+  │
+  └── asyncio.create_task(_consolidate_and_prune())       # orchestrator.py:436
+        │
+        ├── if self.ctx.consolidator is not None:         # orchestrator.py:414
+        │     did = await consolidator.maybe_consolidate(  # consolidator.py:80
+        │         session, build_messages_fn=_build_fn
+        │     )
+        │     │
+        │     ├── 统计未归档消息 (session.messages[last_consolidated:])
+        │     ├── _estimate_message_tokens() → 与 token budget 比较
+        │     ├── 若超预算:
+        │     │   ├── _pick_boundary() → 对齐 user turn 边界  # consolidator.py:155
+        │     │   ├── archive(chunk) → LLM 摘要              # consolidator.py:188
+        │     │   │     ├── provider.chat_with_retry()
+        │     │   │     ├── store.append_history(summary)     # store.py:132
+        │     │   │     └── 异常降级: store.raw_archive()     # store.py:182
+        │     │   └── session.last_consolidated += boundary
+        │     └── 返回 True/False
+        │
+        └── if did: SessionManager.prune_archived_messages() # orchestrator.py:443
+              └── 删除 messages[:min(cursor, last_consolidated)]
+```
+
+### 空闲压缩
+
+```
+Orchestrator.serve() 循环                                # orchestrator.py:541
+  │
+  └── 1s 超时的 idle check                               # orchestrator.py:578
+        └── _compress_idle_sessions(session_key)           # orchestrator.py:491
+              │
+              └── if idle > idle_compress_seconds:         # token_budget.py:93 (300s)
+                    ctx.compress(session_key)               # context_manager.py:429
+                      └── CompactionService.auto_compact()  # compaction.py:187
+                            ├── consolidator.archive() → 旧消息 LLM 摘要 → history.jsonl
+                            └── session.consolidated_cursor += N
+```
+
+### TokenBudget 阈值计算链
+
+```
+Config (config.py)
+  ├── CONTEXT_WINDOW=200000         → Config.context_window
+  ├── MAX_OUTPUT_TOKENS=20000       → Config.max_output_tokens
+  ├── WARNING_BUFFER_RATIO=0.11     → Config.warning_buffer_ratio
+  ├── AUTOCOMPACT_BUFFER_RATIO=0.072 → Config.auto_compact_buffer_ratio
+  └── BLOCK_BUFFER_RATIO=0.017      → Config.block_buffer_ratio
+        │
+        ▼
+TokenBudget(context_window, max_output_tokens,              # token_budget.py:22
+            warning_buffer_ratio, auto_compact_buffer_ratio, block_buffer_ratio)
+  │
+  ├── effective_window = context_window - min(max_output_tokens, context_window * 0.1)
+  ├── warning_threshold = effective_window * (1.0 - warning_buffer_ratio)
+  ├── auto_compact_threshold = effective_window * (1.0 - auto_compact_buffer_ratio)
+  └── block_threshold = effective_window * (1.0 - block_buffer_ratio)
+        │
+        ▼
+ContextManager(token_budget=TokenBudget(...))               # orchestrator.py:139
+  └── CompactionService(token_budget=...)                   # compaction.py:83
+```
 
 ## 设计要点
 

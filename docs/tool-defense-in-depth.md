@@ -59,7 +59,7 @@ User / LLM 请求
 ### 入口：AgentCore 执行工具调用
 
 ```python
-# core/runner.py:913
+# core/runner.py:989
 async def _execute_tool_calls(self, tool_calls, spec, ...):
     for idx, tc in enumerate(tool_calls):
         # 调用 ToolRegistry.execute()
@@ -231,7 +231,7 @@ def _contains_dangerous_pattern(command: str) -> str | None:
     return None
 ```
 
-### 15 个危险正则模式（`tools/bash_tool.py:36-56`）
+### 15 个危险正则模式（`tools/bash_tool.py:36-58`）
 
 | # | 模式 | 拦截意图 |
 |---|------|----------|
@@ -370,7 +370,7 @@ Bubblewrap 创建的隔离容器具有以下安全属性：
 
 ### 环境变量白名单
 
-即使 L1 和 L2 被绕过，通过 `_build_sandbox_env()`（`tools/bash_tool.py:83-98`），环境变量也被严格限制：
+即使 L1 和 L2 被绕过，通过 `_build_sandbox_env()`（`tools/bash_tool.py:83-99`），环境变量也被严格限制：
 
 ```python
 _ALLOWED_ENV_KEYS = frozenset({
@@ -494,16 +494,16 @@ SandboxBackend.execute(command, cwd=..., env=..., timeout=...)
 
 | 文件 | 职责 |
 |------|------|
-| `core/runner.py:913-1057` | AgentCore._execute_tool_calls() — 工具调用入口 |
+| `core/runner.py:989-1142` | AgentCore._execute_tool_calls() — 工具调用入口 |
 | `tools/registry.py:55-78` | ToolRegistry.execute() — L1 注入点 |
-| `tools/guard.py:224-259` | ToolGuard.pre_check() — L1 校验逻辑 |
+| `tools/guard.py:224-260` | ToolGuard.pre_check() — L1 校验逻辑 |
 | `tools/guard.py:264-278` | _check_command_injection() — 命令注入检测 |
 | `tools/guard.py:280-297` | _check_ssrf() — SSRF 检测 |
 | `tools/guard.py:299-303` | _check_sensitive_path() — 路径安全检测 |
 | `tools/bash_tool.py:102-111` | _contains_dangerous_pattern() — L2 校验逻辑 |
-| `tools/bash_tool.py:36-56` | _DANGEROUS_PATTERNS — L2 正则模式定义 |
+| `tools/bash_tool.py:36-58` | _DANGEROUS_PATTERNS — L2 正则模式定义 |
 | `tools/bash_tool.py:62-67` | _BLOCKED_SUBSTRINGS — L2 子串黑名单 |
-| `tools/bash_tool.py:83-98` | _build_sandbox_env() — 环境变量白名单 |
+| `tools/bash_tool.py:83-99` | _build_sandbox_env() — 环境变量白名单 |
 | `tools/sandbox/base.py` | SandboxBackend ABC + SandboxResult |
 | `tools/sandbox/none.py` | NoSandbox — 无隔离后端 |
 | `tools/sandbox/bubblewrap.py` | BubblewrapSandbox — bwrap 容器隔离 |

@@ -119,31 +119,132 @@ def _build_chain(mw_methods, handler, ctx):
 
 这构建了 `mw[0](ctx, lambda: mw[1](ctx, lambda: ... handler(ctx)))` 的嵌套调用链。每个中间件在其 lambda 前后添加自己的逻辑。
 
-## 在 AgentCore 中的集成
+## 代码调用链
 
-`core/runner.py` 在五个位置调用中间件：
+### 中间件完整执行流（AgentCore.run() 内）
+
+```
+AgentCore.run()                                          # core/runner.py:264
+  │
+  ├─ MiddlewareChain.__init__(middlewares)               # core/middleware.py:131
+  │   └─ self._middlewares = list(middlewares or [])
+  │
+  ├─ ctx = MiddlewareContext(                            # core/runner.py:280
+  │       messages=msgs, session_key=session_key, step_count=0
+  │   )
+  │
+  ├─ [1] await mw.run_agent_start(ctx)                  # core/runner.py:294
+  │   └─ for mw in self._middlewares:                   # core/middleware.py:143-145
+  │       await mw.on_agent_start(ctx)                   #   顺序执行，无 call_next
+  │
+  ├─ while step_count < max_iterations:                  # core/runner.py:310
+  │   │
+  │   ├─ ctx.step_count = step_count
+  │   │
+  │   ├─ [2] should_continue = await mw.run_agent_step(  # core/runner.py:335
+  │   │       ctx, _step_handler
+  │   │   )
+  │   │   └─ self._build_chain(                          # core/middleware.py:158-160
+  │   │       [mw.on_agent_step for mw in middlewares],
+  │   │       handler, ctx
+  │   │     )
+  │   │       └─ _dispatch(_i=0)                         # core/middleware.py:196-202
+  │   │           ├─ mw[0].on_agent_step(ctx, lambda: _dispatch(_i=1))
+  │   │           │   ├─ 前置逻辑（检查步数/条件）
+  │   │           │   ├─ await call_next(ctx) → _dispatch(_i=1)
+  │   │           │   │   ├─ mw[1].on_agent_step(ctx, lambda: _dispatch(_i=2))
+  │   │           │   │   │   └─ ... → _dispatch(_i=N)
+  │   │           │   │   │       └─ await handler(ctx)  ← 实际 handler
+  │   │           │   │   │           # handler = _step_handler，即 AgentCore 的步进逻辑
+  │   │           │   │   └─ 后置逻辑
+  │   │           │   └─ 后置逻辑
+  │   │           │
+  │   │   if not should_continue:                        # core/runner.py:336
+  │   │       await mw.run_agent_end(ctx, output)         # core/runner.py:344
+  │   │       return output                               #   中间件中止循环
+  │   │
+  │   ├─ [3] response = await mw.run_llm_call(           # core/runner.py:368
+  │   │       ctx, _llm_handler
+  │   │   )
+  │   │   └─ self._build_chain(                          # core/middleware.py:167-169
+  │   │       [mw.on_llm_call for mw in middlewares],
+  │   │       handler, ctx
+  │   │     )
+  │   │       └─ _dispatch(_i=0)
+  │   │           ├─ mw[0].on_llm_call(ctx, lambda: _dispatch(_i=1))
+  │   │           │   ├─ 修改 ctx.messages / ctx.model / ctx.temperature 等
+  │   │           │   ├─ await call_next(ctx) → ... → handler(ctx)
+  │   │           │   │   # handler = _llm_handler → provider.chat() 实际调用
+  │   │           │   └─ 检查/修改 ctx.llm_response
+  │   │           └─ 返回 LLMResponse
+  │   │
+  │   │   若 LLM 返回 tool_calls:
+  │   │   │
+  │   │   ├─ [4] result = await mw.run_tool_execute(     # core/runner.py:1039
+  │   │   │       ctx, _tool_handler
+  │   │   │   )
+  │   │   │   └─ self._build_chain(                      # core/middleware.py:176-178
+  │   │   │       [mw.on_tool_execute for mw in middlewares],
+  │   │   │       handler, ctx
+  │   │   │     )
+  │   │   │       └─ _dispatch(_i=0)
+  │   │   │           ├─ mw[0].on_tool_execute(ctx, lambda: _dispatch(_i=1))
+  │   │   │           │   ├─ 检查 ctx.tool_name / ctx.tool_arguments
+  │   │   │           │   ├─ await call_next(ctx) → handler(ctx)
+  │   │   │           │   │   # handler = _tool_handler → tool.execute() 实际执行
+  │   │   │           │   └─ 检查/缓存/替换 ctx.tool_result
+  │   │   │           └─ 返回 ToolResult
+  │   │   │
+  │   │   └─ 将 tool_result 反馈给 LLM → 回到 [3]
+  │   │
+  │   └─ step_count += 1
+  │
+  ├─ [5] await mw.run_agent_end(ctx, output)             # core/runner.py:434/458
+  │   └─ for mw in self._middlewares:                   # core/middleware.py:147-151
+  │       await mw.on_agent_end(ctx, output)              #   顺序执行，无 call_next
+  │
+  └─ return output
+
+异常路径:
+  except Exception:                                      # core/runner.py:465
+      await mw.run_agent_end(ctx, None)                   # core/runner.py:472
+      raise
+```
+
+### _build_chain 嵌套闭包原理
+
+`core/middleware.py:185-202`
+
+注册 3 个中间件 `[A, B, C]` 时，`_build_chain` 构建等价于：
 
 ```python
-# 1. Agent 启动（跳过断点恢复时）
-if _checkpoint is None:
-    await mw.run_agent_start(ctx)
+await A.on_llm_call(ctx, lambda ctx:
+    await B.on_llm_call(ctx, lambda ctx:
+        await C.on_llm_call(ctx, lambda ctx:
+            await handler(ctx)    # ← 实际 LLM 调用在最内层
+        )
+    )
+)
+```
 
-# 2. Agent 步骤（可中止循环）
-should_continue = await mw.run_agent_step(ctx, _step_handler)
-if not should_continue:
-    # 中间件要求停止
-    output = AgentOutput(...)
-    await mw.run_agent_end(ctx, output)
-    return output
+每个中间件在 `call_next` 前后添加自己的逻辑。`call_next` 是下一层闭包的入口。中间件可以选择不调用 `call_next` 来短路整个链（如缓存命中时直接返回缓存结果）。
 
-# 3. LLM 调用（包装请求/响应）
-response = await mw.run_llm_call(ctx, _llm_handler)
+### 五种钩子的调用时机总览
 
-# 4. 工具执行（包装执行）
-result = await mw.run_tool_execute(ctx, _tool_handler)
+```
+AgentCore.run() 时间线
+═══════════════════════════════════════════════════════════════
 
-# 5. Agent 结束
-await mw.run_agent_end(ctx, output)
+  on_agent_start ─── 一次 ─── 循环开始前（断点恢复时跳过）
+  │
+  ┌─ while loop ─────────────────────────────────────────┐
+  │  on_agent_step ─── 每次迭代开始                       │
+  │  on_llm_call    ─── LLM API 调用（可能多次 tool call）│
+  │  on_tool_execute ─ 每个 tool call 一次                │
+  │  ...                                                  │
+  └──────────────────────────────────────────────────────┘
+  │
+  on_agent_end ─── 一次 ─── 循环结束后（含异常）
 ```
 
 ## 典型用例

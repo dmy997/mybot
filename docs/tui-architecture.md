@@ -598,6 +598,213 @@ orchestrator.main()
 
 `ChatApp._run_chat()` 通过 `self._orche.process_message()` 调用 Orchestrator，传入 8 个回调函数。Orchestrator 内部的路由（Dispatcher → Agent.run → AgentCore.run → LLM chat_stream）完全透明，TUI 只关心回调接口。
 
+## 代码调用链
+
+### 应用启动
+
+```
+orchestrator.main()                                      # orchestrator.py:725
+  │
+  ├── 解析 CLI 参数 (-c / --continue, --debug, --model)
+  ├── 创建 OpenAICompatibleProvider
+  ├── 创建 Orchestrator(workspace, provider, compress_model, log_config)
+  ├── 确定 session_key (-c 恢复 / 新建)
+  ├── 写入 .last_session
+  │
+  └── async def _run():                                  # orchestrator.py:758
+        ├── await orche.start_services()                  # cron + 事件总线
+        ├── app = ChatApp(orchestrator=orche,             # tui/app.py:62
+        │                 session_key=session_key,
+        │                 model=model, is_resumed=is_resumed)
+        ├── await app.run_async()                         # Textual App.run_async()
+        └── await orche.stop_services()
+```
+
+### ChatApp 初始化与 compose
+
+```
+ChatApp.__init__()                                       # app.py:62
+  │
+  ├── 存储 orchestrator, session_key, model, is_resumed
+  ├── 设置 CSS_PATH = "theme.css"
+  ├── 定义 BINDINGS:
+  │     ctrl+c → quit_or_copy, escape → cancel_message,
+  │     up/down → history_prev/next
+  │
+  └── compose()                                          # app.py:101
+        ├── Header (#header-bar)         dock: top
+        ├── VerticalScroll (#chat-area)  height: 1fr
+        │     └── banner (首次显示)
+        ├── SessionStatus (#session-status)  height: auto
+        ├── Horizontal (#input-area)     dock: bottom
+        │     └── Input (#user-input)
+        └── StatusFooter (#status-bar)   height: 1
+```
+
+### 用户输入处理 → Worker 启动
+
+```
+on_input_submitted(event: Input.Submitted)                # app.py:186
+  │
+  ├── text = event.value.strip()
+  ├── if /exit or /quit → _confirm_exit()
+  │     └── push_screen(ConfirmScreen(message), callback)
+  │           └── confirm → app.exit()
+  │
+  ├── if /xxx (slash command) → _handle_slash_command()   # app.py:210
+  │     ├── /clear  → push_screen(ConfirmScreen) → remove children
+  │     ├── /help   → mount info message
+  │     ├── /history → mount message count
+  │     └── /sessions → push_screen(SessionListScreen)
+  │
+  └── else (普通消息):
+        ├── _save_history(text)  # 持久化输入历史 (去重)
+        ├── input.disabled = True  # 防重复提交
+        ├── chat.mount(UserMessage(text))                # app.py:200
+        │     └── _Bubble → Panel(text, border_style="bright_blue") # widgets.py:121
+        ├── stream = StreamingMessage()                   # widgets.py:150
+        ├── chat.mount(stream)
+        ├── session_status.show("准备中...")              # widgets.py:261
+        │     └── _active=True, _redraw() → "● 准备中..."
+        └── self._run_chat(text, stream, chat)  ← @work  # app.py:228
+```
+
+### Worker 流式执行（@work exclusive）
+
+```
+@work(exclusive=True, group="chat")
+async def _run_chat(text, stream, chat)                   # app.py:228
+  │
+  │  # exclusive=True → 新消息自动取消旧 worker
+  │  # group="chat"    → action_cancel_message() 查找并取消
+  │
+  ├── _tool_count = 0
+  ├── _phase = "生成回复中..."
+  │
+  ├── 定义 _render_bar():                                # app.py:237
+  │     if _tool_count > 0:
+  │         bar.set_status(f"工具执行中 ({_tool_count})")
+  │     else:
+  │         bar.set_status(_phase)
+  │
+  ├── 定义 7 个流式回调 (闭包):
+  │     │
+  │     ├── _on_delta(token)                              # app.py:243
+  │     │     ├── _phase = "生成回复中..."
+  │     │     ├── _render_bar()
+  │     │     └── stream.add_token(token)                 # widgets.py:160
+  │     │           ├── _pending += token
+  │     │           ├── if now - _last_update >= 0.08     # 节流 ~12 FPS
+  │     │           │     or len(_pending) < 200:          # 初始快速显示
+  │     │           │     self.content = _pending          # reactive → watch_content
+  │     │           └── watch_content(content)             # widgets.py:169
+  │     │                 └── self.update(Markdown(content))
+  │     │
+  │     ├── _on_thinking(token)                           # app.py:254
+  │     │     ├── _phase = "思考中..."
+  │     │     └── _render_bar()
+  │     │
+  │     ├── _on_thinking_done()                           # app.py:260
+  │     │     ├── _phase = "生成回复中..."
+  │     │     └── _render_bar()
+  │     │
+  │     ├── _on_tool_start(name, args_brief)              # app.py:265
+  │     │     ├── _phase = "工具调用中..."
+  │     │     └── _render_bar()
+  │     │
+  │     ├── _on_tool_exec_start(name, args, idx, total)   # app.py:273
+  │     │     ├── _tool_count += 1
+  │     │     ├── _render_bar()  # "工具执行中 (N)"
+  │     │     └── stream.add_token(f"⚙ **{name}**({args})\n")
+  │     │           └── stream._refresh()  ← 强制立即渲染
+  │     │
+  │     ├── _on_tool_exec_end(ev)                         # app.py:289
+  │     │     ├── _tool_count -= 1
+  │     │     ├── _render_bar()
+  │     │     ├── if error: stream.add_token(f"✗ {detail}")
+  │     │     └── stream._refresh()
+  │     │
+  │     └── _on_new_turn()                                # app.py:301
+  │           ├── _phase = "生成回复中..."
+  │           ├── _render_bar()
+  │           └── stream.add_token("\n\n")
+  │
+  ├── try:
+  │     result = await self._orche.process_message(       # app.py:308
+  │         session_key, text, model=..., temperature=...,
+  │         on_delta=_on_delta,
+  │         on_thinking=_on_thinking,
+  │         on_thinking_done=_on_thinking_done,
+  │         on_tool_start=_on_tool_start,
+  │         on_tool_execute_start=_on_tool_exec_start,
+  │         on_tool_execute_end=_on_tool_exec_end,
+  │         on_new_turn=_on_new_turn,
+  │     )
+  │     │
+  │     └── Orchestrator.process_message()               # orchestrator.py:269
+  │           ├── ctx.build_messages(...)                  # 上下文组装
+  │           ├── Dispatcher.resolve() → Agent.run()       # 路由分发
+  │           │     └── AgentCore.run()                    # runner.py:264
+  │           │           └── LLM chat_stream → 逐 token 触发回调
+  │           └── ctx.save_exchange(...)                   # 持久化
+  │
+  │   except asyncio.CancelledError:
+  │       stream.add_token("\n\n*[cancelled]*\n")         # Escape 取消
+  │       return
+  │   except Exception as exc:
+  │       chat.mount(ErrorMessage(str(exc)))              # app.py:332
+  │       return
+  │   finally:
+  │       bar.hide()                                       # 折叠状态栏
+  │       input_w.disabled = False                         # 恢复输入
+  │       input_w.focus()
+  │
+  ├── stream.finish()                                     # app.py:339
+  │     └── self.content = self._pending  ← 刷新所有 pending token
+  │
+  └── StatusFooter.set_usage(...)                         # app.py:342
+        └── "Session: xxx  Tokens: N in / M out  3.2s  [react]"
+```
+
+### Worker 生命周期与取消
+
+```
+@work(exclusive=True, group="chat")
+  │
+  ├── 新消息到达 → Textual 自动取消旧 worker (exclusive=True)
+  │     └── old worker 抛出 asyncio.CancelledError → "[cancelled]" 提示
+  │
+  ├── Escape 键 → action_cancel_message()                # app.py:165
+  │     ├── 输入框有焦点 → 清空输入
+  │     └── 否则 → 遍历 workers, 取消 group="chat" 的 worker
+  │
+  └── app.exit() → 所有 workers 随事件循环停止
+```
+
+### 消息渲染数据流
+
+```
+LLM token stream (SSE)
+  │
+  ├── content delta → _on_delta(token) → stream._pending += token
+  │                                         │
+  │                                         ├── [节流通过] stream.content = _pending
+  │                                         │     └── reactive 触发 watch_content()
+  │                                         │           └── self.update(Markdown(content))
+  │                                         │                 └── Rich Markdown → Textual Widget
+  │                                         │
+  │                                         └── [0.15s 滚动节流] chat.scroll_end(animate=False)
+  │
+  ├── tool call → _on_tool_start() + _on_tool_exec_start()
+  │                 └── stream._refresh()  ← 绕过节流，立即渲染
+  │
+  ├── tool result → _on_tool_exec_end()
+  │                   └── stream._refresh()
+  │
+  └── stream.finish()
+        └── stream.content = _pending  ← 最终提交
+```
+
 ## 关键技术决策
 
 | 决策 | 原因 | 替代方案 |

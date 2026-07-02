@@ -59,7 +59,7 @@ class Consolidator:
         provider: LLMProvider | None = None,
         model: str = "",
         *,
-        context_window_tokens: int = 128_000,
+        context_window_tokens: int = 200_000,
         consolidation_ratio: float = 0.7,
     ):
         self.store = store
@@ -94,8 +94,14 @@ class Consolidator:
 
         session_key = getattr(session, "key", "default")
         lock = self._get_lock(session_key)
-        async with lock:
-            return await self._do_consolidate(session, build_messages_fn)
+        try:
+            async with lock:
+                return await self._do_consolidate(session, build_messages_fn)
+        except Exception:
+            logger.opt(exception=True).error(
+                "Consolidation failed for session {!r}", session_key,
+            )
+            return False
 
     async def _do_consolidate(
         self,
@@ -220,7 +226,13 @@ class Consolidator:
             return summary
         except Exception:
             logger.opt(exception=True).warning("Consolidation LLM call failed, raw-archiving")
-            self.store.raw_archive(messages, session_key=session_key)
+            try:
+                self.store.raw_archive(messages, session_key=session_key)
+            except Exception:
+                logger.opt(exception=True).error(
+                    "Raw archive also failed — {} messages for session {!r} may be lost",
+                    len(messages), session_key,
+                )
             return None
 
     # -- helpers --------------------------------------------------------------

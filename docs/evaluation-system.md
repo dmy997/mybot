@@ -272,3 +272,168 @@ class MyScorer(Scorer):
 2. `evaluator.py` — 实现 `Evaluator` 类（`evaluate(agent_factory, ...)` 方法）
 3. `metrics.py` — 实现 `Metrics` 类（`compute(results)` 方法）
 4. 在 `__main__.py` 的 `_run_benchmark()` 中注册
+
+## 代码调用链
+
+### Layer 1 — 自定义任务评估完整调用链
+
+```
+CLI: python -m evals [--paradigm react] [--task file_read_basic] [--output report.md]
+  │
+  └── main()                                             # __main__.py:284
+        ├── argparse 解析 (--paradigm, --task, --output, --json, --benchmark)
+        │
+        ├── [benchmark 路径] _run_benchmark(args)         # __main__.py:100
+        │     └── 见下方「Layer 2 — 社区基准调用链」
+        │
+        └── [自定义任务路径] _run_custom_tasks(args)      # __main__.py:56
+              │
+              ├── 1. discover_tasks(tasks_dir)             # runner.py:81
+              │     └── _load_task(yaml_path)              # runner.py:96
+              │           └── 解析 YAML → EvalTask 实例    # runner.py:43
+              │                 (id, category, description, prompt,
+              │                  expected_tools, expected_in_answer,
+              │                  max_steps, timeout_seconds)
+              │
+              ├── 2. _create_provider()                   # __main__.py:26
+              │     └── OpenAICompatibleProvider(config)   # 从 .env 读取
+              │
+              ├── 3. _create_tools()                      # __main__.py:39
+              │     └── ToolRegistry + discover_tools()   # tools/__init__.py
+              │
+              ├── 4. _run_agent(task, provider, tools, paradigm)
+              │     │                                      # runner.py:118
+              │     ├── ToolRegistry.register(tools)
+              │     ├── AgentCore(provider, workspace)
+              │     │     max_context_tokens=Config.context_window
+              │     ├── AgentInput(
+              │     │     init_messages=[system_prompt, user_prompt],
+              │     │     tools=registry,
+              │     │ )
+              │     ├── result = await core.run(spec)      # runner.py:264
+              │     │     │
+              │     │     └── AgentCore 主循环:
+              │     │           ├── _call_llm() → provider.chat_with_retry()
+              │     │           ├── _execute_tool_calls()  # runner.py:989
+              │     │           │     └── ToolRegistry.execute() → ToolGuard.pre_check()
+              │     │           └── return AgentOutput(content, tools_used, ...)
+              │     │
+              │     └── return {content, tools_used, tool_events,
+              │                 step_count, error}
+              │
+              ├── 5. CompositeScorer.score(task, output)   # scorers.py:134
+              │     │
+              │     ├── CompletionScorer.score()            # scorers.py:41
+              │     │     无 error → 1.0, 有 error → 0.0
+              │     ├── KeywordScorer.score()               # scorers.py:56
+              │     │     hits/expected 比例, ≥0.6 通过
+              │     ├── ToolSetScorer.score()               # scorers.py:85
+              │     │     Jaccard 相似度 (交集/并集), ≥0.5 通过
+              │     └── StepEfficiencyScorer.score()        # scorers.py:112
+              │           1 − steps/max_steps
+              │     └── 返回 list[ScoreResult(name, value, passed, detail)]
+              │
+              ├── 6. compute_overall(scores) → EvalResult  # scorers.py:144
+              │     加权平均各维度得分 → overall_score (0.0-1.0)
+              │
+              └── 7. 报告输出
+                    ├── TerminalReporter → ASCII 表格
+                    ├── MarkdownReporter → .md 文件
+                    └── JSON 导出 → .json 文件
+```
+
+### Layer 2 — 社区基准调用链
+
+```
+CLI: python -m evals --benchmark bfcl --category simple_python --max-samples 20
+  │
+  └── _run_benchmark(args)                                # __main__.py:100
+        │
+        ├── [BFCL]                                         # __main__.py:102-148
+        │     ├── _check_bfcl_data(data_dir)               # __main__.py:260
+        │     │     └── 检查 gorilla/bfcl_eval/data/ 是否存在
+        │     │
+        │     ├── BFCLLoader(data_dir)                     # benchmarks/bfcl/dataset.py
+        │     │     ├── load(category, max_samples)
+        │     │     └── load_ground_truth(category)
+        │     │
+        │     ├── agent_factory = lambda: _BFCLAgent(...)  # __main__.py:201
+        │     │     └── _BFCLAgent.run() → AgentCore.run()
+        │     │           └── _extract_content() → 提取响应用于 AST 匹配
+        │     │
+        │     ├── BFCLEvaluator(data_dir)
+        │     │     └── evaluate(agent_factory, category, max_samples)
+        │     │           ├── _extract_calls(response) → JSON 数组 / 代码块 / 正则回退
+        │     │           └── _ast_match(predicted, truth) → 集合比较 AST keys
+        │     │
+        │     └── BFCLMetrics.compute(results)
+        │           └── {overall_accuracy, category_accuracy, error_rate}
+        │
+        └── [GAIA]                                         # __main__.py:150-194
+              ├── GAIALoader(local_data_dir, split)
+              │     └── load(level, max_samples)
+              │           ├── _load_from_parquet()   # pyarrow 读取 metadata.parquet
+              │           └── _load_from_jsonl()     # 回退到 metadata.jsonl
+              │
+              ├── agent_factory = lambda: _GAIAAgent(...)  # __main__.py:227
+              │     └── _GAIAAgent.run() → AgentCore.run()
+              │           └── 提示词注入 "FINAL ANSWER: " 格式要求
+              │
+              ├── GAIAEvaluator(data_dir, split)
+              │     └── evaluate(agent_factory, level, max_samples)
+              │           ├── _extract_answer(response) → "FINAL ANSWER:" 格式提取
+              │           └── _quasi_exact_match(pred, exp) → 规范化后比较
+              │                 ├── 移除千分位逗号
+              │                 ├── 移除货币符号
+              │                 └── 去冠词 / 去标点 / 合并空格
+              │
+              └── GAIAMetrics.compute(results)
+                    └── {exact_match_rate, partial_match_rate, level_accuracy}
+```
+
+### pytest CI 集成调用链
+
+```
+pytest evals/ -v  [--live-eval]
+  │
+  └── conftest.py                                          # evals/conftest.py
+        ├── pytest_addoption(parser)
+        │     └── parser.addoption("--live-eval", ...)     # conftest.py:16
+        │
+        ├── pytest_generate_tests(metafunc)
+        │     ├── discover_tasks() → 参数化 task 列表
+        │     └── 为每个 task 生成 test 函数
+        │
+        └── test_*.py 执行:
+              ├── [CI 模式] 仅验证任务加载、数据结构、评分管线
+              │     └── 不调用 LLM，仅做 schema 校验
+              └── [--live-eval] 完整端到端执行
+                    └── _run_custom_tasks() → 完整 Layer 1 流程（同上）
+```
+
+### 核心数据类型关系
+
+```
+EvalTask (runner.py:43)                    ScoreResult (scorers.py:11)
+  ├── id: str                               ├── name: str
+  ├── category: str                         ├── value: float (0.0-1.0)
+  ├── description: str                      ├── passed: bool
+  ├── prompt: str                           └── detail: str
+  ├── expected_tools: list[str]
+  ├── expected_in_answer: list[str]        CompositeScorer (scorers.py:124)
+  ├── max_steps: int                         ├── scorers: list[Scorer]
+  └── timeout_seconds: int                   └── score(task, output) → list[ScoreResult]
+
+EvalResult (runner.py:59)                  compute_overall() (scorers.py:144)
+  ├── task_id: str                           └── weighted average → float
+  ├── category: str
+  ├── paradigm: str                         Scorer (ABC) (scorers.py:20)
+  ├── passed: bool                            ├── CompletionScorer
+  ├── overall_score: float                    ├── KeywordScorer
+  ├── scores: list[ScoreResult]               ├── ToolSetScorer
+  ├── tool_events: list[dict]                 ├── StepEfficiencyScorer
+  ├── tools_used: list[str]                   └── LLMJudgeScorer
+  ├── step_count: int
+  ├── content_preview: str
+  ├── duration_seconds: float
+  └── error: str | None

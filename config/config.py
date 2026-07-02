@@ -81,6 +81,43 @@ class Config:
     """Request timeout in seconds (``LLM_TIMEOUT``)."""
 
     # ------------------------------------------------------------------
+    # Context window
+    # ------------------------------------------------------------------
+
+    context_window: int = int(os.getenv("CONTEXT_WINDOW", "200000"))
+    """Main LLM context window in tokens (``CONTEXT_WINDOW``)."""
+
+    max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
+    """Tokens reserved for model output, subtracted from context window
+    (``MAX_OUTPUT_TOKENS``)."""
+
+    compress_ratio: float = float(os.getenv("COMPRESS_RATIO", "0.5"))
+    """Fraction of context window reserved for recent messages during
+    compression (``COMPRESS_RATIO``)."""
+
+    consolidation_ratio: float = float(os.getenv("CONSOLIDATION_RATIO", "0.7"))
+    """Fraction of context window that triggers background consolidation
+    (``CONSOLIDATION_RATIO``)."""
+
+    idle_compress_seconds: int = int(os.getenv("IDLE_COMPRESS_SECONDS", "300"))
+    """Seconds of inactivity before idle compression kicks in
+    (``IDLE_COMPRESS_SECONDS``, 0 = disabled)."""
+
+    warning_buffer_ratio: float = float(os.getenv("WARNING_BUFFER_RATIO", "0.11"))
+    """Fraction of effective_window reserved as warning buffer
+    (``WARNING_BUFFER_RATIO``)."""
+
+    auto_compact_buffer_ratio: float = float(
+        os.getenv("AUTOCOMPACT_BUFFER_RATIO", "0.072")
+    )
+    """Fraction of effective_window reserved as auto-compact buffer
+    (``AUTOCOMPACT_BUFFER_RATIO``)."""
+
+    block_buffer_ratio: float = float(os.getenv("BLOCK_BUFFER_RATIO", "0.017"))
+    """Fraction of effective_window reserved as block buffer
+    (``BLOCK_BUFFER_RATIO``)."""
+
+    # ------------------------------------------------------------------
     # Paths
     # ------------------------------------------------------------------
 
@@ -103,3 +140,13 @@ class Config:
             "LIGHT_MODEL_NAME", os.getenv("LLM_MODEL_ID", "deepseek/deepseek-v4-flash")
         )
         cls.timeout = int(os.getenv("LLM_TIMEOUT", "60"))
+        cls.context_window = int(os.getenv("CONTEXT_WINDOW", "200000"))
+        cls.max_output_tokens = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
+        cls.compress_ratio = float(os.getenv("COMPRESS_RATIO", "0.5"))
+        cls.consolidation_ratio = float(os.getenv("CONSOLIDATION_RATIO", "0.7"))
+        cls.idle_compress_seconds = int(os.getenv("IDLE_COMPRESS_SECONDS", "300"))
+        cls.warning_buffer_ratio = float(os.getenv("WARNING_BUFFER_RATIO", "0.11"))
+        cls.auto_compact_buffer_ratio = float(
+            os.getenv("AUTOCOMPACT_BUFFER_RATIO", "0.072")
+        )
+        cls.block_buffer_ratio = float(os.getenv("BLOCK_BUFFER_RATIO", "0.017"))

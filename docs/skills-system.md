@@ -99,48 +99,48 @@ Skills 的组装发生在**系统提示词构建阶段**，由 `ContextManager` 
 入口层
 ═══════════════════════════════════════════════════════════════════════════
 
-CLI (orchestrator.py:698-765)
+CLI (orchestrator.py:725-792)
   └── orche.process_message(session_key, user_input)
         # skills 参数未传入 → 默认为 None
         # ⚠️ 当前未调用 get_always_skills()
 
-HTTP/WS (orchestrator.py:529-630)
+HTTP/WS (orchestrator.py:541-656)
   └── orche.process_message(..., skills=msg.skills)
         # 从 InboundMessage 提取用户指定的 skill 列表
 
 ═══════════════════════════════════════════════════════════════════════════
-Orchestrator.process_message() — orchestrator.py:263-435
+Orchestrator.process_message() — orchestrator.py:267-466
 ═══════════════════════════════════════════════════════════════════════════
 
-line 274:  active_skills = list(skills or [])
+line 311:  active_skills = list(skills or [])
            # ⚠️ get_always_skills() 未接入，待实现
 
-line 279:  messages = await self.ctx.build_messages(
+line 315:  messages = await self.ctx.build_messages(
                session_key, user_input,
                tools=self._tools,
                skills=active_skills or None,   ← 传入 skills
            )
 
-line 311:  spec = AgentInput(init_messages=messages, ...)
+line 358:  spec = AgentInput(init_messages=messages, ...)
            # AgentInput 没有 skills 字段——skills 已烘焙进 system prompt
 
 ═══════════════════════════════════════════════════════════════════════════
 ContextManager.build_messages() — context_manager.py:295-408
 ═══════════════════════════════════════════════════════════════════════════
 
-line 326:  system_content = await self._build_system_prompt(
+line 345:  system_content = await self._build_system_prompt(
                session_key, tools=tools, skills=skills, query=current_input,
                messages=history,
            )
 
-line 354:  preliminary = (
+line 356:  preliminary = (
                [{"role": "system", "content": system_content}],  # ← skills 在此
            ) + history + (
                [{"role": "system", "content": lang_hint}] if lang_hint else []
            ) + [{"role": "user", "content": current_input}]
 
 ═══════════════════════════════════════════════════════════════════════════
-ContextManager._build_system_prompt() — context_manager.py:498-555
+ContextManager._build_system_prompt() — context_manager.py:524-597
 ═══════════════════════════════════════════════════════════════════════════
 
 三层缓存分区：
@@ -329,7 +329,7 @@ def get_always_skills(self) -> list[str]:
 **当前状态**：`get_always_skills()` 方法已实现，但 **尚未接入 Orchestrator**。`Orchestrator.process_message()` 中 skill 组装逻辑仅为：
 
 ```python
-# orchestrator.py:274
+# orchestrator.py:311
 active_skills = list(skills or [])  # 仅使用传入的 skills，未调用 get_always_skills()
 ```
 

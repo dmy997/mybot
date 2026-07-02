@@ -8,7 +8,7 @@ Reference: Claude Code's ``autoCompact.ts`` multi-threshold system.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -16,9 +16,6 @@ from dataclasses import dataclass, field
 
 _DEFAULT_CONTEXT_WINDOW = 200_000
 _DEFAULT_MAX_OUTPUT_TOKENS = 20_000
-_DEFAULT_AUTOCOMPACT_BUFFER = 13_000   # reserve for output
-_DEFAULT_WARNING_BUFFER = 20_000
-_DEFAULT_BLOCK_BUFFER = 3_000
 
 
 @dataclass
@@ -34,27 +31,34 @@ class TokenBudget:
     context_window: int = _DEFAULT_CONTEXT_WINDOW
     max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS
 
+    # -- ratio-based buffers (fraction of effective_window) ---------------------
+
+    warning_buffer_ratio: float = 0.11
+    auto_compact_buffer_ratio: float = 0.072
+    block_buffer_ratio: float = 0.017
+
     # -- four-tier thresholds (computed) ---------------------------------------
 
     @property
     def effective_window(self) -> int:
         """Usable context after reserving space for the model response."""
-        return self.context_window - min(self.max_output_tokens, 20_000)
+        cap = int(self.context_window * 0.1)
+        return self.context_window - min(self.max_output_tokens, cap)
 
     @property
     def warning_threshold(self) -> int:
         """Warn the user that context is getting full."""
-        return self.effective_window - _DEFAULT_WARNING_BUFFER
+        return int(self.effective_window * (1.0 - self.warning_buffer_ratio))
 
     @property
     def auto_compact_threshold(self) -> int:
         """Trigger automatic LLM summarisation."""
-        return self.effective_window - _DEFAULT_AUTOCOMPACT_BUFFER
+        return int(self.effective_window * (1.0 - self.auto_compact_buffer_ratio))
 
     @property
     def block_threshold(self) -> int:
         """Refuse to proceed until compaction runs."""
-        return self.effective_window - _DEFAULT_BLOCK_BUFFER
+        return int(self.effective_window * (1.0 - self.block_buffer_ratio))
 
     # -- truncation limits (unified — was scattered across 3 locations) --------
 

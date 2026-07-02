@@ -262,6 +262,125 @@ for idx, tc in serial_calls:
 
 结果按原始 tool_call 顺序追加到消息列表，确保与 LLM 期望的 `tool_call_id` 顺序一致。
 
+## 代码调用链
+
+### 工具自动发现 → 注册 → 导出
+
+```
+Orchestrator.__init__()                                  # core/orchestrator.py:92
+  │
+  ├─ tools_dict = discover_tools(workspace)               # tools/__init__.py
+  │   └─ for module_info in pkgutil.iter_modules([tools_dir]):
+  │       ├─ 跳过 _ 开头模块 + tool/registry/subagent/memory_tools
+  │       ├─ module = importlib.import_module(f"tools.{name}")
+  │       ├─ for cls_name, cls in inspect.getmembers(module, inspect.isclass):
+  │       │   if issubclass(cls, Tool) and cls is not Tool and cls.name:
+  │       │       kwargs = _build_init_kwargs(cls, workspace, timeout)
+  │       │       instance = cls(**kwargs)                #   实例化工具
+  │       │       tools[instance.name] = instance
+  │       └─ return tools                                 #   dict[str, Tool]
+  │
+  ├─ registry = ToolRegistry(guard=ToolGuard(...))        # core/orchestrator.py
+  │   └─ for tool in tools_dict.values():
+  │       registry.register(tool)                         # tools/registry.py
+  │
+  └─ ContextManager._build_system_prompt()                # context/context_manager.py:524
+      └─ tools = registry.get_definitions_for_scope(scope) #   tools/registry.py
+          └─ [t.to_openai_schema() for t in self.for_scope(scope)]
+              └─ {"type": "function", "function": {
+                      "name": t.name,
+                      "description": t.description,
+                      "parameters": t.parameters,
+                  }}
+```
+
+### 工具执行全链路（从 AgentCore 到 Tool.execute）
+
+```
+AgentCore._execute_tool_calls(tool_calls, tools)          # core/runner.py:989
+  │
+  ├─ 分组:                                                # core/runner.py:994-1001
+  │   parallel_group = [(i, tc) for i, tc in enumerate(tool_calls)
+  │                     if tools.get(tc.name).parallel]
+  │   serial_calls  = [(i, tc) for i, tc in enumerate(tool_calls)
+  │                    if not tools.get(tc.name).parallel]
+  │
+  ├─ 并行执行 (asyncio.gather):                           # core/runner.py:1003-1039
+  │   tasks = [_exec_one(tc) for _, tc in parallel_group]
+  │   raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+  │   │
+  │   └─ _exec_one(tc):                                   # core/runner.py:901
+  │       ├─ ctx.tool_name = tc.name                      #   填充 MiddlewareContext
+  │       ├─ ctx.tool_arguments = json.loads(tc.arguments)
+  │       ├─ result = await mw.run_tool_execute(           # core/runner.py:1039
+  │       │       ctx, _tool_handler
+  │       │   )
+  │       │   └─ 中间件链 → _tool_handler(ctx)             # core/runner.py:897-899
+  │       │       └─ registry.execute(ctx.tool_name,       # tools/registry.py:55
+  │       │               ctx.tool_arguments)
+  │       │           ├─ tool = self._tools.get(name)      #   查找工具
+  │       │           ├─ if tool is None:                  #   未知工具
+  │       │           │     return ToolResult(success=False, error=...)
+  │       │           ├─ if guard is not None:             #   ToolGuard 预检查
+  │       │           │     allowed, reason = guard.pre_check(
+  │       │           │         tool.name, tool.capabilities, arguments
+  │       │           │     )
+  │       │           │     if not allowed:                #   安全检查拒绝
+  │       │           │         return ToolResult(success=False, error=reason)
+  │       │           ├─ try:
+  │       │           │     return await tool.execute(**arguments)  # 实际执行
+  │       │           └─ except Exception as exc:
+  │       │                 return ToolResult(success=False,          # 异常隔离
+  │       │                     error=f"Tool '{name}' raised: {exc}")
+  │       └─ ctx.tool_result = result
+  │
+  ├─ 结果收集:                                            # core/runner.py:1022-1039
+  │   for (idx, tc), raw in zip(parallel_group, raw_results):
+  │       if isinstance(raw, BaseException):
+  │           result = ToolResult(success=False, error=f"Tool raised: {raw}")
+  │       else:
+  │           result, duration_ms = raw
+  │       results[idx] = (tc, result)                     #   按原始索引存放
+  │
+  └─ 串行执行:                                            # core/runner.py:1078-1090
+      for idx, tc in serial_calls:
+          result, duration_ms = await _exec_one(tc)        #   逐个执行
+          results[idx] = (tc, result)
+```
+
+### ToolGuard 安全检查分发
+
+```
+ToolGuard.pre_check(tool_name, capabilities, arguments)   # tools/guard.py
+  │
+  ├─ if Capability.SHELL in capabilities:                  #   命令注入检测
+  │   cmd = arguments.get("command", "")
+  │   if not _check_command_injection(cmd):
+  │       return False, "Command injection detected in: ..."
+  │   └─ _check_command_injection(cmd):
+  │       扫描 9 种注入模式 ($()、反引号、${}、/dev/tcp/、echo \x、nc -e 等)
+  │       特殊处理: << 'EOF' heredoc 正文先剥离再检测
+  │
+  ├─ if Capability.NETWORK in capabilities:               #   SSRF 检测
+  │   for key, value in _extract_strings(arguments):
+  │       urls = re.findall(r"https?://[^\s]+", value)
+  │       for url in urls:
+  │           host = urlparse(url).hostname
+  │           if host in _SSRF_BLOCKED_HOSTS:              #   localhost, 169.254.169.254...
+  │               return False, f"SSRF blocked: {host}"
+  │           if ip in _SSRF_BLOCKED_CIDRS:                #   10.0.0.0/8, 172.16.0.0/12...
+  │               return False, f"SSRF blocked: {host}"
+  │
+  └─ if {FILE_READ, FILE_WRITE} & capabilities:            #   敏感路径检测
+      path = arguments.get("path", "")
+      if _check_sensitive_path(path):
+          return False, f"Sensitive path blocked: {path}"
+      └─ _check_sensitive_path(path):
+          检查扩展名: .env, .pem, .key, .p12, .pfx, .jks, .keystore
+          检查路径模式: .git/, .ssh/, credentials, secret, password, token
+          精确匹配: .env, .env.local, .env.production 等
+```
+
 ## 设计要点
 
 - **零知识新增**: 添加不需要能力的工具只需设置 name/description/parameters + 实现 execute

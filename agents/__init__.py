@@ -26,11 +26,16 @@ def discover_agents(
 
     Returns a dict suitable for passing to :class:`~core.dispatcher.Dispatcher`.
     """
+    from config import Config
     from core.runner import AgentCore
 
     agents: dict[str, BaseAgent] = {}
     agents_dir = Path(__file__).parent
-    core = AgentCore(provider, middleware=middleware)
+    core = AgentCore(
+        provider,
+        middleware=middleware,
+        max_context_tokens=Config.context_window,
+    )
 
     for module_info in pkgutil.iter_modules([str(agents_dir)]):
         if module_info.name.startswith("_"):

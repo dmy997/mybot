@@ -147,7 +147,7 @@ store.set_dream_cursor(cursor)
 ```python
 class Consolidator:
     def __init__(self, store, provider=None, model="", *,
-                 context_window_tokens=128_000, consolidation_ratio=0.7): ...
+                 context_window_tokens=200_000, consolidation_ratio=0.7): ...
 
     async def maybe_consolidate(self, session, build_messages_fn=None) -> bool:
         """检查 token 预算，超出阈值则压缩."""
@@ -263,6 +263,106 @@ def _build_history_context(self, max_entries=20, max_chars=16_000) -> str:
     entries = self.store.read_history(since_cursor=dream_cursor)
     # 格式化最近的摘要条目，注入提示词
 ```
+
+## 6. 代码调用链
+
+### 6.1 系统启动：记忆系统初始化
+
+```
+Orchestrator.__init__()                               # core/orchestrator.py:92
+  ├─ MemoryStore(workspace)                           # memory/store.py:28
+  │   ├─ _ensure_dir("memory/")
+  │   └─ _ensure_dir("cron/")
+  ├─ ctx = ContextManager(workspace, store, provider)
+  ├─ Consolidator(store, provider, model)             # memory/consolidator.py:37
+  ├─ Dream(store, provider, model)                    # memory/dream.py:41
+  ├─ cron = CronScheduler(state_dir, on_job=...)      # services/cron.py:58
+  │   └─ register_job("dream", interval_hours=2)      # services/cron.py:84
+  └─ await cron.start()                               # services/cron.py:122
+      └─ _arm_timer() → sleep → _on_timer() loop      # services/cron.py:168→195
+```
+
+### 6.2 对话后 Consolidation（实时，fire-and-forget）
+
+```
+Orchestrator.process_message()                        # core/orchestrator.py:267
+  ├─ ContextManager.build_messages()                  # context/context_manager.py:295
+  │   ├─ _build_memory_context() → store.read_soul/read_user/get_memory_context
+  │   └─ _build_history_context() → store.read_history(since_cursor=dream_cursor)
+  ├─ Dispatcher.resolve() → Agent.run() → AgentCore.run()  # core/runner.py:264
+  ├─ ctx.save_exchange() → SessionManager.add_messages_to_session()
+  └─ asyncio.create_task(                             # core/orchestrator.py:436
+       Consolidator.maybe_consolidate(session, build_messages_fn)
+     )                                                # memory/consolidator.py:80
+       └─ _do_consolidate(session)                    # memory/consolidator.py:100
+           ├─ 统计未归档消息 (session.messages[last_consolidated:])
+           ├─ _estimate_message_tokens() → 与 token budget 比较
+           ├─ 若超预算:
+           │   ├─ _pick_boundary() → 对齐 user turn 边界
+           │   ├─ archive(chunk)                      # memory/consolidator.py:188
+           │   │   ├─ _format_messages() → LLM chat_with_retry()
+           │   │   ├─ store.append_history(summary)   # memory/store.py:132
+           │   │   └─ 异常降级: store.raw_archive()   # memory/store.py:182
+           │   ├─ session.last_consolidated += boundary
+           │   └─ 循环直到 token 在预算内
+           └─ 返回 True/False
+     # 若 consolidation 完成 → SessionManager.prune_archived_messages()
+     #   删除 messages[:min(cursor, last_consolidated)]   # context/session.py
+```
+
+### 6.3 Dream 周期合并（每 2 小时，CronScheduler 触发）
+
+```
+CronScheduler._on_timer()                             # services/cron.py:195
+  └─ Orchestrator._on_cron_job("dream")               # core/orchestrator.py:246
+      └─ Dream.run()                                  # memory/dream.py:66
+          ├─ 读取 SOUL.md, USER.md, MEMORY.md + history.jsonl 新条目
+          │   store.read_soul() / read_user() / read_memory_file()
+          │   store.read_history(since_cursor=dream_cursor)
+          ├─ Phase 1: LLM 分析
+          │   └─ provider.chat_with_retry() → [FILE]/[FILE-REMOVE]/[SKIP] 指令
+          ├─ Phase 2: 程序化合并
+          │   ├─ _parse_instructions() → 解析结构化指令
+          │   ├─ _apply_adds() → 去重 + 追加到目标文件
+          │   ├─ _apply_removes() → 精确匹配 → 多行块匹配删除
+          │   └─ _update_age_annotations() → 行龄标记 ← Nd
+          ├─ 原子写入各文件 (tmp + os.replace)
+          │   store.write_soul() / write_user() / write_memory_file()
+          └─ store.set_dream_cursor(new_cursor)       # 推进消费游标
+```
+
+### 6.4 上下文组装：记忆注入 LLM
+
+```
+ContextManager.build_messages(session_key, user_input) # context/context_manager.py:295
+  └─ _build_system_prompt(skills, tools, file_context) # context/context_manager.py:524
+      ├─ _build_static_prompt(skills, tools)           # context/context_manager.py:612
+      │   ├─ 基础 system prompt 模板
+      │   ├─ SkillsLoader 注入活跃 skill 的 SKILL.md
+      │   └─ 工具定义注入
+      ├─ _build_memory_context()                       # 读取三份文件
+      │   ├─ store.read_soul()        → "Identity" 段落
+      │   ├─ store.read_user()        → "User Profile" 段落
+      │   └─ store.get_memory_context() → "Long-term Memory" 段落
+      └─ _build_history_context(max_entries=20)        # 过渡层
+          ├─ store.get_dream_cursor()
+          ├─ store.read_history(since_cursor=dream_cursor)  # 未处理条目
+          └─ 格式化为 "Recent History" 段落 (max 16K chars)
+```
+
+### 6.5 MemoryStore 原子写入保障
+
+所有关键写入使用统一模式:
+
+```
+MemoryStore._atomic_write(path, content)
+  ├─ tmp = path.with_suffix(".tmp")
+  ├─ tmp.write_text(content)
+  ├─ os.fsync(tmp.fileno())        # 强制刷盘
+  └─ os.replace(tmp, path)         # 原子替换 (POSIX 保证)
+```
+
+此模式应用于 `write_memory_file`, `append_history`, `_write_entries`, `write_soul`, `write_user`。
 
 ## 设计要点
 

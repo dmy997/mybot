@@ -368,6 +368,164 @@ MYBOT_OTEL_ENABLED=1 mybot
 
 每条 trace 展示完整的 `agent.run → llm.chat → tool.execute` 调用树，包括模型名称、token 消耗、工具名称和执行耗时。
 
+## 代码调用链
+
+### 系统启动：可观测性初始化
+
+```
+Orchestrator.__init__()                                  # orchestrator.py:92
+  │
+  ├── init_logging(log_config)                           # orchestrator.py:134 → log.py:54
+  │     ├── logger.remove()  # 移除默认 handler
+  │     ├── logger.add(sys.stderr, level=config.level, colorize=True)
+  │     │     └── 控制台格式: "时间 | 级别 | 事件类型 | 消息"
+  │     └── if config.log_dir:
+  │           logger.add(log_dir / "mybot_{time}.log", serialize=True)
+  │           └── 文件格式: JSON Lines, level=DEBUG
+  │
+  ├── auto_install_otel(tracer)                          # orchestrator.py:136 → otel_bridge.py:173
+  │     │
+  │     ├── if MYBOT_OTEL_ENABLED not in ("1", "true", "yes"): return False
+  │     └── OTelBridge().install(tracer)                  # otel_bridge.py:84
+  │           ├── _setup_otel_sdk()                       # otel_bridge.py:109
+  │           │     ├── Resource.create({SERVICE_NAME: ...})
+  │           │     ├── OTLPSpanExporter(endpoint=...)
+  │           │     └── TracerProvider + BatchSpanProcessor
+  │           ├── tracer._on_span_start.append(_on_span_start)
+  │           └── tracer._on_span_end.append(_on_span_end)
+  │
+  └── subscribers.install(debug=...)                     # orchestrator.py (在 start_services 中)
+        │                                                # subscribers.py:101
+        ├── bus.subscribe(LLMResponseReady, _on_llm_response)    # subscribers.py:29
+        ├── bus.subscribe(ToolExecutionCompleted, _on_tool_completed)  # :51
+        ├── bus.subscribe(AgentCompleted, _on_agent_completed)        # :66
+        └── bus.subscribe(AgentStallWarning, _on_stall_warning)      # :82
+```
+
+### Agent 运行时：Span 追踪
+
+```
+AgentCore.run()                                          # runner.py:264
+  │
+  ├── with tracer.trace("agent.run", session_key=..., paradigm=...):
+  │     │                                                # trace.py:97 (start_trace)
+  │     ├── 创建 SpanContext(trace_id, span_id, parent=None)
+  │     ├── _current_span.set(span)  # contextvars 传播
+  │     └── [_on_span_start hooks] → OTelBridge 创建 OTel span
+  │
+  │     while not done:  # Agent 主循环
+  │       │
+  │       ├── with tracer.span("llm.chat", model=...):   # trace.py:111 (start_span)
+  │       │     │
+  │       │     ├── parent = _current_span.get()  # 继承 trace context
+  │       │     ├── 创建子 Span(name="llm.chat", parent_span_id=parent.span_id)
+  │       │     │
+  │       │     ├── response = await provider.chat_stream_with_retry(...)
+  │       │     │     │
+  │       │     │     ├── tracer.set_attribute("tokens_in", usage.prompt_tokens)
+  │       │     │     ├── tracer.set_attribute("tokens_out", usage.completion_tokens)
+  │       │     │     └── tracer.set_attribute("finish_reason", response.finish_reason)
+  │       │     │
+  │       │     └── end_span(span, "ok")                  # trace.py:133
+  │       │           ├── span.end_time = time.monotonic()
+  │       │           ├── _current_span.set(span._parent)  # 恢复父 span
+  │       │           ├── [_on_span_end hooks] → OTelBridge 同步属性 + 结束 OTel span
+  │       │           └── 结构化日志: logger.bind(event_type="Span", ...).info(...)
+  │       │
+  │       └── for each tool_call:
+  │             with tracer.span("tool.execute", tool_name=...):
+  │               │
+  │               ├── result = await ToolRegistry.execute(name, arguments)
+  │               ├── tracer.set_attribute("tool.success", result.success)
+  │               ├── if error: tracer.add_event("tool.error", message=...)
+  │               └── end_span(span, "ok" | "error")
+  │
+  └── end_span(root_span, "ok" | "error")
+        └── 最终日志: Span "agent.run" ok (1234.56 ms)
+```
+
+### 事件 → 指标 自动桥接
+
+```
+AgentCore / ToolRegistry 产生事件
+  │
+  ├── LLMResponseReady(model, latency_ms, tokens_in, tokens_out, finish_reason, error)
+  │     └── bus.emit(event)
+  │           └── _on_llm_response(event)                 # subscribers.py:29
+  │                 ├── REGISTRY.llm_calls_total.inc()
+  │                 ├── REGISTRY.llm_latency_ms.observe(event.latency_ms)
+  │                 ├── REGISTRY.llm_tokens_total.inc(event.tokens_total)
+  │                 ├── if error: REGISTRY.llm_calls_errors_total.inc()
+  │                 └── emit(LLMCallEvent(...))           # log.py:166 → 结构化日志
+  │
+  ├── ToolExecutionCompleted(tool_name, success, latency_ms, ...)
+  │     └── bus.emit(event)
+  │           └── _on_tool_completed(event)               # subscribers.py:51
+  │                 ├── REGISTRY.tool_calls_total.inc()
+  │                 ├── REGISTRY.tool_latency_ms.observe(event.latency_ms)
+  │                 ├── if not success: REGISTRY.tool_calls_errors_total.inc()
+  │                 └── emit(ToolCallEvent(...))
+  │
+  ├── AgentCompleted(session_key, paradigm, steps, total_latency_ms, stop_reason, error)
+  │     └── bus.emit(event)
+  │           └── _on_agent_completed(event)              # subscribers.py:66
+  │                 ├── REGISTRY.agent_steps.observe(event.steps)
+  │                 ├── if error: REGISTRY.agent_errors_total.inc()
+  │                 └── emit(AgentRunEvent(...))
+  │
+  └── AgentStallWarning(session_key, steps)
+        └── bus.emit(event)
+              └── _on_stall_warning(event)                # subscribers.py:82
+                    ├── REGISTRY.agent_stall_warnings_total.inc()
+                    └── logger.warning("Agent stall detected")
+```
+
+### 指标采集与暴露
+
+```
+REGISTRY (全局单例, metrics.py:205)
+  │
+  ├── 预定义指标 (metrics.py:207-217):
+  │     counters:   llm_calls_total, llm_calls_errors_total,
+  │                 llm_tokens_total, tool_calls_total,
+  │                 tool_calls_errors_total, agent_errors_total,
+  │                 agent_stall_warnings_total
+  │     gauges:     active_sessions
+  │     histograms: llm_latency_ms, tool_latency_ms, agent_steps
+  │
+  ├── 属性式访问: REGISTRY.llm_calls_total.inc()          # metrics.py:185
+  │     └── __getattr__ → self.counter("llm_calls_total")
+  │
+  └── HTTP 端点暴露 (server.py):
+        ├── GET /metrics → REGISTRY.collect_all()          # metrics.py:164
+        │     └── MetricsRegistrySnapshot(counters, gauges, histograms)
+        ├── GET /logs    → recent.get_logs()               # recent.py
+        └── GET /traces  → recent.get_spans()              # recent.py
+```
+
+### Tracer contextvars 异步传播机制
+
+```
+Tracer (trace.py:70)
+  │
+  ├── _current_span: contextvars.ContextVar[Span | None]  # trace.py:73
+  │     └── 每个 asyncio.Task 有独立的 context 副本
+  │         → serve("s1") 和 serve("s2") 的 span 栈互不干扰
+  │
+  ├── start_span(name) → 创建子 Span                      # trace.py:111
+  │     ├── parent = self._current_span.get()
+  │     ├── 若无活跃 span → 自动调用 start_trace() 创建根
+  │     └── self._current_span.set(new_span)
+  │
+  ├── end_span(span, status)                              # trace.py:133
+  │     └── self._current_span.set(span._parent)  ← 退栈，恢复父 span
+  │
+  └── contextmanager span(name):                          # trace.py:186
+        ├── start_span() → yield span
+        ├── end_span(span, "ok")
+        └── except Exception: end_span(span, "error") → raise
+```
+
 ## 设计要点
 
 - **零依赖内置方案**: 无外部服务时，日志 + 指标 + span 追踪仍然完整工作

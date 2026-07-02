@@ -100,7 +100,7 @@ class RetryConfig:
 
 ## AgentCore 层：分类恢复
 
-`core/runner.py:662-883`
+`core/runner.py:749-891`
 
 `_call_llm()` 是 LLM 调用的核心方法，对三类错误采用不同的响应策略：
 
@@ -215,7 +215,7 @@ async def execute(self, name, arguments) -> ToolResult:
 
 ### 并行工具执行的异常处理
 
-`core/runner.py:975-993`
+`core/runner.py:989-1142`
 
 并行工具使用 `asyncio.gather(return_exceptions=True)` 执行，确保一个工具失败不影响其他工具：
 
@@ -232,7 +232,7 @@ for (idx, tc), raw in zip(parallel_group, raw_results):
 
 ## 停滞检测
 
-`core/runner.py:245-252`
+`core/runner.py:317-326`
 
 当 Agent 步数达到 `max_iterations` 的 75%（默认 20 × 0.75 = 15 步，最少 10 步）时触发警告：
 
@@ -250,7 +250,7 @@ if step_count == _stall_threshold:
 
 ## 断点恢复 (Checkpoint/Resume)
 
-`core/runner.py:401-511`
+`core/runner.py:478-584`
 
 Agent 执行循环中，每轮工具执行完成后保存一次检查点，崩溃后可从该点恢复：
 
@@ -305,6 +305,144 @@ def _checkpointing_enabled(spec):
 ```
 
 恢复时跳过 `on_agent_start` 中间件和 `AgentStarted` 事件发布，但 step/llm/tool 中间件钩子正常触发。
+
+## 代码调用链
+
+### LLM 调用错误处理全链路
+
+```
+AgentCore.run()                                          # core/runner.py:264
+  │
+  └─ AgentCore._call_llm(spec, messages, tool_defs)      # core/runner.py:749
+       │
+       ├─ with tracer.span("llm.chat"):                  # core/runner.py:759
+       │
+       ├─ try:
+       │   response = await self.provider.chat_with_retry(
+       │       messages, tools=tool_defs, model=model,    # core/runner.py:777
+       │       max_tokens=max_tokens, temperature=temperature
+       │   )
+       │   └─ LLMProvider.chat_with_retry()               # providers/base.py:111
+       │       └─ with_retry(                             # providers/retry.py
+       │             self.chat,                            #   → OpenAICompatibleProvider.chat()
+       │             messages, tools, model,
+       │             classify_error=self._classify_error,  #   自定义分类器
+       │             config=retry_config,                  #   RetryConfig(max_retries=3, ...)
+       │           )
+       │           └─ for attempt in range(max_retries + 1):
+       │               try:
+       │                   return await fn(messages, ...)  #   调用 self.chat()
+       │               except RetryableLLMError as e:      #   指数退避: base_delay * 2^attempt
+       │                   if attempt == max_retries:       #   最后一次尝试失败 → raise
+       │                       raise
+       │                   delay = min(base * 2^attempt, max_delay)
+       │                   if jitter: delay *= random(0.5, 1.5)
+       │                   await asyncio.sleep(delay)
+       │               # RecoverableLLMError / FatalLLMError → 直接 raise
+       │
+       │   # 成功路径
+       │   span.attributes["tokens_in"] = tokens_in        # core/runner.py:786-791
+       │   span.attributes["tokens_out"] = tokens_out
+       │   return response                                 # core/runner.py:799
+       │
+       ├─ except RecoverableLLMError as exc:              # core/runner.py:803
+       │   if recovery_attempt:                            #   已尝试恢复 → 放弃
+       │       return self._error_response(exc.info)        # core/runner.py:805
+       │   return await self._recover_and_retry(            # core/runner.py:806
+       │       spec, messages, tool_defs, exc.info
+       │   )
+       │   └─ if error_type == "context_length":           # core/runner.py:834
+       │       return await self._recover_context_length(   # core/runner.py:835-836
+       │           spec, messages, tool_defs, info
+       │       )
+       │       └─ 第一步: compaction.micro_compact()       #   CompactionService 压缩
+       │          或: _lightweight_compact()                #   回退轻量压缩
+       │          if 压缩有效:
+       │              return await _call_llm(               #   重试（recovery_attempt=True）
+       │                  spec, compacted, tool_defs, recovery_attempt=True
+       │              )
+       │          第二步: 丢弃最旧的非系统消息               #   保留 2/3
+       │          system_msgs + other_msgs[-keep:]
+       │          return await _call_llm(                   #   重试（recovery_attempt=True）
+       │              spec, trimmed, tool_defs, recovery_attempt=True
+       │          )
+       │
+       │      if error_type == "content_filter":            # core/runner.py:838
+       │          return await self._recover_content_filter( # core/runner.py:839-840
+       │              spec, messages, tool_defs, info
+       │          )
+       │          └─ 在 system prompt 末尾追加合规提示       # core/runner.py:854-865
+       │             return await _call_llm(                #   重试（recovery_attempt=True）
+       │                 spec, modified, tool_defs, recovery_attempt=True
+       │             )
+       │
+       ├─ except RetryableLLMError as exc:                 # core/runner.py:809
+       │   return self._error_response(exc.info)            #   Provider 已重试 3 次仍失败
+       │
+       └─ except FatalLLMError as exc:                     # core/runner.py:812
+           return self._error_response(exc.info)            #   立即返回错误
+```
+
+### 工具执行错误隔离
+
+```
+AgentCore._execute_tool_calls(tool_calls, tools)          # core/runner.py:989
+  │
+  ├─ 分组: parallel_group vs serial_calls                 # core/runner.py:994-1001
+  │
+  ├─ 并行执行:                                            # core/runner.py:1003-1039
+  │   tasks = [_exec_one(tc) for _, tc in parallel_group]
+  │   raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+  │   └─ _exec_one(tc) → mw.run_tool_execute(ctx, handler)
+  │       └─ handler → ToolRegistry.execute(name, args)    # tools/registry.py:55
+  │           ├─ tool = self._tools.get(name)              #   查找工具
+  │           ├─ guard.pre_check(name, capabilities, args) #   ToolGuard 预检查
+  │           └─ try:
+  │               return await tool.execute(**args)         #   实际执行
+  │               except Exception as exc:
+  │                   return ToolResult(success=False,      #   异常隔离
+  │                       error=f"Tool '{name}' raised: {exc}")
+  │
+  ├─ for (idx, tc), raw in zip(parallel_group, raw_results):
+  │   if isinstance(raw, BaseException):                   #   asyncio.gather 异常
+  │       result = ToolResult(success=False, error=...)     # core/runner.py:1025
+  │   else:
+  │       result, duration_ms = raw                        # core/runner.py:1028
+  │
+  └─ 串行执行:                                            # core/runner.py:1078-1090
+      for idx, tc in serial_calls:
+          result, duration_ms = await _exec_one(tc)        #   逐个执行
+```
+
+### 检查点生命周期
+
+```
+AgentCore.run()                                           # core/runner.py:264
+  │
+  ├─ 启动:
+  │   _checkpoint = _load_checkpoint(session_key)          # core/runner.py:286
+  │   └─ _get_checkpoint_path() → Path.read_text()        # core/runner.py:494-498
+  │       ├─ 版本校验: version != _CHECKPOINT_VERSION → 丢弃
+  │       └─ 完整性检查
+  │   if _checkpoint is not None:                          # core/runner.py:288-295
+  │       恢复: messages = _checkpoint["messages"]          #   跳过 on_agent_start
+  │       step_count = _checkpoint["step_count"] + 1        #   从下一步继续
+  │
+  ├─ 每轮工具执行后:                                      # core/runner.py:392
+  │   await _save_checkpoint(session_key, data)            # core/runner.py:500
+  │   └─ data = {version, session_key, paradigm,          # core/runner.py:507-521
+  │       step_count, messages, tools_used, tool_events,
+  │       total_usage, updated_at}
+  │   └─ tmp.write_text(json.dumps(data))                  # core/runner.py:530
+  │       os.fsync(tmp) → os.replace(tmp, path)             #   原子写入
+  │
+  ├─ 成功完成:                                            # core/runner.py:434/458
+  │   await _delete_checkpoint(session_key)                # core/runner.py:442/460
+  │   └─ path.unlink(missing_ok=True)                      # core/runner.py:580
+  │
+  └─ 异常崩溃:                                            # core/runner.py:465
+      检查点保留在磁盘 → 下次运行自动恢复
+```
 
 ## 设计要点
 

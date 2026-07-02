@@ -115,8 +115,9 @@ class Orchestrator:
         workspace: str | Path,
         provider: Any,  # LLMProvider (lazy import)
         *,
-        max_context_tokens: int = 128_000,
+        max_context_tokens: int = 200_000,
         idle_compress_seconds: int = 300,
+        compress_ratio: float = 0.5,
         compress_model: str | None = None,
         dispatcher: Dispatcher | None = None,
         disabled_skills: list[str] | None = None,
@@ -140,6 +141,7 @@ class Orchestrator:
             provider=provider,
             max_context_tokens=max_context_tokens,
             idle_compress_seconds=idle_compress_seconds,
+            compress_ratio=compress_ratio,
             compress_model=compress_model,
             disabled_skills=disabled_skills,
         )
@@ -409,26 +411,35 @@ class Orchestrator:
                 await self.ctx.save_exchange(session_key, user_input, assistant_msgs)
 
                 # 7. Consolidate — fire-and-forget, never blocks the response
-                try:
-                    session = self.ctx.session.get_session(session_key)
-                    if session:
+                if self.ctx.consolidator is not None:
+                    try:
+                        session = self.ctx.session.get_session(session_key)
+                        if session:
 
-                        async def _build_fn():
-                            return await self.ctx.build_messages(
-                                session_key,
-                                "",
-                                tools=self._tools,
-                            )
+                            async def _build_fn():
+                                return await self.ctx.build_messages(
+                                    session_key,
+                                    "",
+                                    tools=self._tools,
+                                )
 
-                        asyncio.create_task(
-                            self.ctx.consolidator.maybe_consolidate(
-                                session, build_messages_fn=_build_fn,
-                            )
+                            async def _consolidate_and_prune():
+                                try:
+                                    did_consolidate = await self.ctx.consolidator.maybe_consolidate(
+                                        session, build_messages_fn=_build_fn,
+                                    )
+                                    if did_consolidate:
+                                        self.ctx.session.prune_archived_messages(session_key)
+                                except Exception:
+                                    logger.opt(exception=True).warning(
+                                        "Consolidation task failed for {!r}", session_key,
+                                    )
+
+                            asyncio.create_task(_consolidate_and_prune())
+                    except Exception:
+                        logger.opt(exception=True).warning(
+                            "Consolidation skipped for {!r}", session_key,
                         )
-                except Exception:
-                    logger.opt(exception=True).warning(
-                        "Consolidation skipped for {!r}", session_key,
-                    )
 
                 return OrchestratorResult(
                     content=output.content,
@@ -546,6 +557,27 @@ class Orchestrator:
         queue = bus_msg.inbound(session_key)
         self._running = True
 
+        _dropped_logged = False
+
+        def _safe_put(msg: OutboundMessage) -> None:
+            """Put *msg* on the shared outbound queue without blocking.
+
+            Uses ``put_nowait`` to avoid deadlocking the orchestrator when
+            no SSE / WS consumer is draining the queue.  Drops the message
+            (with a single warning) when the queue is full.
+            """
+            nonlocal _dropped_logged
+            try:
+                bus_msg.outbound.put_nowait(msg)
+            except asyncio.QueueFull:
+                if not _dropped_logged:
+                    logger.warning(
+                        "Outbound queue full (maxsize={}), dropping messages "
+                        "for session {!r} — consumer may have disconnected",
+                        bus_msg.outbound.maxsize, session_key,
+                    )
+                    _dropped_logged = True
+
         await bus.publish(SessionCreated(session_key=session_key))
 
         try:
@@ -561,41 +593,35 @@ class Orchestrator:
 
                 msg: InboundMessage = raw
                 cid = msg.correlation_id
+                _dropped_logged = False  # reset per inbound message
 
                 async def _on_delta(token: str) -> None:
-                    await bus_msg.outbound.put(
-                        OutboundMessage(session_key, cid, "delta", token))
+                    _safe_put(OutboundMessage(session_key, cid, "delta", token))
 
                 async def _on_thinking(token: str) -> None:
-                    await bus_msg.outbound.put(
-                        OutboundMessage(session_key, cid, "thinking", token))
+                    _safe_put(OutboundMessage(session_key, cid, "thinking", token))
 
                 async def _on_thinking_done() -> None:
-                    await bus_msg.outbound.put(
-                        OutboundMessage(session_key, cid, "thinking_done", None))
+                    _safe_put(OutboundMessage(session_key, cid, "thinking_done", None))
 
                 async def _on_tool_start(name: str, args_brief: str = "") -> None:
-                    await bus_msg.outbound.put(
-                        OutboundMessage(session_key, cid, "tool_start", name))
+                    _safe_put(OutboundMessage(session_key, cid, "tool_start", name))
 
                 async def _on_tool_end(ev: dict[str, str]) -> None:
-                    await bus_msg.outbound.put(
-                        OutboundMessage(session_key, cid, "tool_end", ev))
+                    _safe_put(OutboundMessage(session_key, cid, "tool_end", ev))
 
                 async def _on_tool_exec_start(
                     name: str, args: dict[str, Any], idx: int, total: int,
                 ) -> None:
-                    await bus_msg.outbound.put(OutboundMessage(
+                    _safe_put(OutboundMessage(
                         session_key, cid, "tool_exec_start",
                         {"name": name, "args": args, "index": idx, "total": total}))
 
                 async def _on_tool_exec_end(ev: dict[str, Any]) -> None:
-                    await bus_msg.outbound.put(
-                        OutboundMessage(session_key, cid, "tool_exec_end", ev))
+                    _safe_put(OutboundMessage(session_key, cid, "tool_exec_end", ev))
 
                 async def _on_new_turn() -> None:
-                    await bus_msg.outbound.put(
-                        OutboundMessage(session_key, cid, "new_turn", None))
+                    _safe_put(OutboundMessage(session_key, cid, "new_turn", None))
 
                 t_start = time.monotonic()
                 try:
@@ -616,7 +642,7 @@ class Orchestrator:
                         on_tool_execute_end=_on_tool_exec_end,
                         on_new_turn=_on_new_turn,
                     )
-                    await bus_msg.outbound.put(OutboundMessage(
+                    _safe_put(OutboundMessage(
                         session_key, cid, "final",
                         {"content": result.content, "usage": result.usage,
                          "stop_reason": result.stop_reason,
@@ -626,7 +652,7 @@ class Orchestrator:
                 except Exception as exc:
                     logger.opt(exception=True).error(
                         "serve() failed for session {!r}", session_key)
-                    await bus_msg.outbound.put(
+                    _safe_put(
                         OutboundMessage(session_key, cid, "error", str(exc)))
         finally:
             self._running = False
@@ -722,6 +748,7 @@ def main() -> None:
     orche = Orchestrator(
         workspace=Config.workspace,
         provider=provider,
+        max_context_tokens=Config.context_window,
         compress_model=Config.light_model,
         log_config=LogConfig(level=console_level),
     )

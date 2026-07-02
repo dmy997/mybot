@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,6 +15,8 @@ from typing import Any
 from loguru import logger
 
 from observability.metrics import REGISTRY
+
+_MAX_CACHED_SESSIONS = 128
 
 
 @dataclass
@@ -37,12 +40,28 @@ class SessionManager:
         self,
         workspace: Path,
         sessions: dict[str, Session] | None = None,
+        *,
+        max_cached: int = _MAX_CACHED_SESSIONS,
     ) -> None:
         self.workspace = workspace
-        self.sessions = sessions or {}
+        self.sessions: OrderedDict[str, Session] = (
+            OrderedDict(sessions) if sessions else OrderedDict()
+        )
+        self._max_cached = max_cached
         self.sessions_dir = self.workspace / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._write_locks: dict[str, asyncio.Lock] = {}
+
+    def _evict_lru(self) -> None:
+        """Evict the least recently used session from cache (keeps disk copy)."""
+        if len(self.sessions) <= self._max_cached:
+            return
+        evicted_key, evicted_session = self.sessions.popitem(last=False)
+        REGISTRY.active_sessions.dec()
+        logger.debug(
+            "LRU evict session {!r} ({} msgs, cached {})",
+            evicted_key, len(evicted_session.messages), len(self.sessions),
+        )
 
     # -- retrieve ----------------------------------------------------------------
 
@@ -50,12 +69,15 @@ class SessionManager:
         """Get a session by key, loading from disk if not in memory."""
         session = self.sessions.get(key)
         if session is not None:
+            self.sessions.move_to_end(key)
             return session
         session = self._load_from_path(key)
         if session is None:
             session = Session(key=key)
             REGISTRY.active_sessions.inc()
         self.sessions[key] = session
+        self.sessions.move_to_end(key)
+        self._evict_lru()
         return session
 
     def get_session_history(self, key: str) -> list[dict[str, Any]]:
@@ -90,6 +112,30 @@ class SessionManager:
         session = self.get_session(key)
         session.consolidated_cursor = cursor
         self.save_session(session)
+
+    def prune_archived_messages(self, key: str) -> int:
+        """Remove messages that have been both consolidated and archived.
+
+        Returns the number of messages pruned.  Call after consolidation
+        advances ``last_consolidated`` to prevent unbounded growth of the
+        in-memory message list.
+        """
+        session = self.sessions.get(key)
+        if session is None:
+            return 0
+        prune_before = min(session.consolidated_cursor, session.last_consolidated)
+        if prune_before <= 0:
+            return 0
+        removed = prune_before
+        session.messages = session.messages[prune_before:]
+        session.consolidated_cursor = max(0, session.consolidated_cursor - prune_before)
+        session.last_consolidated = max(0, session.last_consolidated - prune_before)
+        self.save_session(session)
+        logger.debug(
+            "Pruned {} archived messages from session {!r} ({} remaining)",
+            removed, key, len(session.messages),
+        )
+        return removed
 
     # -- concurrency -------------------------------------------------------------
 
