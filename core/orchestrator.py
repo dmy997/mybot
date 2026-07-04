@@ -9,6 +9,7 @@ Wires ContextManager, Dispatcher, and Agents together. Handles:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -116,8 +117,13 @@ class Orchestrator:
         provider: Any,  # LLMProvider (lazy import)
         *,
         max_context_tokens: int = 200_000,
+        max_output_tokens: int = 20_000,
+        warning_buffer_ratio: float = 0.11,
+        auto_compact_buffer_ratio: float = 0.072,
+        block_buffer_ratio: float = 0.017,
         idle_compress_seconds: int = 300,
         compress_ratio: float = 0.5,
+        consolidation_ratio: float = 0.7,
         compress_model: str | None = None,
         dispatcher: Dispatcher | None = None,
         disabled_skills: list[str] | None = None,
@@ -135,15 +141,40 @@ class Orchestrator:
         install_subscribers(debug=(log_config is not None and log_config.level == "DEBUG"))
         auto_install_otel(tracer)
 
+        # Generate default settings.json if not present
+        from config.settings import generate_default_settings
+        generate_default_settings()
+
+        # Hybrid search store (graceful degradation if unavailable)
+        hybrid_store = None
+        if os.getenv("HYBRID_SEARCH_ENABLED", "true").lower() == "true":
+            try:
+                from memory.hybrid_store import HybridStore
+
+                hybrid_store = HybridStore(
+                    db_path=os.path.join(str(self.workspace), "memory", "search.db"),
+                    embedding_model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
+                )
+            except Exception:
+                logger.warning(
+                    "Hybrid search unavailable, falling back to substring search"
+                )
+
         # Context (idle compression is handled by ContextManager)
         self.ctx = ContextManager(
             self.workspace,
             provider=provider,
             max_context_tokens=max_context_tokens,
+            max_output_tokens=max_output_tokens,
+            warning_buffer_ratio=warning_buffer_ratio,
+            auto_compact_buffer_ratio=auto_compact_buffer_ratio,
+            block_buffer_ratio=block_buffer_ratio,
             idle_compress_seconds=idle_compress_seconds,
             compress_ratio=compress_ratio,
+            consolidation_ratio=consolidation_ratio,
             compress_model=compress_model,
             disabled_skills=disabled_skills,
+            hybrid_store=hybrid_store,
         )
 
         # Dispatcher (accept pre-built or auto-discover agents)
@@ -152,7 +183,7 @@ class Orchestrator:
         else:
             from agents import discover_agents
 
-            agents = discover_agents(provider, middleware=middleware)
+            agents = discover_agents(provider, middleware=middleware, max_context_tokens=max_context_tokens)
             self._dispatcher = Dispatcher(
                 agents, provider=provider, classify_model=compress_model
             )
@@ -311,6 +342,17 @@ class Orchestrator:
             try:
                 # 1. Resolve active skills
                 active_skills = list(skills or [])
+                # Merge in always-on skills (marked metadata.mybot.always: true)
+                for _always_skill in self.ctx.skills_loader.get_always_skills():
+                    if _always_skill not in active_skills:
+                        active_skills.append(_always_skill)
+
+                # 1.5 Resolve per-model context window
+                from config import Config
+                from config.settings import resolve_context_window
+
+                effective_model = model or Config.default_model
+                mwc = resolve_context_window(effective_model)
 
                 # 2. Build messages (includes repair, token-budget compression)
                 with tracer.span("context.build"):
@@ -319,6 +361,8 @@ class Orchestrator:
                         user_input,
                         tools=self._tools,
                         skills=active_skills or None,
+                        context_window=mwc.context_window,
+                        max_output_tokens=mwc.max_output_tokens,
                     )
 
                 # 3. Resolve paradigm
@@ -749,6 +793,13 @@ def main() -> None:
         workspace=Config.workspace,
         provider=provider,
         max_context_tokens=Config.context_window,
+        max_output_tokens=Config.max_output_tokens,
+        warning_buffer_ratio=Config.warning_buffer_ratio,
+        auto_compact_buffer_ratio=Config.auto_compact_buffer_ratio,
+        block_buffer_ratio=Config.block_buffer_ratio,
+        compress_ratio=Config.compress_ratio,
+        consolidation_ratio=Config.consolidation_ratio,
+        idle_compress_seconds=Config.idle_compress_seconds,
         compress_model=Config.light_model,
         log_config=LogConfig(level=console_level),
     )

@@ -703,7 +703,8 @@ class TestAgentCoreCheckpoint:
         spec = AgentInput(session_key="")
         assert core._checkpointing_enabled(spec) is False
 
-    def test_checkpoint_disabled_by_default(self, core):
+    def test_checkpoint_disabled_by_default(self, core, monkeypatch):
+        monkeypatch.delenv("MYBOT_CHECKPOINT", raising=False)
         spec = AgentInput(session_key="s1")
         assert core._checkpointing_enabled(spec) is False
 

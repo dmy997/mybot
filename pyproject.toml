@@ -33,6 +33,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "textual>=8.0",
+    "sqlite-vec>=0.1",
+    "sentence-transformers>=3.0",
 ]
 
 [project.optional-dependencies]

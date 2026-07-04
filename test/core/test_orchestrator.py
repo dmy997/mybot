@@ -291,6 +291,30 @@ class TestSkillsLoader:
 
         assert not isinstance(NotALoader(), SkillsLoader)
 
+    @pytest.mark.asyncio
+    async def test_always_skills_merged(self, orchestrator, react_agent):
+        """Always-on skills are auto-merged into active_skills without duplicates."""
+        from unittest.mock import MagicMock
+
+        orchestrator.context.skills_loader.get_always_skills = MagicMock(
+            return_value=["always-skill"]
+        )
+        orchestrator.context.skills_loader.build_skills_summary = MagicMock(
+            return_value="**always-skill**: An always-on skill."
+        )
+
+        # When skills=None, always_skills should be merged
+        await orchestrator.process_message("sk4", "query")
+        spec: AgentInput = react_agent.run.call_args[0][0]
+        system_msg = spec.init_messages[0]["content"]
+        assert "always-skill" in system_msg
+
+        # When same skill passed explicitly, no duplicates
+        await orchestrator.process_message("sk5", "query", skills=["always-skill"])
+        spec = react_agent.run.call_args[0][0]
+        system_msg = spec.init_messages[0]["content"]
+        assert "always-skill" in system_msg
+
 
 # ---------------------------------------------------------------------------
 # Tools

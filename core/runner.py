@@ -91,7 +91,6 @@ _STALL_WARNING_RATIO = 0.75  # fraction of max_iterations at which stall warning
 _CHECKPOINT_VERSION = 1
 
 # Lightweight compaction (fallback when CompactionService is not injected)
-_LW_COMPACT_MAX_TOKENS = 200_000
 _LW_COMPACT_TRIGGER_RATIO = 0.8
 _LW_COMPACT_KEEP_TURNS = 2
 _LW_COMPACT_SUMMARY_CHARS = 200
@@ -246,7 +245,7 @@ class AgentCore:
         max_iterations: int = _DEFAULT_MAX_ITERATIONS,
         max_tool_result_chars: int = _DEFAULT_MAX_TOOL_RESULT_CHARS,
         middleware: MiddlewareChain | None = None,
-        max_context_tokens: int = _LW_COMPACT_MAX_TOKENS,
+        max_context_tokens: int = 200_000,
         compaction: Any | None = None,
         workspace: str | Path | None = None,
     ) -> None:
@@ -650,7 +649,7 @@ class AgentCore:
     def _lightweight_compact(
         messages: list[dict[str, Any]],
         *,
-        max_tokens: int = _LW_COMPACT_MAX_TOKENS,
+        max_tokens: int = 200_000,
         trigger_ratio: float = _LW_COMPACT_TRIGGER_RATIO,
         keep_turns: int = _LW_COMPACT_KEEP_TURNS,
         summary_chars: int = _LW_COMPACT_SUMMARY_CHARS,

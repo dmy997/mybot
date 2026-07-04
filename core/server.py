@@ -470,6 +470,13 @@ def main() -> None:
         workspace=Config.workspace,
         provider=provider,
         max_context_tokens=Config.context_window,
+        max_output_tokens=Config.max_output_tokens,
+        warning_buffer_ratio=Config.warning_buffer_ratio,
+        auto_compact_buffer_ratio=Config.auto_compact_buffer_ratio,
+        block_buffer_ratio=Config.block_buffer_ratio,
+        compress_ratio=Config.compress_ratio,
+        consolidation_ratio=Config.consolidation_ratio,
+        idle_compress_seconds=Config.idle_compress_seconds,
         compress_model=Config.light_model,
     )
 

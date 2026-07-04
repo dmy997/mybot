@@ -31,7 +31,12 @@ def _load_dotenv() -> None:
             pass
 
 
-# Load .env before Config class reads os.environ
+# Inject settings.json "env" into os.environ (highest priority after shell env)
+from config.settings import apply_settings_env
+
+apply_settings_env()
+
+# Load .env (lower priority than settings.json, skipped when key already set)
 _load_dotenv()
 
 
@@ -118,6 +123,20 @@ class Config:
     (``BLOCK_BUFFER_RATIO``)."""
 
     # ------------------------------------------------------------------
+    # Hybrid search
+    # ------------------------------------------------------------------
+
+    hybrid_search_enabled: bool = (
+        os.getenv("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+    )
+    """Enable hybrid search (SQLite + sqlite-vec + FTS5) for memory recall
+    (``HYBRID_SEARCH_ENABLED``)."""
+
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    """Sentence-transformers model for embedding memory chunks
+    (``EMBEDDING_MODEL``)."""
+
+    # ------------------------------------------------------------------
     # Paths
     # ------------------------------------------------------------------
 
@@ -150,3 +169,7 @@ class Config:
             os.getenv("AUTOCOMPACT_BUFFER_RATIO", "0.072")
         )
         cls.block_buffer_ratio = float(os.getenv("BLOCK_BUFFER_RATIO", "0.017"))
+        cls.hybrid_search_enabled = (
+            os.getenv("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+        )
+        cls.embedding_model = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")

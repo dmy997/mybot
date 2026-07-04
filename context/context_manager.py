@@ -13,11 +13,10 @@ Thresholds are read from :class:`TokenBudget` (single configuration source).
 
 from __future__ import annotations
 
-import json as _json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -190,10 +189,16 @@ class ContextManager:
         provider: Any | None = None,
         system_prompt: str = "",
         max_context_tokens: int = 200_000,
+        max_output_tokens: int = 20_000,
+        warning_buffer_ratio: float = 0.11,
+        auto_compact_buffer_ratio: float = 0.072,
+        block_buffer_ratio: float = 0.017,
         idle_compress_seconds: int = 300,
         compress_model: str | None = None,
         compress_ratio: float = 0.5,
+        consolidation_ratio: float = 0.7,
         disabled_skills: list[str] | None = None,
+        hybrid_store: object | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.system_prompt = system_prompt
@@ -201,7 +206,8 @@ class ContextManager:
         from core.skills import SkillsLoader as _SkillsLoader
 
         self.session = SessionManager(self.workspace)
-        self.store = MemoryStore(self.workspace)
+        self.store = MemoryStore(self.workspace, hybrid_store=hybrid_store)
+        self._hybrid_store = hybrid_store
         self.skills_loader = _SkillsLoader(self.workspace, disabled_skills=disabled_skills)
 
         # Consolidator — per-turn LLM summarization → history.jsonl
@@ -210,12 +216,16 @@ class ContextManager:
             provider=provider,
             model=compress_model or "",
             context_window_tokens=max_context_tokens,
-            consolidation_ratio=compress_ratio,
+            consolidation_ratio=consolidation_ratio,
         )
 
         # Unified token budget (must be first — used by memory_service below)
         self.token_budget = TokenBudget(
             context_window=max_context_tokens,
+            max_output_tokens=max_output_tokens,
+            warning_buffer_ratio=warning_buffer_ratio,
+            auto_compact_buffer_ratio=auto_compact_buffer_ratio,
+            block_buffer_ratio=block_buffer_ratio,
             compress_ratio=compress_ratio,
             idle_compress_seconds=idle_compress_seconds,
         )
@@ -299,6 +309,8 @@ class ContextManager:
         *,
         tools: ToolRegistry | None = None,
         skills: list[str] | None = None,
+        context_window: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
         """Assemble the complete message list for an agent run.
 
@@ -313,8 +325,26 @@ class ContextManager:
            - > auto_compact_threshold → auto_compact (with circuit breaker)
            - > warning_threshold → logger warning
 
+        When *context_window* or *max_output_tokens* is provided, a
+        temporary :class:`TokenBudget` is created so that thresholds
+        adjust to the per-request model.  Ratio fields are copied from
+        the default budget.
+
         Returns a list ready for ``AgentInput.init_messages``.
         """
+
+        # Per-request budget override (model-specific context window)
+        budget = self.token_budget
+        if context_window is not None or max_output_tokens is not None:
+            budget = TokenBudget(
+                context_window=context_window or budget.context_window,
+                max_output_tokens=max_output_tokens or budget.max_output_tokens,
+                warning_buffer_ratio=budget.warning_buffer_ratio,
+                auto_compact_buffer_ratio=budget.auto_compact_buffer_ratio,
+                block_buffer_ratio=budget.block_buffer_ratio,
+                compress_ratio=budget.compress_ratio,
+                idle_compress_seconds=budget.idle_compress_seconds,
+            )
         session = self.session.get_session(session_key)
         cursor = session.consolidated_cursor
 
@@ -362,7 +392,6 @@ class ContextManager:
         ]
 
         # 7. Multi-threshold token-budget check
-        budget = self.token_budget
         if budget.context_window <= 0:
             return preliminary
 
@@ -876,13 +905,33 @@ class ContextManager:
         return False
 
     def recall(self, query: str, *, top_n: int = 10) -> list[dict]:
-        """Keyword search in MEMORY.md content.
-
-        Returns list of dicts with name/content/type keys.
+        """Search memory content. Uses hybrid search when available, falls back
+        to substring matching on MEMORY.md.
         """
-        current = self.store.read_memory_file()
         if not query.strip():
             return []
+
+        if self._hybrid_store is not None:
+            try:
+                sr = self._hybrid_store.search(query, top_k=top_n)
+                if sr:
+                    return [
+                        {
+                            "name": r.source_key or r.source,
+                            "content": r.content,
+                            "mem_type": r.source,
+                            "score": r.score,
+                        }
+                        for r in sr
+                    ]
+            except Exception:
+                logger.debug("Hybrid search failed, falling back to substring", exc_info=True)
+
+        return self._substring_recall(query, top_n=top_n)
+
+    def _substring_recall(self, query: str, *, top_n: int = 10) -> list[dict]:
+        """Fallback: case-insensitive substring search in MEMORY.md."""
+        current = self.store.read_memory_file()
         query_lower = query.lower()
         results: list[dict] = []
         for line in current.splitlines():
@@ -891,14 +940,12 @@ class ContextManager:
                 continue
             if query_lower not in line.lower():
                 continue
-            # Parse: "- [type] name: content"
-            rest = line[2:]  # strip "- "
+            rest = line[2:]
             entry: dict = {"raw": rest}
             if rest.startswith("[") and "] " in rest:
                 bracket_end = rest.index("] ")
                 entry["mem_type"] = rest[1:bracket_end]
                 rest = rest[bracket_end + 2:]
-            # Split name: content
             if ": " in rest:
                 name_part, content_part = rest.split(": ", 1)
                 entry["name"] = name_part.strip()

@@ -14,7 +14,6 @@ from dataclasses import dataclass
 # Defaults
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CONTEXT_WINDOW = 200_000
 _DEFAULT_MAX_OUTPUT_TOKENS = 20_000
 
 
@@ -28,7 +27,7 @@ class TokenBudget:
 
     # -- window sizing ---------------------------------------------------------
 
-    context_window: int = _DEFAULT_CONTEXT_WINDOW
+    context_window: int = 200_000
     max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS
 
     # -- ratio-based buffers (fraction of effective_window) ---------------------

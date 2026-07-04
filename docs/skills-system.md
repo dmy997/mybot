@@ -102,7 +102,7 @@ Skills 的组装发生在**系统提示词构建阶段**，由 `ContextManager` 
 CLI (orchestrator.py:725-792)
   └── orche.process_message(session_key, user_input)
         # skills 参数未传入 → 默认为 None
-        # ⚠️ 当前未调用 get_always_skills()
+        # always_skills 由 process_message() 自动合并
 
 HTTP/WS (orchestrator.py:541-656)
   └── orche.process_message(..., skills=msg.skills)
@@ -112,8 +112,10 @@ HTTP/WS (orchestrator.py:541-656)
 Orchestrator.process_message() — orchestrator.py:267-466
 ═══════════════════════════════════════════════════════════════════════════
 
-line 311:  active_skills = list(skills or [])
-           # ⚠️ get_always_skills() 未接入，待实现
+line 330:  active_skills = list(skills or [])
+line 331:  for _always_skill in self.ctx.skills_loader.get_always_skills():
+line 332:      if _always_skill not in active_skills:
+line 333:          active_skills.append(_always_skill)   ← 自动合并 always skills，去重
 
 line 315:  messages = await self.ctx.build_messages(
                session_key, user_input,
@@ -326,19 +328,17 @@ def get_always_skills(self) -> list[str]:
 
 在前端设计中，`metadata.mybot.always: true` 标记的 skill（如 `frontend-design`）应该自动加载到上下文中，无需用户显式调用。
 
-**当前状态**：`get_always_skills()` 方法已实现，但 **尚未接入 Orchestrator**。`Orchestrator.process_message()` 中 skill 组装逻辑仅为：
+**当前状态**：`get_always_skills()` 方法已实现，**已接入 Orchestrator**。`Orchestrator.process_message()` 中 skill 组装逻辑：
 
 ```python
-# orchestrator.py:311
-active_skills = list(skills or [])  # 仅使用传入的 skills，未调用 get_always_skills()
-```
-
-接入方式：在此行合并 `get_always_skills()` 的结果：
-
-```python
+# orchestrator.py:330-333
 active_skills = list(skills or [])
-active_skills.extend(self.ctx.skills_loader.get_always_skills())
+for _always_skill in self.ctx.skills_loader.get_always_skills():
+    if _always_skill not in active_skills:
+        active_skills.append(_always_skill)
 ```
+
+合并策略：先取用户传入的 skills，再将 always skills 逐一追加（已存在的跳过，去重）。
 
 ## 依赖项检查
 

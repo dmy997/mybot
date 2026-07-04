@@ -40,9 +40,11 @@ class MemoryStore:
             └── .dream_cursor          # Dream consumption cursor
     """
 
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY,
+                 *, hybrid_store: object | None = None):
         self.workspace = Path(workspace).expanduser().resolve()
         self.max_history_entries = max_history_entries
+        self._hybrid_store = hybrid_store
         self.memory_dir = self.workspace / "memory"
         # Core files
         self.memory_file = self.memory_dir / "MEMORY.md"
@@ -103,6 +105,11 @@ class MemoryStore:
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
+        if self._hybrid_store is not None:
+            try:
+                self._hybrid_store.index_memory(content)
+            except Exception:
+                logger.debug("Hybrid store index_memory failed", exc_info=True)
 
     def get_memory_context(self) -> str:
         """Return MEMORY.md content formatted for system-prompt injection.
@@ -157,12 +164,20 @@ class MemoryStore:
             f.flush()
             os.fsync(f.fileno())
         self._cursor_file.write_text(str(cursor), encoding="utf-8")
+        if self._hybrid_store is not None:
+            try:
+                self._hybrid_store.index_history([record])
+            except Exception:
+                logger.debug("Hybrid store index_history failed", exc_info=True)
         return cursor
 
     def read_history(self, since_cursor: int = 0) -> list[dict]:
         """Return history entries with cursor > *since_cursor*."""
         entries = self._read_entries()
-        return [e for e in entries if isinstance(e.get("cursor"), int) and e["cursor"] > since_cursor]
+        return [
+            e for e in entries
+            if isinstance(e.get("cursor"), int) and e["cursor"] > since_cursor
+        ]
 
     def compact_history(self) -> int:
         """Drop oldest entries if the file exceeds *max_history_entries*.
@@ -236,7 +251,7 @@ class MemoryStore:
         """Read all entries from history.jsonl."""
         entries: list[dict] = []
         with suppress(FileNotFoundError):
-            with open(self.history_file, "r", encoding="utf-8") as f:
+            with open(self.history_file, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:

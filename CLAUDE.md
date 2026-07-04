@@ -111,7 +111,11 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 - Prompt templates in `prompt_templates/`, loaded via `utils.render_template(name, **vars)`
 - Templates ending in `.md` are rendered as Jinja2 with `strip=True`
 
-## Environment Variables
+## Configuration
+
+All settings live in `~/.mybot/settings.json` under the `"env"` key (JSON, follows Claude Code's `~/.claude/settings.json` pattern). First run auto-generates it with defaults. Priority: shell env > settings.json > `.env` file.
+
+### Environment Variables (in `settings.json` → `"env"`)
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -125,10 +129,55 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 | `MYBOT_API_KEY` | — | Bearer auth for HTTP/WS (disabled when unset) |
 | `MYBOT_HOST` | `127.0.0.1` | Server bind address |
 | `MYBOT_PORT` | `8080` | Server port |
+| `HYBRID_SEARCH_ENABLED` | `true` | Enable SQLite FTS5 + sqlite-vec hybrid search |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers embedding model |
+| `CONTEXT_WINDOW` | `200000` | Default context window in tokens |
+| `MAX_OUTPUT_TOKENS` | `20000` | Tokens reserved for model output |
+| `WARNING_BUFFER_RATIO` | `0.11` | Fraction of effective_window for warning threshold |
+| `AUTOCOMPACT_BUFFER_RATIO` | `0.072` | Fraction of effective_window for auto-compact threshold |
+| `BLOCK_BUFFER_RATIO` | `0.017` | Fraction of effective_window for block threshold |
+| `COMPRESS_RATIO` | `0.5` | Fraction of context window for recent messages during compression |
+| `CONSOLIDATION_RATIO` | `0.7` | Fraction triggering background consolidation |
+| `IDLE_COMPRESS_SECONDS` | `300` | Seconds of inactivity before idle compression (0=disabled) |
+
+## Settings File (`~/.mybot/settings.json`)
+
+Per-model context window configuration (JSON, follows Claude Code's `~/.claude/settings.json` pattern):
+
+```json
+{
+  "env": {
+    "PROVIDER_NAME": "openrouter",
+    "LLM_MODEL_ID": "deepseek/deepseek-v4-flash",
+    "OPENAI_API_KEY": "sk-or-v1-...",
+    "OPENAI_API_BASE": "https://openrouter.ai/api/v1",
+    ...
+  },
+  "models": [
+    {"pattern": "deepseek/*", "context_window": 200000, "max_output_tokens": 20000},
+    {"pattern": "gpt-4o*",   "context_window": 128000, "max_output_tokens": 16384},
+    {"pattern": "claude-*",  "context_window": 200000, "max_output_tokens": 32000},
+    {"pattern": "*",         "context_window": 200000, "max_output_tokens": 20000}
+  ],
+  "thresholds": {
+    "warning_buffer_ratio": 0.11,
+    "auto_compact_buffer_ratio": 0.072,
+    "block_buffer_ratio": 0.017,
+    "compress_ratio": 0.5,
+    "consolidation_ratio": 0.7,
+    "idle_compress_seconds": 300
+  }
+}
+```
+
+- `models[].pattern` — fnmatch pattern, first-match-wins, `"*"` as catch-all default
+- `thresholds` — all optional, fall back to env vars then hardcoded defaults
+- Auto-generated with defaults on first run if missing
+- Priority: settings.json > env var > hardcoded default
 
 ## Known Gaps (from README.md roadmap)
 
-- **P2**: Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay
+- **P2**: ~~Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay~~ (done)
 - **P3**: Multimodal input, more providers (Anthropic direct, Ollama), external chat channels, Heartbeat service, Skill system enhancement, chunk-level retrieval
 - See `README.md` Roadmap for the full prioritized list with status markers
 
@@ -137,5 +186,5 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 See `docs/memory-comparison.md` for the full cross-project analysis. Summary:
 
 - **P1 (short-term)**: ~~Dream dedup~~, ~~age annotations (`<- Nd`)~~, ~~session source tracking in history.jsonl~~
-- **P2 (medium-term)**: Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay
+- **P2 (medium-term)**: ~~Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay~~ (done)
 - **P3 (long-term)**: Heartbeat service, Skill system, chunk-level retrieval granularity

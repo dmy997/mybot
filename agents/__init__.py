@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 def discover_agents(
     provider: Any,
     middleware: MiddlewareChain | None = None,
+    max_context_tokens: int = 200_000,
 ) -> dict[str, BaseAgent]:
     """Auto-discover all :class:`BaseAgent` subclasses in the agents package.
 
@@ -26,7 +27,6 @@ def discover_agents(
 
     Returns a dict suitable for passing to :class:`~core.dispatcher.Dispatcher`.
     """
-    from config import Config
     from core.runner import AgentCore
 
     agents: dict[str, BaseAgent] = {}
@@ -34,7 +34,7 @@ def discover_agents(
     core = AgentCore(
         provider,
         middleware=middleware,
-        max_context_tokens=Config.context_window,
+        max_context_tokens=max_context_tokens,
     )
 
     for module_info in pkgutil.iter_modules([str(agents_dir)]):

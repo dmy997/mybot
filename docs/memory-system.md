@@ -364,6 +364,82 @@ MemoryStore._atomic_write(path, content)
 
 此模式应用于 `write_memory_file`, `append_history`, `_write_entries`, `write_soul`, `write_user`。
 
+## 七、混合搜索 (Hybrid Search)
+
+### 7.1 概述
+
+`HybridStore` (`memory/hybrid_store.py`) 为 MEMORY.md 和 history.jsonl 提供语义 + 关键词混合搜索，替代原有的纯子串匹配。
+
+```
+HybridStore
+├── SQLite DB (workspace/memory/search.db)
+│   ├── chunks         — 内容存储 (source, source_key, content, created_at, metadata)
+│   ├── chunks_vec     — vec0 虚拟表，cosine distance 向量搜索
+│   └── chunks_fts     — FTS5 虚拟表，BM25 关键词搜索
+├── Embedding model    — all-MiniLM-L6-v2 (384-dim), 惰性加载单例
+├── index_memory()     — 索引 MEMORY.md 每一行
+├── index_history()    — 索引 history.jsonl 每个条目
+├── search(query, k=5) — 混合搜索: 向量 + FTS5 融合评分
+└── 时间衰减           — history.jsonl 条目指数衰减，MEMORY.md 永久豁免
+```
+
+### 7.2 评分融合
+
+```
+# 向量路径: cosine distance → similarity
+vec_sim = max(0, 1 - cosine_distance / 2)
+
+# FTS5 路径: BM25 rank → 归一化评分
+text_score = 1 / (1 + exp(bm25_rank / 100))
+
+# 加权融合 (0.7 向量 / 0.3 文本)
+final_score = 0.7 * vec_sim + 0.3 * text_score
+
+# 时间衰减 (仅 history.jsonl，MEMORY.md 豁免)
+age_days = (now - created_at).days
+decay = exp(-ln(2) / 30 * age_days)
+decayed_score = final_score * decay
+```
+
+### 7.3 索引触发
+
+| 操作 | 触发点 | 文件:行 |
+|------|--------|---------|
+| MEMORY.md 写入 | `MemoryStore.write_memory_file()` 之后 | `store.py:97` |
+| history.jsonl 追加 | `MemoryStore.append_history()` 之后 | `store.py:132` |
+| `remember()` | 委托 `store.write_memory_file()` | `context_manager.py:843` |
+| `forget()` | 委托 `store.write_memory_file()` | `context_manager.py:861` |
+
+### 7.4 搜索调用链
+
+```
+memory_recall 工具                                   tools/memory_tools.py:111
+  └── ContextManager.recall(query)                   context_manager.py:880
+        ├── [优先] HybridStore.search(query)          hybrid_store.py:248
+        │     ├── _vector_search() → vec0 cosine     hybrid_store.py:260
+        │     ├── _text_search()  → FTS5 BM25        hybrid_store.py:271
+        │     ├── _fuse() → 0.7*vec + 0.3*text       hybrid_store.py:284
+        │     └── _apply_temporal_decay()             hybrid_store.py:300
+        └── [回退] _substring_recall()                context_manager.py:898
+              (原有子串匹配，不依赖 SQLite/embeddings)
+```
+
+### 7.5 优雅降级
+
+- **sqlite-vec 不可用**: 仅使用 FTS5 关键词搜索（`_has_vec = False`）
+- **sentence-transformers 不可用**: 回退到 `_substring_recall()` 子串匹配
+- **整个 HybridStore 创建失败**: `Orchestrator` 设 `hybrid_store = None`，`ContextManager.recall()` 自动使用子串回退
+- **搜索异常**: `recall()` 捕获异常后回退到子串匹配
+
+### 7.6 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `HYBRID_SEARCH_ENABLED` | `true` | 启用混合搜索 |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers 模型名称 |
+
+> 三种检索算法（向量检索、FTS5、子串匹配）的详细原理、算法伪代码、评分融合公式及全方位对比，见 **[memory-search-algorithms.md](memory-search-algorithms.md)**。
+
 ## 设计要点
 
 - **LLM 替代关键词**: 用 LLM 摘要替代关键词匹配，提取的事实更准确，自然去重
