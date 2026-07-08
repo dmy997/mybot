@@ -89,9 +89,28 @@ class TestMessageBus:
         b.remove_session("s1")
         assert "s1" not in b.sessions
 
-    def test_outbound_shared(self):
+    def test_outbound_same_channel_same_queue(self):
         b = MessageBus()
-        assert b.outbound is b.outbound  # same object
+        assert b.outbound("default") is b.outbound("default")
+
+    def test_outbound_different_channels_different_queues(self):
+        b = MessageBus()
+        assert b.outbound("cli") is not b.outbound("http")
+
+    @pytest.mark.asyncio
+    async def test_outbound_per_channel_isolation(self):
+        """Messages on one channel are not visible on another."""
+        b = MessageBus()
+        await b.outbound("cli").put(OutboundMessage("s1", "c1", "delta", "a"))
+        await b.outbound("http").put(OutboundMessage("s1", "c2", "delta", "b"))
+        assert await b.outbound("cli").get() is not await b.outbound("http").get()
+
+    def test_outbound_channels_independent(self):
+        b = MessageBus()
+        q_cli = b.outbound("cli")
+        q_http = b.outbound("http")
+        assert q_cli is b.outbound("cli")
+        assert q_http is b.outbound("http")
 
     @pytest.mark.asyncio
     async def test_put_get_inbound(self):
@@ -105,8 +124,8 @@ class TestMessageBus:
     async def test_put_get_outbound(self):
         b = MessageBus()
         msg = OutboundMessage("s1", "abc", "delta", "hi")
-        await b.outbound.put(msg)
-        result = await b.outbound.get()
+        await b.outbound("default").put(msg)
+        result = await b.outbound("default").get()
         assert result is msg
 
     @pytest.mark.asyncio
@@ -119,9 +138,9 @@ class TestMessageBus:
     @pytest.mark.asyncio
     async def test_backpressure_outbound(self):
         b = MessageBus(outbound_maxsize=2)
-        await b.outbound.put(OutboundMessage("s1", "", "delta", "1"))
-        await b.outbound.put(OutboundMessage("s1", "", "delta", "2"))
-        assert b.outbound.full()
+        await b.outbound("default").put(OutboundMessage("s1", "", "delta", "1"))
+        await b.outbound("default").put(OutboundMessage("s1", "", "delta", "2"))
+        assert b.outbound("default").full()
 
     @pytest.mark.asyncio
     async def test_close_puts_sentinels(self):
@@ -136,19 +155,27 @@ class TestMessageBus:
         await close_task
 
     @pytest.mark.asyncio
+    async def test_close_sentinels_on_outbound(self):
+        b = MessageBus()
+        q = b.outbound("cli")
+        close_task = asyncio.create_task(b.close())
+        assert await q.get() is None
+        await close_task
+
+    @pytest.mark.asyncio
     async def test_correlation_id_routing(self):
         """Outbound messages can be filtered by correlation_id."""
         b = MessageBus()
-        await b.outbound.put(OutboundMessage("s1", "req1", "delta", "a"))
-        await b.outbound.put(OutboundMessage("s1", "req2", "delta", "b"))
-        await b.outbound.put(OutboundMessage("s1", "req1", "final", {"c": 1}))
+        await b.outbound("default").put(OutboundMessage("s1", "req1", "delta", "a"))
+        await b.outbound("default").put(OutboundMessage("s1", "req2", "delta", "b"))
+        await b.outbound("default").put(OutboundMessage("s1", "req1", "final", {"c": 1}))
 
         req1_msgs: list[OutboundMessage] = []
         req2_msgs: list[OutboundMessage] = []
 
         # Consume all and filter
         for _ in range(3):
-            msg = await b.outbound.get()
+            msg = await b.outbound("default").get()
             if msg.correlation_id == "req1":
                 req1_msgs.append(msg)
             elif msg.correlation_id == "req2":

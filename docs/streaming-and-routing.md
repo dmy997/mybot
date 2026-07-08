@@ -69,45 +69,25 @@ AgentCore._call_llm()  (core/runner.py:749-831)
 │    └── finish() → 最终刷新，完整 Markdown 渲染                       │
 └──────────────────────────────────────────────────────────────────────┘
 
-┌─── HTTP/WS 路径 (orchestrator.py:541-656) ──────────────────────────┐
+┌─── HTTP/WS 路径 (orchestrator.py:541-703) ──────────────────────────┐
+│                                                                      │
+│  # _safe_put 接收 channel 参数，路由到正确的 per-channel 队列        │
+│  def _safe_put(msg, channel):                                        │
+│      bus_msg.outbound(channel).put_nowait(msg)                       │
 │                                                                      │
 │  async def _on_delta(token):                                         │
-│      await bus_msg.outbound.put(OutboundMessage(                     │
+│      _safe_put(OutboundMessage(                                      │
 │          session_key, cid, "delta", token                            │
-│      ))                                                              │
+│      ), channel)                                                     │
 │                                                                      │
 │  async def _on_thinking(token):                                      │
-│      await bus_msg.outbound.put(OutboundMessage(                     │
+│      _safe_put(OutboundMessage(                                      │
 │          session_key, cid, "thinking", token                         │
-│      ))                                                              │
+│      ), channel)                                                     │
 │                                                                      │
-│  async def _on_thinking_done():                                      │
-│      await bus_msg.outbound.put(OutboundMessage(                     │
-│          session_key, cid, "thinking_done", None                     │
-│      ))                                                              │
-│                                                                      │
-│  async def _on_tool_start(name, args_brief=""):                      │
-│      await bus_msg.outbound.put(OutboundMessage(                     │
-│          session_key, cid, "tool_start", name                        │
-│      ))                                                              │
-│                                                                      │
-│  async def _on_tool_exec_start(name, args, idx, total):              │
-│      await bus_msg.outbound.put(OutboundMessage(                     │
-│          session_key, cid, "tool_exec_start",                        │
-│          {"name": name, "args": args, "index": idx, "total": total}  │
-│      ))                                                              │
-│                                                                      │
-│  async def _on_tool_exec_end(ev):                                    │
-│      await bus_msg.outbound.put(OutboundMessage(                     │
-│          session_key, cid, "tool_exec_end", ev                       │
-│      ))                                                              │
-│                                                                      │
-│  async def _on_new_turn():                                           │
-│      await bus_msg.outbound.put(OutboundMessage(                     │
-│          session_key, cid, "new_turn", None                          │
-│      ))                                                              │
-│                                                                      │
-│  # 所有回调 = 构造 OutboundMessage → outbound_queue.put()            │
+│  # channel 从 InboundMessage.source 提取：                          │
+│  #   "http" → SSE consumer, "websocket" → WS consumer               │
+│  #   "wechat" → WeChatBot consumer                                  │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -149,11 +129,11 @@ session_key ───── 会话级别：标识一次完整的对话 (e.g. "20
 correlation_id ── 请求级别：标识一次请求-响应完整生命周期 (e.g. "a1b2c3d4e5")
   │                 一个 session 可以有多个并发请求，各自有独立的 cid
   │
-source ────────── 来源标识："cli" | "http" | "websocket" | "telegram"
-                   用于日志/调试，不影响路由逻辑
+source ────────── 来源标识："cli" | "http" | "websocket" | "wechat"
+                   决定出站消息路由到哪个通道的队列
 ```
 
-### 架构：per-session inbound + 共享 outbound
+### 架构：per-session inbound + per-channel outbound
 
 ```
                     ┌──────────────────────────────────┐
@@ -163,17 +143,19 @@ CLI ───────────────►│ inbound("default")      
 HTTP POST /chat/s1─►│ inbound("s1")                    │←─────── .serve("s1")
 HTTP POST /chat/s2─►│ inbound("s2")                    │←─────── .serve("s2")
 WS /ws/s1 ─────────►│ inbound("s1")  ← 共享同一队列    │←─────── .serve("s1")
+WeChat msg ────────►│ inbound("wechat:...")            │←─────── .serve("wechat:...")
                     │                                  │
-                    │        outbound (共享)            │
-Orchestrator ──────►│  OutboundMessage(session, cid, ...)├──────► CLI (全消费)
-                    │                                  ├──────► SSE (过滤 cid)
-                    │                                  ├──────► WS  (过滤 cid)
+                    │     outbound (per-channel)        │
+Orchestrator ──────►│  outbound("cli")      ──────────►│ CLI (全消费)
+                    │  outbound("http")     ──────────►│ SSE (过滤 cid)
+                    │  outbound("websocket")───────────►│ WS  (过滤 cid)
+                    │  outbound("wechat")   ──────────►│ WeChatBot consumer
                     └──────────────────────────────────┘
 ```
 
 **关键设计**：
 - **inbound**：per-session 独立队列（`asyncio.Queue[InboundMessage]`），一个 session 一个 `serve()` task 消费
-- **outbound**：所有 session 共享一个队列（`asyncio.Queue[OutboundMessage]`），消费者按 `correlation_id` 过滤
+- **outbound**：per-channel 独立队列（`dict[str, asyncio.Queue[OutboundMessage]]`），按 `InboundMessage.source` 路由。不同频道的消息完全隔离，consumer 只读自己频道的队列，不再需要丢弃非当前 `correlation_id` 的消息
 
 ### InboundMessage — 入站消息
 
@@ -244,35 +226,25 @@ class OutboundMessage:
         correlation_id="a1b2c3d4e5",
     ))                                   (server.py:181-189)
    │
-5. Orchestrator.serve() 后台 task（从步骤 3 开始运行） (orchestrator.py:541-656)
+5. Orchestrator.serve() 后台 task（从步骤 3 开始运行） (orchestrator.py:588-703)
    │  inbound = await bus_msg.inbound("session_abc").get()
-   │  取出 InboundMessage
+   │  取出 InboundMessage，提取 channel = msg.source or "default"
    │
-   │  构造回调 (orchestrator.py:595-621)：
-   │    _on_delta(token)        → outbound.put(OutboundMessage(..., "delta", token))
-   │    _on_thinking(token)     → outbound.put(OutboundMessage(..., "thinking", token))
-   │    _on_tool_start(name)    → outbound.put(OutboundMessage(..., "tool_start", name))
-   │    _on_tool_end(ev)        → outbound.put(OutboundMessage(..., "tool_end", ev))
-   │    _on_tool_exec_start(...) → outbound.put(OutboundMessage(..., "tool_exec_start", ...))
-   │    _on_tool_exec_end(ev)   → outbound.put(OutboundMessage(..., "tool_exec_end", ev))
+   │  构造回调 (orchestrator.py:642-670)：
+   │    _safe_put(OutboundMessage(..., msg_type, data), channel)
+   │    → bus_msg.outbound(channel).put_nowait(...)
    │
-   │  result = await process_message(
-   │      session_key, content,
-   │      on_delta=_on_delta,
-   │      on_tool_start=_on_tool_start, ...
-   │  )                                (orchestrator.py:625-641)
+   │  result = await process_message(...)
    │
-   │  发送最终消息 (orchestrator.py:642-648)：
-   │  outbound.put(OutboundMessage(..., "final", {
-   │      content, usage, stop_reason, paradigm, elapsed_ms
-   │  }))
+   │  发送最终消息：
+   │  _safe_put(OutboundMessage(..., "final", {...}), channel)
    │
    │  循环回步骤 5，等待下一条入站消息
    │
 6. event_stream() SSE 消费者（步骤 1 返回的 StreamingResponse） (server.py:178-236)
    │  while True:
-   │    out = await bus_msg.outbound.get()
-   │    if out.correlation_id != "a1b2c3d4e5": continue  ← 过滤其他请求
+   │    out = await bus_msg.outbound("http").get()
+   │    if out.correlation_id != "a1b2c3d4e5": continue  ← 过滤同频道其他请求
    │    if out.msg_type == "delta":       → yield SSE event: delta
    │    if out.msg_type == "thinking":    → yield SSE event: thinking
    │    if out.msg_type == "tool_start":  → yield SSE event: tool_start
@@ -291,47 +263,48 @@ class OutboundMessage:
 
 请求 A (cid="aaa"):
   POST → inbound("s1").put(InboundMessage(cid="aaa", "写代码"))
-    → serve("s1") 从队列取出消息 A
+    → serve("s1") 从队列取出消息 A，channel = "http"
     → process_message() → LLM 流式输出
-      → outbound: (cid="aaa", "delta", "def"), (cid="aaa", "delta", " main")...
+      → outbound("http"): (cid="aaa", "delta", "def"), (cid="aaa", "delta", " main")...
 
 请求 B (cid="bbb"):
   POST → inbound("s1").put(InboundMessage(cid="bbb", "搜索资料"))
     → 等待请求 A 的 process_message() 完成（同一 session 串行消费）
-    → serve("s1") 从队列取出消息 B
+    → serve("s1") 从队列取出消息 B，channel = "http"
     → process_message() → LLM 流式输出
-      → outbound: (cid="bbb", "delta", "搜索结果")...
+      → outbound("http"): (cid="bbb", "delta", "搜索结果")...
 
 前端 A (cid="aaa") 的 SSE consumer:
-  out = outbound_queue.get()
+  out = outbound("http").get()
   if out.correlation_id == "aaa": 渲染 ✓    ← 过滤掉 cid="bbb" 的消息
   if out.correlation_id == "bbb": 跳过 ✗
 
 前端 B (cid="bbb") 的 SSE consumer:
-  out = outbound_queue.get()
+  out = outbound("http").get()
   if out.correlation_id == "aaa": 跳过 ✗
   if out.correlation_id == "bbb": 渲染 ✓    ← 过滤掉 cid="aaa" 的消息
 ```
 
 关键保证：
 - 同一 session 内请求**串行处理**（单队列 → 单 `serve()` 消费者），保证会话状态一致性
-- 不同请求的输出通过 `correlation_id` 在共享 outbound 队列上**多路复用**
-- 每个 consumer 只取自己的消息，跳过其他消息（消息不会丢失——其他 consumer 会读到）
+- 不同请求的输出通过 `correlation_id` 在同一通道队列上**多路复用**
+- 每条消息至少被一个 consumer 消费——**不再丢弃非当前 cid 的消息**（跨通道完全隔离）
 
 ### 不同来源的消费者对比
 
 | 来源 | 入站方式 | 出站消费方式 | 过滤逻辑 | 特殊能力 |
 |------|---------|-------------|---------|---------|
 | **CLI** | `orchestrator.process_message()` 同步调用 | 无 MessageBus，回调直接更新 StreamingMessage（tui/widgets.py） | 无需过滤（单请求） | 直接渲染，零延迟 |
-| **HTTP SSE** | `POST /chat/{sid}` → inbound.put() | `async for` 读 outbound 队列 | `out.correlation_id != cid` → skip | 流式响应 |
-| **WebSocket** | `{"type":"chat"...}` → inbound.put() | `async for` 读 outbound 队列 | `out.correlation_id != cid` → skip | 支持 cancel（取消 in-flight task） |
+| **HTTP SSE** | `POST /chat/{sid}` → inbound.put() | `async for` 读 outbound("http") 队列 | `out.correlation_id != cid` → skip | 流式响应 |
+| **WebSocket** | `{"type":"chat"...}` → inbound.put() | `async for` 读 outbound("websocket") 队列 | `out.correlation_id != cid` → skip | 支持 cancel（取消 in-flight task） |
+| **WeChat** | `_on_message()` → inbound.put() | 后台 consumer 读 outbound("wechat") 队列 | 只处理 `final` 消息 | 无流式，通过 itchat 发送 |
 
 ## 设计要点
 
 - **`asyncio.sleep(0)` 防饿死**：每个 chunk 后让出事件循环，确保消费者能及时渲染，避免"伪流式"
 - **非流式降级**：`AgentInput` 未设置回调时自动走 `chat_with_retry`，节省非用户场景的开销
 - **session_key 路由入站**：per-session 独立队列，一个 session 的慢请求不阻塞其他 session
-- **correlation_id 路由出站**：共享 outbound 队列，消费者按 cid 过滤，实现多路复用
+- **source 路由出站**：per-channel 独立队列，按 `InboundMessage.source` 路由。不同频道消息完全隔离，不再丢弃非当前 `correlation_id` 的消息
 - **同一 session 串行**：`serve()` 单消费者串行处理，避免并发修改会话状态
-- **CLI vs HTTP 双路径**：CLI 直接渲染（最低延迟），HTTP/WS 通过 MessageBus 解耦（支持多消费者）
+- **CLI vs HTTP 双路径**：CLI 直接渲染（最低延迟），HTTP/WS/WeChat 通过 MessageBus 解耦（每通道独立队列）
 - **去重工具调用回调**：CLI 路径中 `_shown_tool_indices` 确保同一 tool_call delta 只触发一次 tool_start 事件

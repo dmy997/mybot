@@ -130,6 +130,29 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                 orchestrator.serve(bus_msg, session_key)
             )
 
+    def _push_channel(session_key: str) -> str:
+        """Dedicated per-session outbound channel for scheduled pushes."""
+        return f"push:{session_key}"
+
+    async def _deliver_scheduled(task: Any) -> None:
+        """Push a scheduled task's result by injecting its prompt onto the bus.
+
+        Routes the prompt with ``source="push:<session_key>"`` so serve()
+        writes every OutboundMessage to a per-session push channel that the
+        long-lived ``GET /events/{session_id}`` SSE stream drains.  This
+        channel is session-scoped (no correlation-id filtering), so results
+        reach any browser tab listening on ``/events`` for that session.
+        """
+        await _ensure_serve_task(task.session_key)
+        await bus_msg.inbound(task.session_key).put(InboundMessage(
+            session_key=task.session_key,
+            content=task.prompt,
+            source=_push_channel(task.session_key),
+            correlation_id=uuid.uuid4().hex,
+        ))
+
+    orchestrator.scheduled_tasks.set_deliver(_deliver_scheduled)
+
     # ------------------------------------------------------------------
     # HTTP endpoints
     # ------------------------------------------------------------------
@@ -190,7 +213,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
 
             try:
                 while True:
-                    out = await bus_msg.outbound.get()
+                    out = await bus_msg.outbound("http").get()
                     if out is None:
                         break
                     if out.correlation_id != cid:
@@ -234,6 +257,87 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                         break
             except asyncio.CancelledError:
                 raise
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    async def push_events(request: Request) -> StreamingResponse:
+        """Long-lived SSE stream for scheduled push results on a session.
+
+        Listens on a dedicated per-session push channel so scheduled delivery
+        works without correlation-id filtering.  The client opens this once
+        per session and receives all push-generated output (delta / tool
+        events / final / error).
+        """
+        if not _check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        session_id = request.path_params.get("session_id", "default")
+        push_channel = _push_channel(session_id)
+
+        async def event_stream():
+            await _ensure_serve_task(session_id)
+            queue = bus_msg.outbound(push_channel)
+
+            while True:
+                # Exit promptly when the browser tab closes / reloads so we
+                # don't leak an idle generator per page load.
+                if await request.is_disconnected():
+                    break
+                try:
+                    out = await asyncio.wait_for(queue.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    # Keep-alive so proxies / browsers don't close the connection
+                    yield ": keepalive\n\n"
+                    continue
+                # CancelledError (client disconnect / server shutdown) propagates
+                # out of the generator and stops the stream.
+
+                if out is None:
+                    break
+
+                if out.msg_type == "delta":
+                    yield _sse_event("delta", {"token": out.data})
+                elif out.msg_type == "thinking":
+                    yield _sse_event("thinking", {"token": out.data})
+                elif out.msg_type == "thinking_done":
+                    yield _sse_event("thinking_done", {})
+                elif out.msg_type == "tool_start":
+                    yield _sse_event("tool_start", {"name": out.data})
+                elif out.msg_type == "tool_end":
+                    yield _sse_event("tool_end", out.data)
+                elif out.msg_type == "tool_exec_start":
+                    yield _sse_event("tool_exec_start", out.data)
+                elif out.msg_type == "tool_exec_end":
+                    yield _sse_event("tool_exec_end", out.data)
+                elif out.msg_type == "final":
+                    data = out.data or {}
+                    content = data.get("content", "")
+                    if data.get("error"):
+                        yield _sse_event("error", {"message": data["error"]})
+                    else:
+                        snap = REGISTRY.collect_all()
+                        yield _sse_event("done", {
+                            "content": content,
+                            "stop_reason": data.get("stop_reason", "completed"),
+                            "paradigm": data.get("paradigm", "unknown"),
+                            "usage": data.get("usage", {}),
+                            "metrics": {
+                                "counters": snap.counters,
+                                "gauges": snap.gauges,
+                                "histograms": snap.histograms,
+                            },
+                        })
+                    # Keep listening — more pushes may come later
+                elif out.msg_type == "error":
+                    yield _sse_event("push_error", {"message": str(out.data)})
 
         return StreamingResponse(
             event_stream(),
@@ -314,7 +418,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                 ))
 
                 while True:
-                    out = await bus_msg.outbound.get()
+                    out = await bus_msg.outbound("websocket").get()
                     if out is None:
                         break
                     if out.correlation_id != cid:
@@ -435,6 +539,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         Route("/logs", logs_endpoint),
         Route("/traces", traces_endpoint),
         Route("/chat/{session_id}", chat_sse, methods=["POST"]),
+        Route("/events/{session_id}", push_events, methods=["GET"]),
         Route("/sessions", list_sessions, methods=["GET"]),
         Route("/sessions/{session_id}", get_session, methods=["GET"]),
         Route("/sessions/{session_id}/messages", get_session_messages, methods=["GET"]),
@@ -486,7 +591,9 @@ def main() -> None:
         import uvicorn
 
         async def _serve():
-            config = uvicorn.Config(app, host=host, port=port)
+            config = uvicorn.Config(
+            app, host=host, port=port, timeout_graceful_shutdown=5,
+        )
             server = uvicorn.Server(config)
             await orchestrator.start_services()
             await server.serve()

@@ -34,7 +34,7 @@ def orchestrator():
         msg = await bus.inbound(session_key).get()
         if msg is None:
             return
-        await bus.outbound.put(OutboundMessage(
+        await bus.outbound("default").put(OutboundMessage(
             session_key, msg.correlation_id, "final",
             {"content": "test response", "stop_reason": "stop",
              "paradigm": "react", "usage": {}},
@@ -124,7 +124,7 @@ class TestHTTPEndpoints:
             if msg is None:
                 return
             cid = msg.correlation_id
-            q = bus.outbound
+            q = bus.outbound("http")
             await q.put(OutboundMessage(session_key, cid, "delta", "hello "))
             await q.put(OutboundMessage(session_key, cid, "delta", "world"))
             await q.put(OutboundMessage(session_key, cid, "thinking", "thinking..."))
@@ -164,7 +164,7 @@ class TestHTTPEndpoints:
             if msg is None:
                 return
             _captured_model = msg.model
-            await bus.outbound.put(OutboundMessage(
+            await bus.outbound("http").put(OutboundMessage(
                 session_key, msg.correlation_id, "final",
                 {"content": "ok", "stop_reason": "stop",
                  "paradigm": "react", "usage": {}},
@@ -184,6 +184,47 @@ class TestHTTPEndpoints:
             resp.read()  # consume the stream
 
         assert _captured_model == "gpt-4o"
+
+
+class TestPushEvents:
+    """Scheduled-task push delivery via the per-session push channel."""
+
+    def test_deliver_scheduled_routes_to_push_channel(self, orchestrator):
+        """The injected deliver callback must set source='push:<session_key>'."""
+        from core.message_bus import MessageBus
+
+        bus = MessageBus()
+
+        async def _idle_serve(b, sk):  # noqa: ARG001
+            await asyncio.sleep(0)
+
+        orchestrator.serve = AsyncMock(side_effect=_idle_serve)
+
+        create_app(orchestrator, bus_msg=bus)
+        # create_app registers the deliver callback via set_deliver(cb)
+        deliver_cb = orchestrator.scheduled_tasks.set_deliver.call_args[0][0]
+
+        task = MagicMock(session_key="test", prompt="say hi", channel="http")
+
+        async def _run():
+            await deliver_cb(task)
+            return await bus.inbound("test").get()
+
+        inbound = asyncio.run(_run())
+        assert inbound.source == "push:test"
+        assert inbound.content == "say hi"
+
+    def test_push_events_route_registered(self, orchestrator):
+        """GET /events/{session_id} is wired into the app route table.
+
+        The endpoint is a long-lived SSE stream that never terminates, so it
+        cannot be exercised through TestClient without deadlocking on close.
+        Its delivery behaviour is validated by the deliver-routing test above
+        and by manual end-to-end smoke.
+        """
+        app = create_app(orchestrator)
+        paths = {getattr(r, "path", None) for r in app.routes}
+        assert "/events/{session_id}" in paths
 
 
 class TestAuth:
@@ -235,8 +276,8 @@ class TestWebSocket:
             if msg is None:
                 return
             cid = msg.correlation_id
-            await bus.outbound.put(OutboundMessage(session_key, cid, "delta", "response"))
-            await bus.outbound.put(OutboundMessage(session_key, cid, "final",
+            await bus.outbound("websocket").put(OutboundMessage(session_key, cid, "delta", "response"))
+            await bus.outbound("websocket").put(OutboundMessage(session_key, cid, "final",
                 {"content": "response", "stop_reason": "stop", "paradigm": "react", "usage": {}}))
 
         orchestrator.serve = AsyncMock(side_effect=_fake_serve)
