@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -182,6 +183,22 @@ class TestLifecycle:
         (workspace / "sessions" / "bad.json").write_text("garbage", encoding="utf-8")
         sessions = mgr.list_sessions()
         assert any(s["key"] == "bad" for s in sessions)
+
+    def test_list_skips_non_session_json(self, mgr, workspace):
+        # A runner checkpoint shares the sessions dir but has no top-level "key".
+        (workspace / "sessions" / "xiaohongshu_checkpoint.json").write_text(
+            json.dumps({
+                "session_key": "xiaohongshu",
+                "messages": [],
+                "step_count": 1,
+                "updated_at": "2026-07-07T20:00:00",
+            }),
+            encoding="utf-8",
+        )
+        mgr.save_session(mgr.get_session("real"))
+        keys = {s["key"] for s in mgr.list_sessions()}
+        assert "real" in keys
+        assert "xiaohongshu_checkpoint" not in keys
 
 
 # ---------------------------------------------------------------------------

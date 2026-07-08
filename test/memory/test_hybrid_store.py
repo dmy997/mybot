@@ -52,6 +52,37 @@ class TestInit:
 
 
 # ---------------------------------------------------------------------------
+# Embedding model loading (offline-first)
+# ---------------------------------------------------------------------------
+
+
+class TestModelLoad:
+    def test_prefers_local_cache(self, hybrid_store):
+        calls: list[dict] = []
+
+        def fake_st(name, **kw):
+            calls.append(kw)
+            return object()
+
+        model = hybrid_store._load_model(fake_st)
+        assert model is not None
+        assert calls == [{"local_files_only": True}]
+
+    def test_falls_back_to_online_when_uncached(self, hybrid_store):
+        calls: list[dict] = []
+
+        def fake_st(name, **kw):
+            calls.append(kw)
+            if kw.get("local_files_only"):
+                raise OSError("not cached")
+            return object()
+
+        model = hybrid_store._load_model(fake_st)
+        assert model is not None
+        assert calls == [{"local_files_only": True}, {}]
+
+
+# ---------------------------------------------------------------------------
 # Indexing
 # ---------------------------------------------------------------------------
 

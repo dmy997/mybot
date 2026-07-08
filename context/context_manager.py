@@ -904,16 +904,27 @@ class ContextManager:
             return True
         return False
 
-    def recall(self, query: str, *, top_n: int = 10) -> list[dict]:
+    def recall(self, query: str, *, top_n: int = 10, session_key: str | None = None) -> list[dict]:
         """Search memory content. Uses hybrid search when available, falls back
         to substring matching on MEMORY.md.
         """
+        import time
+
         if not query.strip():
             return []
 
+        t0 = time.monotonic()
         if self._hybrid_store is not None:
             try:
                 sr = self._hybrid_store.search(query, top_k=top_n)
+                ms = (time.monotonic() - t0) * 1000
+                mode = "hybrid" if self._hybrid_store._has_vec else "fts5_only"
+                from observability.log import MemorySearchEvent, emit
+                emit(MemorySearchEvent(
+                    query=query[:80], mode=mode,
+                    result_count=len(sr), latency_ms=round(ms, 2),
+                    session_key=session_key,
+                ))
                 if sr:
                     return [
                         {
@@ -927,7 +938,15 @@ class ContextManager:
             except Exception:
                 logger.debug("Hybrid search failed, falling back to substring", exc_info=True)
 
-        return self._substring_recall(query, top_n=top_n)
+        results = self._substring_recall(query, top_n=top_n)
+        ms = (time.monotonic() - t0) * 1000
+        from observability.log import MemorySearchEvent, emit
+        emit(MemorySearchEvent(
+            query=query[:80], mode="substring",
+            result_count=len(results), latency_ms=round(ms, 2),
+            session_key=session_key,
+        ))
+        return results
 
     def _substring_recall(self, query: str, *, top_n: int = 10) -> list[dict]:
         """Fallback: case-insensitive substring search in MEMORY.md."""

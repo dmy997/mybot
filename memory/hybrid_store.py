@@ -16,6 +16,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -132,7 +133,7 @@ class HybridStore:
         try:
             from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self._embedding_model_name)
+            self._model = self._load_model(SentenceTransformer)
             self._model_dim = self._model.get_sentence_embedding_dimension()
             return self._model
         except Exception:
@@ -143,6 +144,24 @@ class HybridStore:
                 "FTS5 keyword search only"
             )
             return None
+
+    def _load_model(self, st_cls: Any) -> object:
+        """Load the embedding model, preferring the local HuggingFace cache.
+
+        Tries ``local_files_only=True`` first so a cached model loads without
+        any network probe — avoiding the blocking HEAD request to
+        huggingface.co (and ``Errno 101 Network is unreachable`` where it is
+        unreachable).  Falls back to a normal online load, which downloads on
+        first use, only when the model is not yet cached.
+        """
+        try:
+            return st_cls(self._embedding_model_name, local_files_only=True)
+        except Exception:
+            logger.info(
+                "Embedding model {!r} not in local cache; downloading once",
+                self._embedding_model_name,
+            )
+            return st_cls(self._embedding_model_name)
 
     def _embed(self, texts: list[str]) -> list[list[float]] | None:
         model = self._ensure_model()
@@ -301,6 +320,16 @@ class HybridStore:
             vec_results = self._vector_search(query, _VEC_TOP_N)
 
         text_results = self._text_search(query, _TEXT_TOP_N)
+
+        mode_parts: list[str] = []
+        if vec_results:
+            mode_parts.append(f"vector({len(vec_results)})")
+        if text_results:
+            mode_parts.append(f"fts5({len(text_results)})")
+        logger.info("hybrid search [%s] → %d fused → %d results",
+                      "+".join(mode_parts) or "none",
+                      len(vec_results | text_results),
+                      min(top_k, len(set(vec_results) | set(text_results))))
 
         fused = self._fuse(vec_results, text_results)
         fused = self._apply_temporal_decay(fused)

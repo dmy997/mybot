@@ -221,7 +221,13 @@ class SessionManager:
         return False
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        """List all session files with metadata."""
+        """List all session files with metadata.
+
+        Files that parse as a dict but lack a top-level ``"key"`` are not
+        sessions this manager wrote (every :meth:`save_session` includes
+        ``"key"``) — e.g. runner checkpoints that share the directory — so
+        they are skipped rather than surfaced with a fabricated key.
+        """
         result: list[dict[str, Any]] = []
         for path in sorted(self.sessions_dir.glob("*.json")):
             try:
@@ -230,8 +236,10 @@ class SessionManager:
                     result.append({"key": path.stem, "message_count": 0,
                                    "error": f"unexpected type: {type(data).__name__}"})
                     continue
+                if "key" not in data:
+                    continue  # not a session (e.g. a runner checkpoint)
                 result.append({
-                    "key": data.get("key", path.stem),
+                    "key": data["key"],
                     "message_count": len(data.get("messages", [])),
                     "created_at": data.get("created_at", ""),
                     "updated_at": data.get("updated_at", ""),
