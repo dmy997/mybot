@@ -158,6 +158,17 @@ class AgentRunEvent:
     error: str | None = None
 
 
+@dataclass
+class MemorySearchEvent:
+    """Emitted when memory recall is performed."""
+
+    query: str
+    mode: str  # "hybrid" | "fts5_only" | "substring"
+    result_count: int
+    latency_ms: float = 0.0
+    session_key: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # emit helper
 # ---------------------------------------------------------------------------

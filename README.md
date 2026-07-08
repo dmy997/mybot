@@ -1,7 +1,7 @@
 # mybot
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-782%20passed-green)](.)
+[![Tests](https://img.shields.io/badge/tests-820%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 受 **Claude Code**、**nanobot**、**OpenClaw** 启发，通过 Claude Code vibe coding 开发的个人 AI 助手框架。可读性强，高度模块化，轻量无冗余。
@@ -14,10 +14,11 @@
 - **范式 Agent** — ReAct（单轮推理+行动）、Plan-and-Solve（先规划后执行）；通过 `discover_agents()` 自动发现
 - **流式输出** — SSE、WebSocket、Rich 终端 UI，实时渲染工具调用
 - **可插拔中间件** — 责任链模式，拦截 LLM 调用、工具执行、Agent 生命周期
-- **长期记忆** — 基于文件的类型化记忆（用户/反馈/项目/参考），支持关键词检索
+- **长期记忆** — 基于文件的类型化记忆（用户/反馈/项目/参考），支持混合搜索（向量+FTS5）
 - **上下文管理** — 非破坏性压缩、会话中断修复、空闲自动压缩
 - **可观测性** — 结构化日志（loguru）、自定义指标/追踪，以及可选的 OpenTelemetry → Jaeger 桥接
 - **断点恢复** — 长任务崩溃后可从检查点续跑，避免重新推理
+- **多频道接入** — 可扩展频道架构（BaseChannel ABC），支持 CLI、Web UI、微信个人号；MessageBus 每通道独立出站队列，消息不丢失
 - **13 个内置 Skill** — docx、pptx、pdf、xlsx、canvas-design、frontend-design、algorithmic-art、brand-guidelines、internal-comms、mcp-builder、skill-creator、slack-gif-creator、theme-factory、web-artifacts-builder、webapp-testing
 
 ## 架构
@@ -25,7 +26,7 @@
 ### 请求流程
 
 ```
-HTTP/WS 或 CLI → Orchestrator → ContextManager.build_messages()
+HTTP/WS/WeChat 或 CLI → Orchestrator → ContextManager.build_messages()
                                    ├─ 修复中断会话
                                    ├─ 组装 system prompt
                                    ├─ 加载会话历史
@@ -49,10 +50,11 @@ HTTP/WS 或 CLI → Orchestrator → ContextManager.build_messages()
 | AgentCore | `core/runner.py` | 共享执行循环——流式输出、工具执行、上下文压缩、错误恢复 |
 | Middleware | `core/middleware.py` | 可插拔中间件链——拦截 LLM 调用、工具执行、Agent 生命周期 |
 | EventBus | `core/events.py` | 异步发布/订阅事件总线——Agent/LLM/Tool 生命周期事件 |
-| MessageBus | `core/message_bus.py` | 双队列消息总线——解耦输入源与输出消费者 |
+| MessageBus | `core/message_bus.py` | 每会话入站 + 每通道出站队列——不同频道消息完全隔离 |
 | ContextManager | `context/context_manager.py` | 会话持久化、空闲压缩、token 预算压缩、中断修复 |
 | MemoryStore | `memory/store.py` | 类型化长期记忆的文件 I/O |
-| StreamRenderer | `observability/stream_renderer.py` | Rich Live 终端流式渲染，Markdown + ThinkingSpinner |
+| BaseChannel | `channels/base.py` | 频道抽象——ChannelMessage、send_reply、build_session_key |
+| WeChatBot | `channels/wechat.py` | 微信个人号频道——itchat-uos → MessageBus → Orchestrator |
 | SkillsLoader | `core/skills.py` | 基于文件的 Skill 发现（YAML），自动注入 system prompt |
 
 ### Agent 范式
@@ -72,7 +74,8 @@ cp .env.example .env   # 然后填入 API 密钥
 可选依赖：
 
 ```bash
-pip install -e ".[otel]"   # OpenTelemetry → Jaeger 桥接
+pip install -e ".[otel]"     # OpenTelemetry → Jaeger 桥接
+pip install -e ".[wechat]"   # 微信个人号频道
 ```
 
 ## 快速开始
@@ -84,6 +87,10 @@ mybot
 # HTTP/WS 服务器
 mybot-server
 # 浏览器打开 http://127.0.0.1:8080
+
+# 微信个人号
+mybot-wechat
+# 终端显示二维码，手机微信扫码登录
 
 # WebSocket
 websocat ws://127.0.0.1:8080/ws/default
@@ -173,7 +180,7 @@ MYBOT_OTEL_ENABLED=1 mybot
 
 ```bash
 ruff check .                               # lint
-pytest                                     # 全部 782 个测试
+pytest                                     # 全部 820 个测试
 pytest test/core/test_middleware.py -v     # 单个测试文件
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 bash scripts/loc.sh                        # 按模块统计代码行数
@@ -220,7 +227,7 @@ python -m evals --benchmark gaia                                              # 
 - 工具系统安全边界（`ToolGuard`、作用域、能力检查）
 - HTTP API + WebSocket + SSE 流式 + Web UI
 - 可插拔中间件链（Agent / LLM / Tool 钩子）
-- EventBus（异步发布/订阅）+ MessageBus（双队列消息总线）
+- EventBus（异步发布/订阅）+ MessageBus（每通道独立出站队列）
 - 13 个内置 Skill
 - 上下文管理子系统（压缩、修复、空闲自动压缩）
 - 基于文件的长期记忆系统（MemoryStore + Consolidator + Dream 两级管道）
@@ -229,19 +236,20 @@ python -m evals --benchmark gaia                                              # 
 - OpenTelemetry 桥接 → Jaeger trace 可视化
 - MCP（Model Context Protocol）集成 — 连接外部工具服务器
 - Memory Dream 系统 — 两阶段 LLM 记忆合并（Consolidator 实时摘要 + Dream 周期回顾）
+- 混合搜索 + 时间衰减 — SQLite + sqlite-vec + FTS5，30 天半衰期指数衰减
+- 可扩展频道架构 + 微信个人号频道 — BaseChannel ABC，MessageBus 每通道路由
+- 混合搜索可观测性 — 终端和 Web UI 日志视图显示搜索模式
 
 ### P2 — 质量与可靠性
 
 - ~~**Agent 性能评估系统（第一阶段）**~~ — 9 个自定义 YAML 任务 + 4 个规则评分器 + pytest CI 集成 ✅
 - ~~**Agent 性能评估系统（第二阶段）**~~ — BFCL/GAIA 社区基准、LLM Judge 评分器、CLI 入口 ✅
-- **混合搜索** — SQLite + sqlite-vec + FTS5 为 MEMORY.md 和 history.jsonl 建立可搜索索引（参考 OpenClaw）
-- **时间衰减** — 指数衰减让旧记忆在搜索中权重自然下降（参考 OpenClaw 30 天半衰期）
 
 ### P3 — 扩展能力
 
 - **多模态输入** — 支持图片、音频等非文本输入，通过 Provider 多模态 API 传入 LLM
 - **更多 LLM Provider** — Anthropic 直连、Ollama 本地模型
-- **多消息频道** — 微信、Telegram、Discord 等外部频道接入
+- **更多消息频道** — QQ、Telegram、飞书等外部频道接入
 - **Heartbeat 服务** — 周期任务检查，按 HEARTBEAT.md 清单定时执行（参考 nanobot）
 - **Skill 系统增强** — Dream 自动提取重复工作流为可复用 SKILL.md
 - **Chunk 级检索** — 大文件分块存储和检索，减少上下文浪费

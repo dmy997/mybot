@@ -350,6 +350,104 @@ function _loadMessageHistory(sessionKey) {
   historyDraft = '';
 }
 
+// =========================================================================
+// Push events (scheduled task delivery via EventSource)
+// =========================================================================
+let _pushSource = null;
+
+function _connectPushEvents(sessionKey) {
+  if (_pushSource) { _pushSource.close(); _pushSource = null; }
+
+  const url = '/events/' + encodeURIComponent(sessionKey);
+  _pushSource = new EventSource(url);
+
+  let asstEl = null, contentEl = null;
+  let thinkingBlock = null, thinkingBody = null;
+  let toolBlock = null, toolBody = null;
+  let textBuffer = '';
+
+  function _ensureBubble() {
+    if (asstEl) return;
+    asstEl = addBubble('assistant', '');
+    contentEl = asstEl.querySelector('.msg-content');
+  }
+
+  _pushSource.addEventListener('delta', function(e) {
+    let data = JSON.parse(e.data);
+    _ensureBubble();
+    textBuffer += data.token || '';
+    contentEl.innerHTML = marked.parse(textBuffer);
+    scrollDown();
+    if (thinkingBlock) { thinkingBlock.classList.remove('open'); thinkingBlock = null; }
+  });
+
+  _pushSource.addEventListener('thinking', function(e) {
+    let data = JSON.parse(e.data);
+    _ensureBubble();
+    if (!thinkingBlock) {
+      thinkingBlock = createThinkBlock(asstEl);
+      thinkingBody = thinkingBlock.querySelector('.think-body');
+    }
+    thinkingBlock.classList.add('open');
+    thinkingBody.textContent += data.token || '';
+    scrollDown();
+  });
+
+  _pushSource.addEventListener('thinking_done', function() {
+    if (thinkingBlock) {
+      setTimeout(function() { thinkingBlock && thinkingBlock.classList.remove('open'); }, 2000);
+    }
+  });
+
+  _pushSource.addEventListener('tool_start', function(e) {
+    let data = JSON.parse(e.data);
+    _ensureBubble();
+    if (!toolBlock || toolBlock.dataset.name !== data.name) {
+      toolBlock = createToolBlock(asstEl, data.name);
+      toolBody = toolBlock.querySelector('.tool-body');
+    }
+  });
+
+  _pushSource.addEventListener('tool_end', function(e) {
+    let data = JSON.parse(e.data);
+    if (toolBlock) {
+      toolBody.textContent += (data.detail || JSON.stringify(data)) + '\n';
+      if (data.status === 'error') {
+        toolBlock.querySelector('.tool-summary').style.color = '#f87171';
+      }
+    }
+  });
+
+  _pushSource.addEventListener('done', function(e) {
+    let data = JSON.parse(e.data);
+    _ensureBubble();
+    if (!textBuffer && data.content) {
+      contentEl.innerHTML = marked.parse(data.content);
+    }
+    if (data.usage) {
+      let badge = document.createElement('div');
+      badge.className = 'usage-badge';
+      badge.textContent = 'in:' + (data.usage.prompt_tokens || '?')
+        + ' out:' + (data.usage.completion_tokens || '?');
+      asstEl.appendChild(badge);
+    }
+    asstEl = null; contentEl = null; thinkingBlock = null; toolBlock = null; textBuffer = '';
+  });
+
+  _pushSource.addEventListener('push_error', function(e) {
+    console.warn('Push error:', e.data);
+  });
+
+  _pushSource.onerror = function() {
+    if (asstEl && !textBuffer) { asstEl.remove(); }
+    asstEl = null; contentEl = null; thinkingBlock = null; toolBlock = null; textBuffer = '';
+  };
+}
+
+function _disconnectPushEvents() {
+  if (_pushSource) { _pushSource.close(); _pushSource = null; }
+}
+
 function _saveMessageHistory(sessionKey) {
   if (messageHistory.length > _HISTORY_MAX) {
     messageHistory = messageHistory.slice(-_HISTORY_MAX);
@@ -434,6 +532,7 @@ function selectSession(key) {
   currentSession = key;
   document.getElementById('current-session-name').textContent = key;
   _loadMessageHistory(key);
+  _connectPushEvents(key);
   switchView('chat');
   loadSessions();
   loadHistory(key);
@@ -1042,7 +1141,7 @@ function fmtMs(v) {
   const sessions = await loadSessions();
   const recent = sessions.find(s => s.message_count > 0);
   if (recent) selectSession(recent.key);
-  else loadHistory('default');
+  else { _connectPushEvents('default'); loadHistory('default'); }
 })();
 </script>
 </body>

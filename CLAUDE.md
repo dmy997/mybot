@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, and HTTP/WS API. Designed to work with any OpenAI-compatible API endpoint. 678 tests, all passing.
+mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, HTTP/WS API, and extensible chat channels (WeChat). Designed to work with any OpenAI-compatible API endpoint. 820 tests, all passing.
 
 ## Development Setup
 
@@ -36,7 +36,8 @@ mybot-server           # HTTP/WS server (core.server:main), then open http://127
 - `agents/` — ReAct Agent (single-pass) + PlanSolve Agent (two-phase). Auto-discovered via `discover_agents()`
 - `evals/` — Agent evaluation system (custom YAML tasks + BFCL/GAIA benchmarks)
 - `context/` — ContextManager (system prompt assembly, compression, session repair) + SessionManager (JSON persistence)
-- `tools/` — 10 tools (bash, file R/W, grep, webfetch, websearch, memory CRUD, subagent), ToolRegistry, ToolGuard security
+- `tools/` — bash, file R/W, grep, webfetch, websearch, memory CRUD, subagent, `schedule_task` (create/list/cancel periodic tasks), ToolRegistry, ToolGuard security
+- `services/` — `CronScheduler` (self-driven timer, cron-expression + interval jobs) + `ScheduledTaskService` (chat-created push tasks + system side-effect tasks like Xiaohongshu). See `docs/scheduled-tasks.md`
 - `memory/` — Long-term file-based memory (MemoryStore, Consolidator + Dream pipeline)
 - `observability/` — Structured logging (loguru), Prometheus-style metrics, span tracing, rich CLI display
 - `config/` — `.env` auto-loading, typed `Config` class
