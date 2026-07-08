@@ -51,12 +51,31 @@ _on_timer()
 @dataclass
 class CronJob:
     name: str
-    interval_hours: float
+    interval_hours: float = 0.0   # 间隔模式（Dream 用）
+    schedule: str = ""            # cron 表达式模式，如 "0 8 * * *"（定时任务用）
     next_run_at_ms: int = 0    # 下次运行时间戳（毫秒）
     last_run_at_ms: int = 0    # 上次运行时间戳
     last_status: str | None    # "ok" | "error"
     last_error: str | None
 ```
+
+### cron 表达式支持
+
+`register_job` 同时支持两种调度模式，二选一：
+
+```python
+cron.register_job("dream", interval_hours=2)         # 间隔：每 2 小时
+cron.register_job("user:a1b2", schedule="0 8 * * *") # cron：每天 8:00（本地时区）
+```
+
+- 传 `schedule` 时用 `croniter` 校验并计算下次运行；无效表达式立即 `raise ValueError`
+- `_compute_next_run` 对 cron 任务用 `croniter(expr, base).get_next(datetime)`（本地时区），
+  对间隔任务用 `last + interval_hours`
+- `unregister_job(name)` 移除 job 并重算定时器——用于用户取消定时任务
+
+> 上层的[统一定时任务框架](scheduled-tasks.md)（`ScheduledTaskService`）正是用
+> `register_job(schedule=...)` / `unregister_job` 把聊天创建的周期任务和系统任务挂到这里。
+> Dream 仍用间隔模式，且走原生方法而非 agent，保持独立。
 
 ### 首次运行延迟
 
@@ -79,7 +98,7 @@ def _load_state(self) -> dict:
     # 读取 cron_state.json，恢复各 job 的上次运行时间
 
 def _save_state(self) -> None:
-    # 原子写入（tmp + replace）cron_state.json
+    # 通过 utils.atomic_write 持久化：fsync + tmp + os.replace + 父目录 fsync
 ```
 
 ### 并发保护
@@ -293,5 +312,5 @@ Orchestrator.stop_services()
 - **Per-job 去重锁**：同一 job 不会并发执行，上一轮未完成则跳过本次
 - **失败重试一次**：job 执行失败立即重试，之后标记错误并安排下次运行
 - **状态持久化**：`cron_state.json` 记录最后运行时间，重启后按间隔继续（不会因重启而重置计时）
-- **原子写入**：cron 状态和 memory 文件均使用 `tmp + replace` 模式
+- **原子写入**：cron 状态和 memory 文件均通过 `utils.atomic_write`（`fsync` + `tmp` + `os.replace` + 父目录 `fsync`）持久化，SIGKILL / 断电中途写入也不会截断或丢盘
 - **Phase 1/2 分离**：LLM 产出结构化指令 → 程序化精确合并，避免 LLM 直接修改文件内容的风险

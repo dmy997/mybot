@@ -16,11 +16,15 @@ import json
 import time
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from croniter import croniter
 from loguru import logger
+
+from utils.utils import atomic_write
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,7 +47,8 @@ class CronJob:
     """Runtime state for a single scheduled job."""
 
     name: str
-    interval_hours: float
+    interval_hours: float = 0.0
+    schedule: str = ""  # cron expression; when set, overrides interval_hours
     next_run_at_ms: int = 0
     last_run_at_ms: int = 0
     last_status: str | None = None  # "ok" | "error"
@@ -85,14 +90,26 @@ class CronScheduler:
         self,
         name: str,
         *,
-        interval_hours: float,
+        interval_hours: float | None = None,
+        schedule: str = "",
     ) -> CronJob:
         """Register a periodic job (idempotent on re-registration).
+
+        Provide either ``interval_hours`` (every N hours, relative to the
+        last run) or ``schedule`` (a cron expression evaluated in local
+        time).  When both are given the cron ``schedule`` wins.
 
         If the loop is already running the timer is re-armed so the new
         job's schedule takes effect immediately.
         """
-        job = CronJob(name=name, interval_hours=interval_hours)
+        if schedule and not croniter.is_valid(schedule):
+            raise ValueError(f"Invalid cron expression: {schedule!r}")
+
+        job = CronJob(
+            name=name,
+            interval_hours=float(interval_hours) if interval_hours else 0.0,
+            schedule=schedule,
+        )
 
         # Restore persisted state so last-run time survives restarts
         existing = self._load_state().get(name)
@@ -101,23 +118,51 @@ class CronScheduler:
             job.last_status = existing.get("last_status")
             job.last_error = existing.get("last_error")
 
-        # Compute next run: if never run, start from now; else from last run
-        if job.last_run_at_ms > 0:
-            job.next_run_at_ms = job.last_run_at_ms + int(interval_hours * 3600 * 1000)
+        # Compute next run.
+        if job.schedule:
+            # Wall-clock cron: next occurrence after now (ignores last-run drift)
+            job.next_run_at_ms = self._compute_next_run(job, _now_ms())
+        elif job.last_run_at_ms > 0:
+            job.next_run_at_ms = job.last_run_at_ms + int(job.interval_hours * 3600 * 1000)
         else:
             # First run: delay by the full interval so the user isn't
             # surprised by an immediate Dream on first launch.
-            job.next_run_at_ms = _now_ms() + int(interval_hours * 3600 * 1000)
+            job.next_run_at_ms = _now_ms() + int(job.interval_hours * 3600 * 1000)
 
         self._jobs[name] = job
         self._ensure_loop()
         logger.info(
-            "Cron: registered job {!r} (every {}h, next in {}s)",
+            "Cron: registered job {!r} ({}, next in {}s)",
             name,
-            interval_hours,
+            f"cron={job.schedule!r}" if job.schedule else f"every {job.interval_hours}h",
             max(0, (job.next_run_at_ms - _now_ms()) // 1000),
         )
         return job
+
+    def unregister_job(self, name: str) -> None:
+        """Remove a registered job and re-arm the timer.  Safe if absent."""
+        if name not in self._jobs:
+            return
+        self._jobs.pop(name, None)
+        self._locks.pop(name, None)
+        self._save_state()  # persist the removal (drops stale last-run entry)
+        if self._running:
+            with suppress(RuntimeError):
+                asyncio.get_running_loop()
+                self._arm_timer()
+        logger.info("Cron: unregistered job {!r}", name)
+
+    def _compute_next_run(self, job: CronJob, after_ms: int) -> int:
+        """Return the next fire time (ms) strictly after *after_ms*.
+
+        Uses ``croniter`` in local time for cron ``schedule`` jobs, else
+        ``interval_hours`` arithmetic.
+        """
+        if job.schedule:
+            base = datetime.fromtimestamp(after_ms / 1000)
+            nxt = croniter(job.schedule, base).get_next(datetime)
+            return int(nxt.timestamp() * 1000)
+        return after_ms + int(job.interval_hours * 3600 * 1000)
 
     async def start(self) -> None:
         """Start the timer loop (explicit, for re-start after ``stop()``)."""
@@ -247,7 +292,7 @@ class CronScheduler:
                 logger.exception("Cron: job {!r} failed after retry", job.name)
 
             job.last_run_at_ms = start_ms
-            job.next_run_at_ms = _now_ms() + int(job.interval_hours * 3600 * 1000)
+            job.next_run_at_ms = self._compute_next_run(job, _now_ms())
             self._save_state()
 
     # -- persistence ----------------------------------------------------------
@@ -269,11 +314,4 @@ class CronScheduler:
                 "last_status": job.last_status,
                 "last_error": job.last_error,
             }
-        self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._state_file.with_suffix(".json.tmp")
-        try:
-            tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(self._state_file)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
+        atomic_write(self._state_file, json.dumps(state, ensure_ascii=False))

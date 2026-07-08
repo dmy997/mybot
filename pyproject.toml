@@ -35,6 +35,7 @@ dependencies = [
     "textual>=8.0",
     "sqlite-vec>=0.1",
     "sentence-transformers>=3.0",
+    "croniter>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +56,9 @@ otel = [
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp-proto-http>=1.20",
+]
+wechat = [
+    "itchat-uos>=1.4",
 ]
 
 [tool.setuptools.packages.find]
@@ -77,6 +81,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [project.scripts]
 mybot = "core.orchestrator:main"
 mybot-server = "core.server:main"
+mybot-wechat = "channels.wechat:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

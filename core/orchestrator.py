@@ -35,13 +35,18 @@ from observability.otel_bridge import auto_install as auto_install_otel
 from observability.subscribers import install as install_subscribers
 from observability.trace import tracer
 from services.cron import CronScheduler
-from services.xiaohongshu import XiaohongshuService
+from services.scheduled_tasks import ScheduledTaskService
+from services.xiaohongshu import XIAOHONGSHU_SESSION_KEY, xiaohongshu_prompt
 from tools import ToolRegistry
 from tools.mcp.client_manager import MCPClientManager
+from tools.schedule_task import ScheduleTaskTool
 from tools.tool import Tool
 
 from .dispatcher import Dispatcher
 from .runner import AgentInput
+from .session_context import SessionContext
+from .session_context import reset as reset_session
+from .session_context import set_current as set_session
 
 
 def _summarize_tool_args(args_json: str) -> str:
@@ -183,7 +188,9 @@ class Orchestrator:
         else:
             from agents import discover_agents
 
-            agents = discover_agents(provider, middleware=middleware, max_context_tokens=max_context_tokens)
+            agents = discover_agents(
+                provider, middleware=middleware, max_context_tokens=max_context_tokens
+            )
             self._dispatcher = Dispatcher(
                 agents, provider=provider, classify_model=compress_model
             )
@@ -215,8 +222,23 @@ class Orchestrator:
         )
         self.cron.register_job("dream", interval_hours=2)
 
-        self._xiaohongshu = XiaohongshuService(workspace=self.workspace)
-        self.cron.register_job("xiaohongshu", interval_hours=24)
+        # Unified scheduled tasks (chat-created + system) on top of cron.
+        # `deliver` is wired later by the entry point (channel-specific);
+        # `run_agent` runs internal side-effect tasks via the agent pipeline.
+        self._scheduled = ScheduledTaskService(
+            self.workspace,
+            self.cron,
+            run_agent=self._run_scheduled_agent,
+        )
+        self._scheduled.seed_system_task(
+            task_id="xiaohongshu",
+            schedule="0 20 * * *",
+            prompt=xiaohongshu_prompt(self.workspace),
+            session_key=XIAOHONGSHU_SESSION_KEY,
+            skills=["xiaohongshu"],
+        )
+        self._scheduled.load()
+        self._tools.register(ScheduleTaskTool(self._scheduled))
 
     def _register_default_tools(self) -> None:
         """Auto-discover and register tools available in the ``"core"`` scope."""
@@ -276,12 +298,23 @@ class Orchestrator:
 
     # -- Cron / Dream ---------------------------------------------------------
 
+    async def _run_scheduled_agent(
+        self, session_key: str, prompt: str, skills: list[str] | None,
+    ) -> None:
+        """Run an internal side-effect scheduled task through the agent pipeline."""
+        await self.process_message(
+            session_key=session_key,
+            user_input=prompt,
+            skills=skills,
+            source="cron",
+        )
+
     async def _on_cron_job(self, name: str) -> None:
         """Route cron job *name* to the appropriate handler."""
         if name == "dream":
             await self._dream.run()
-        if name == "xiaohongshu":
-            await self._xiaohongshu.on_cron_trigger(self)
+        else:
+            await self._scheduled.fire(name)
 
     async def start_services(self) -> None:
         """Start background services (MCP + cron)."""
@@ -302,6 +335,7 @@ class Orchestrator:
         session_key: str,
         user_input: str,
         *,
+        source: str = "",
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
@@ -339,6 +373,7 @@ class Orchestrator:
             session_key=session_key,
             user_input=user_input[:200],
         ):
+            token = set_session(SessionContext(session_key, source))
             try:
                 # 1. Resolve active skills
                 active_skills = list(skills or [])
@@ -510,6 +545,8 @@ class Orchestrator:
                     stop_reason="error",
                     error=str(exc),
                 )
+            finally:
+                reset_session(token)
 
     # -- idle compression -------------------------------------------------------
 
@@ -603,22 +640,23 @@ class Orchestrator:
 
         _dropped_logged = False
 
-        def _safe_put(msg: OutboundMessage) -> None:
-            """Put *msg* on the shared outbound queue without blocking.
+        def _safe_put(msg: OutboundMessage, channel: str = "default") -> None:
+            """Put *msg* on the per-channel outbound queue without blocking.
 
             Uses ``put_nowait`` to avoid deadlocking the orchestrator when
-            no SSE / WS consumer is draining the queue.  Drops the message
+            no consumer is draining that channel's queue.  Drops the message
             (with a single warning) when the queue is full.
             """
             nonlocal _dropped_logged
             try:
-                bus_msg.outbound.put_nowait(msg)
+                bus_msg.outbound(channel).put_nowait(msg)
             except asyncio.QueueFull:
                 if not _dropped_logged:
                     logger.warning(
-                        "Outbound queue full (maxsize={}), dropping messages "
-                        "for session {!r} — consumer may have disconnected",
-                        bus_msg.outbound.maxsize, session_key,
+                        "Outbound queue full for channel {!r} (maxsize={}), "
+                        "dropping messages for session {!r} — consumer may "
+                        "have disconnected",
+                        channel, bus_msg.outbound(channel).maxsize, session_key,
                     )
                     _dropped_logged = True
 
@@ -637,41 +675,43 @@ class Orchestrator:
 
                 msg: InboundMessage = raw
                 cid = msg.correlation_id
+                channel = msg.source or "default"
                 _dropped_logged = False  # reset per inbound message
 
                 async def _on_delta(token: str) -> None:
-                    _safe_put(OutboundMessage(session_key, cid, "delta", token))
+                    _safe_put(OutboundMessage(session_key, cid, "delta", token), channel)
 
                 async def _on_thinking(token: str) -> None:
-                    _safe_put(OutboundMessage(session_key, cid, "thinking", token))
+                    _safe_put(OutboundMessage(session_key, cid, "thinking", token), channel)
 
                 async def _on_thinking_done() -> None:
-                    _safe_put(OutboundMessage(session_key, cid, "thinking_done", None))
+                    _safe_put(OutboundMessage(session_key, cid, "thinking_done", None), channel)
 
                 async def _on_tool_start(name: str, args_brief: str = "") -> None:
-                    _safe_put(OutboundMessage(session_key, cid, "tool_start", name))
+                    _safe_put(OutboundMessage(session_key, cid, "tool_start", name), channel)
 
                 async def _on_tool_end(ev: dict[str, str]) -> None:
-                    _safe_put(OutboundMessage(session_key, cid, "tool_end", ev))
+                    _safe_put(OutboundMessage(session_key, cid, "tool_end", ev), channel)
 
                 async def _on_tool_exec_start(
                     name: str, args: dict[str, Any], idx: int, total: int,
                 ) -> None:
                     _safe_put(OutboundMessage(
                         session_key, cid, "tool_exec_start",
-                        {"name": name, "args": args, "index": idx, "total": total}))
+                        {"name": name, "args": args, "index": idx, "total": total}), channel)
 
                 async def _on_tool_exec_end(ev: dict[str, Any]) -> None:
-                    _safe_put(OutboundMessage(session_key, cid, "tool_exec_end", ev))
+                    _safe_put(OutboundMessage(session_key, cid, "tool_exec_end", ev), channel)
 
                 async def _on_new_turn() -> None:
-                    _safe_put(OutboundMessage(session_key, cid, "new_turn", None))
+                    _safe_put(OutboundMessage(session_key, cid, "new_turn", None), channel)
 
                 t_start = time.monotonic()
                 try:
                     result = await self.process_message(
                         session_key=session_key,
                         user_input=msg.content,
+                        source=channel,
                         model=msg.model,
                         temperature=msg.temperature,
                         max_tokens=msg.max_tokens,
@@ -692,12 +732,12 @@ class Orchestrator:
                          "stop_reason": result.stop_reason,
                          "paradigm": result.paradigm,
                          "elapsed_ms": (time.monotonic() - t_start) * 1000},
-                    ))
+                    ), channel)
                 except Exception as exc:
                     logger.opt(exception=True).error(
                         "serve() failed for session {!r}", session_key)
                     _safe_put(
-                        OutboundMessage(session_key, cid, "error", str(exc)))
+                        OutboundMessage(session_key, cid, "error", str(exc)), channel)
         finally:
             self._running = False
             logger.info("serve() ended for session {!r}", session_key)
@@ -758,6 +798,19 @@ class Orchestrator:
     def dispatcher(self) -> Dispatcher:
         """The internal :class:`Dispatcher`."""
         return self._dispatcher
+
+    @property
+    def scheduled_tasks(self) -> ScheduledTaskService:
+        """The unified scheduled-task service (chat-created + system tasks)."""
+        return self._scheduled
+
+    def get_tool(self, name: str):
+        """Return a registered core-scope tool by name, or ``None``.
+
+        Used by entry points to wire channel-specific hooks onto a tool after
+        registration (e.g. the Xiaohongshu publish-fallback push callback).
+        """
+        return self._tools.get(name)
 
     @property
     def context(self) -> ContextManager:

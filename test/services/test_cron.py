@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.cron import CronScheduler, CronJob
-
+from services.cron import CronJob, CronScheduler
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -43,7 +40,7 @@ class TestRegisterJob:
         assert "dream" in cron._jobs
 
     def test_register_idempotent(self, cron):
-        j1 = cron.register_job("dream", interval_hours=2)
+        cron.register_job("dream", interval_hours=2)
         j2 = cron.register_job("dream", interval_hours=4)
         assert j2.interval_hours == 4
         assert len(cron._jobs) == 1
@@ -215,3 +212,72 @@ class TestEdgeCases:
 
     def test_get_next_wake_none_when_no_jobs(self, cron):
         assert cron._get_next_wake_ms() is None
+
+
+# ---------------------------------------------------------------------------
+# Cron-expression schedules (croniter)
+# ---------------------------------------------------------------------------
+
+
+class TestCronSchedule:
+    def test_register_with_cron_schedule(self, cron):
+        job = cron.register_job("daily8", schedule="0 8 * * *")
+        assert job.schedule == "0 8 * * *"
+        assert job.next_run_at_ms > 0
+        cron.stop()
+
+    def test_cron_next_run_is_future(self, cron):
+        from services.cron import _now_ms
+
+        job = cron.register_job("daily8", schedule="0 8 * * *")
+        assert job.next_run_at_ms > _now_ms()
+        cron.stop()
+
+    def test_cron_every_minute_within_60s(self, cron):
+        from services.cron import _now_ms
+
+        job = cron.register_job("everymin", schedule="* * * * *")
+        delta_ms = job.next_run_at_ms - _now_ms()
+        assert 0 < delta_ms <= 60_000
+        cron.stop()
+
+    def test_invalid_cron_raises(self, cron):
+        with pytest.raises(ValueError):
+            cron.register_job("bad", schedule="not a cron")
+        cron.stop()
+
+    def test_cron_takes_precedence_over_interval(self, cron):
+        """When both are given, the cron schedule wins."""
+        job = cron.register_job("both", interval_hours=2, schedule="0 8 * * *")
+        assert job.schedule == "0 8 * * *"
+        cron.stop()
+
+
+# ---------------------------------------------------------------------------
+# unregister_job
+# ---------------------------------------------------------------------------
+
+
+class TestUnregisterJob:
+    def test_unregister_removes_job(self, cron):
+        cron.register_job("temp", schedule="0 8 * * *")
+        assert "temp" in cron._jobs
+        cron.unregister_job("temp")
+        assert "temp" not in cron._jobs
+        cron.stop()
+
+    def test_unregister_unknown_is_noop(self, cron):
+        cron.unregister_job("nonexistent")  # must not raise
+        cron.stop()
+
+    def test_unregister_drops_persisted_state(self, state_dir):
+        cron1 = CronScheduler(state_dir)
+        cron1._running = True
+        cron1.register_job("temp", schedule="0 8 * * *")
+        cron1._jobs["temp"].last_run_at_ms = 999
+        cron1._save_state()
+        cron1.unregister_job("temp")
+        cron1.stop()
+
+        # A fresh scheduler must not resurrect the removed job's state
+        assert "temp" not in cron1._load_state()
