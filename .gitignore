@@ -67,3 +67,13 @@ cron/
 
 # Downloaded datasets (GAIA)
 data/
+
+# Local runtime state / cache / secrets (do not commit)
+.tokensave/
+QR.png
+scripts/xhs_cookies.json
+memory/.cursor
+memory/.dream_cursor
+memory/.dream_date
+memory/history.jsonl
+/xiaohongshu/
