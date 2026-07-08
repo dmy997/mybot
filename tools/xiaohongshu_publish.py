@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+from loguru import logger
 
 from .guard import Capability
 from .tool import Tool, ToolResult
 
 _SCRIPT_NAME = "xhs_publish.py"
+
+NotifyCb = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class XiaohongshuPublishTool(Tool):
@@ -27,7 +32,8 @@ class XiaohongshuPublishTool(Tool):
     name = "xiaohongshu_publish"
     description = (
         "Publish a note to Xiaohongshu (RED). "
-        "Provide a title, the full markdown/plain-text body, "
+        "Provide a title, the content rendered onto the cover image, "
+        "an optional caption for the note's text body, "
         "and optionally a list of local image file paths. "
         "Returns the note ID on success."
     )
@@ -40,7 +46,20 @@ class XiaohongshuPublishTool(Tool):
             },
             "content": {
                 "type": "string",
-                "description": "Full note body in plain text or markdown.",
+                "description": (
+                    "Main content rendered onto the auto-generated cover "
+                    "image (e.g. the turtle-soup puzzle text). When no "
+                    "images are supplied this is drawn onto the card."
+                ),
+            },
+            "caption": {
+                "type": "string",
+                "description": (
+                    "Optional text for the note's body box — call-to-action "
+                    "lines and hashtags that should NOT appear on the image "
+                    "(e.g. '答案明天揭晓，评论区留下你的推理 #海龟汤 #推理'). "
+                    "Falls back to content when omitted."
+                ),
             },
             "images": {
                 "type": "array",
@@ -57,9 +76,23 @@ class XiaohongshuPublishTool(Tool):
     _scopes = {"core"}
     _parallel = False
 
+    def __init__(self) -> None:
+        self._notify: NotifyCb | None = None
+
+    def set_notify(self, notify: NotifyCb) -> None:
+        """Inject a callback invoked with the rendered draft when a publish is
+        auto-filled but *not confirmed*.
+
+        Lets a channel push the cover image + caption to the operator for
+        manual publishing.  When unset, an unconfirmed publish just returns the
+        plain error (no push).
+        """
+        self._notify = notify
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         title = str(kwargs.get("title", "")).strip()
         content = str(kwargs.get("content", "")).strip()
+        caption = str(kwargs.get("caption", "")).strip()
         images = kwargs.get("images") or []
 
         if not title:
@@ -90,7 +123,7 @@ class XiaohongshuPublishTool(Tool):
             )
 
         payload = json.dumps(
-            {"title": title, "content": content, "images": images}
+            {"title": title, "content": content, "caption": caption, "images": images}
         )
 
         try:
@@ -111,9 +144,12 @@ class XiaohongshuPublishTool(Tool):
                 err_msg = (
                     stderr.decode().strip() or stdout.decode().strip()
                 )
+                fallback = await self._dispatch_fallback(
+                    stdout, title=title, content=content, caption=caption
+                )
                 return ToolResult(
                     success=False,
-                    content="",
+                    content=fallback,
                     error=f"Publish failed: {err_msg}",
                 )
         except FileNotFoundError:
@@ -128,6 +164,36 @@ class XiaohongshuPublishTool(Tool):
                 content="",
                 error=f"Publish error: {exc}",
             )
+
+    async def _dispatch_fallback(
+        self, stdout: bytes, *, title: str, content: str, caption: str
+    ) -> str:
+        """On an *unconfirmed* publish, push the rendered draft to the operator.
+
+        Returns an operator-facing message when a fallback push was dispatched;
+        otherwise an empty string, so the caller keeps the plain error and the
+        agent does not advance its publish state.
+        """
+        if self._notify is None:
+            return ""
+        try:
+            data = json.loads(stdout.decode().strip() or "{}")
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(data, dict) or data.get("status") != "unconfirmed":
+            return ""
+        draft = {
+            "title": title,
+            "content": content,
+            "caption": caption or data.get("caption", ""),
+            "image": data.get("image", ""),
+        }
+        try:
+            await self._notify(draft)
+        except Exception:
+            logger.opt(exception=True).warning("Xiaohongshu fallback notify failed")
+            return ""
+        return "自动发布未确认，已把封面图+文案推送到你的微信文件传输助手，请手动发布。"
 
     def _find_script(self) -> Path | None:
         """Locate the publish script relative to the project root."""
