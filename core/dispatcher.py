@@ -37,6 +37,7 @@ from .runner import AgentInput, AgentOutput
 _EXPLICIT_ROUTES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^/react\b", re.IGNORECASE), "react"),
     (re.compile(r"^/plan\b", re.IGNORECASE), "plan_solve"),
+    (re.compile(r"^/research\b", re.IGNORECASE), "deep_research"),
 ]
 
 _PLAN_INDICATORS: list[re.Pattern[str]] = [
@@ -102,6 +103,7 @@ async def heuristic_classifier(user_input: str) -> str:
 _DEFAULT_PARADIGM_DESCRIPTIONS: dict[str, str] = {
     "react": render_template("dispatcher/react_paradigm.md", strip=True),
     "plan_solve": render_template("dispatcher/plan_solve_paradigm.md", strip=True),
+    "deep_research": "多智能体深度研究——协调多个研究员并行搜索和分析，综合成完整报告",
 }
 
 

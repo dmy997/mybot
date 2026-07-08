@@ -1,16 +1,20 @@
 """Sub-agent delegation tool.
 
-Allows the main agent to spawn isolated sub-agents for focused subtasks.
+Allows the main agent to spawn an isolated sub-agent for a focused subtask.
+The worker execution is delegated to the shared
+:class:`~agents.team.runner.SubAgentRunner` — the same primitive the
+multi-agent DeepResearch topology uses — so there is a single sub-agent
+runtime across the codebase.
+
 Each sub-agent runs its own :class:`AgentCore` loop with a restricted tool
-set.  Sub-agents are NOT auto-discovered — they are registered manually by
-the Orchestrator.
+set (parent tools minus ``delegate``, guarded by a ``subagent``-scope
+ToolGuard).  Sub-agents do NOT have access to this tool, preventing
+unbounded recursion.
 """
 
 from __future__ import annotations
 
-import asyncio
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,41 +28,16 @@ from .guard import Capability
 from .registry import ToolRegistry
 from .tool import Tool, ToolResult
 
-# ---------------------------------------------------------------------------
-# SubAgentSpec
-# ---------------------------------------------------------------------------
-
-
 _SUBAGENT_SYSTEM_PROMPT = render_template("agent/subagent_system.md", strip=True)
-
-
-@dataclass
-class SubAgentSpec:
-    """Complete configuration for a single sub-agent run."""
-
-    task: str
-    tools: ToolRegistry
-    system_prompt: str = _SUBAGENT_SYSTEM_PROMPT
-    max_iterations: int = 10
-    model: str | None = None
-    timeout_seconds: float = 120.0
-    allow_network: bool = False   # sub-agents cannot access network by default
-    allow_shell: bool = False     # sub-agents cannot execute shell by default
-
-
-# ---------------------------------------------------------------------------
-# SubAgentTool
-# ---------------------------------------------------------------------------
+_MAX_ITERATIONS = 10
+_TIMEOUT_SECONDS = 120.0
 
 
 class SubAgentTool(Tool):
     """Tool that spawns an isolated sub-agent to complete a delegated task.
 
-    The sub-agent runs its own :class:`AgentCore` loop with a restricted
-    tool subset.  Results are returned inline so the parent agent can continue
-    reasoning with the sub-agent's output in context.
-
-    Sub-agents do NOT have access to this tool, preventing unbounded recursion.
+    Results are returned inline so the parent agent can continue reasoning
+    with the sub-agent's output in context.
     """
 
     name = "delegate"
@@ -114,102 +93,59 @@ class SubAgentTool(Tool):
 
     async def execute(self, task: str, **_: Any) -> ToolResult:
         """Spawn and run a sub-agent for the given *task*."""
+        from agents.team.runner import SubAgentRunner, SubAgentSpec
 
-        # Sub-agents get all parent tools minus delegate (no recursion)
+        runner = SubAgentRunner(self._provider, workspace=self._workspace)
+        sub_tools = self._sub_tools()
         spec = SubAgentSpec(
             task=task,
-            tools=ToolRegistry(),  # placeholder — replaced below
+            system_prompt=_SUBAGENT_SYSTEM_PROMPT,
+            tools=sub_tools,
+            max_iterations=_MAX_ITERATIONS,
+            timeout_seconds=_TIMEOUT_SECONDS,
         )
-        spec.tools = self._build_sub_tools(spec)
 
         logger.info(
             "Sub-agent starting: task={task!r}, tools={tools}",
             task=task[:200],
-            tools=[t.name for t in spec.tools],
+            tools=[t.name for t in sub_tools],
         )
         REGISTRY.tool_calls_total.inc()
 
         t_start = time.monotonic()
-
         with tracer.span("subagent.run", task=task[:200]):
-            result = await self._run_sub_agent(spec)
-
-        latency_ms = (time.monotonic() - t_start) * 1000
-        REGISTRY.tool_latency_ms.observe(latency_ms)
+            result = await runner.run(spec)
+        REGISTRY.tool_latency_ms.observe((time.monotonic() - t_start) * 1000)
 
         if not result.success:
             REGISTRY.tool_calls_errors_total.inc()
             logger.warning("Sub-agent failed: {error}", error=result.error)
-
-        return result
-
-    # -- internal --------------------------------------------------------------
-
-    def _build_sub_tools(self, spec: SubAgentSpec) -> ToolRegistry:
-        """Build a tool registry with sub-agent ToolGuard, excluding delegate."""
-        from .guard import ToolGuard as _ToolGuard
-
-        guard = _ToolGuard(
-            self._workspace,
-            scope="subagent",
-            allow_network=spec.allow_network,
-            allow_shell=spec.allow_shell,
-        )
-        sub = ToolRegistry(guard=guard)
-        for tool in self._parent_registry:
-            if tool.name != "delegate":
-                sub.register(tool)
-        return sub
-
-    async def _run_sub_agent(self, spec: SubAgentSpec) -> ToolResult:
-        """Execute the sub-agent's AgentCore loop with timeout protection."""
-        from core.runner import AgentCore, AgentInput
-
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": spec.system_prompt},
-            {"role": "user", "content": spec.task},
-        ]
-
-        core = AgentCore(
-            self._provider,
-            max_iterations=spec.max_iterations,
-        )
-
-        agent_input = AgentInput(
-            init_messages=messages,
-            tools=spec.tools,
-            model=spec.model,
-        )
-
-        try:
-            output = await asyncio.wait_for(
-                core.run(agent_input),
-                timeout=spec.timeout_seconds,
-            )
-        except asyncio.TimeoutError:
             return ToolResult(
-                success=False,
-                content="",
-                error=f"子代理超时（{spec.timeout_seconds:.0f}s）",
+                success=False, content=result.content, error=result.error
             )
 
-        if output.error:
-            return ToolResult(
-                success=False,
-                content=output.content or "",
-                error=f"子代理错误: {output.error}",
-            )
-
-        # Format a clean result for the parent agent
         result_parts = [
             "子任务完成",
             "=" * 10,
             "",
-            output.content,
+            result.content,
         ]
-
-        if output.tools_used:
+        if result.tools_used:
             result_parts.append("")
-            result_parts.append(f"(使用工具: {', '.join(output.tools_used)})")
+            result_parts.append(f"(使用工具: {', '.join(result.tools_used)})")
 
         return ToolResult(success=True, content="\n".join(result_parts))
+
+    # -- internal --------------------------------------------------------------
+
+    def _sub_tools(self) -> ToolRegistry:
+        """Parent tools minus ``delegate`` (no recursion).
+
+        The runner re-wraps these with a ``subagent``-scope ToolGuard, so no
+        guard is attached here.
+        """
+        reg = ToolRegistry()
+        for tool in self._parent_registry:
+            if tool.name != "delegate":
+                reg.register(tool)
+        return reg
