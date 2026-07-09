@@ -719,13 +719,10 @@ async function showMetrics() {
 async function showLogs() {
   const el = document.getElementById('obs-content');
   try {
-    const resp = await fetch('/logs?limit=200');
+    let url = '/logs?limit=200';
+    if (currentSession !== 'default') url += '&session_key=' + encodeURIComponent(currentSession);
+    const resp = await fetch(url);
     let logs = await resp.json();
-
-    // Filter by session if selected
-    if (currentSession !== 'default') {
-      logs = logs.filter(e => e.data && e.data.session_key === currentSession);
-    }
 
     if (!logs.length) {
       el.innerHTML = '<div style="color:var(--text-muted);padding:20px;">'
@@ -766,19 +763,10 @@ async function showTraces() {
       expandedSpanIds.add(r.dataset.spanId);
     });
 
-    const resp = await fetch('/traces?limit=100');
+    let turl = '/traces?limit=100';
+    if (currentSession !== 'default') turl += '&session_key=' + encodeURIComponent(currentSession);
+    const resp = await fetch(turl);
     let spans = await resp.json();
-
-    // Filter by session: keep only traces whose root span matches
-    if (currentSession !== 'default') {
-      const matchingTraceIds = new Set();
-      spans.forEach(s => {
-        if (!s.parent_span_id && s.attributes && s.attributes.session_key === currentSession) {
-          matchingTraceIds.add(s.trace_id);
-        }
-      });
-      spans = spans.filter(s => matchingTraceIds.has(s.trace_id));
-    }
 
     if (!spans.length) {
       expandedSpanIds.clear();

@@ -198,7 +198,7 @@ CronScheduler._on_timer → _on_cron_job("user:a1b2")
   → ScheduledTaskService.fire("user:a1b2")
     → deliver 回调（WeChat）: 注入 InboundMessage(prompt) 到 bus
       → serve() → process_message → agent 执行 → OutboundMessage("final")
-        → _consume_outbound → itchat.send → 推送到用户微信
+        → _consume_outbound → iLink sendmessage → 推送到用户微信
 ```
 
 ## 设计要点

@@ -387,7 +387,7 @@ while True:
 - 不同频道的消息完全隔离——SSE consumer 永远不会读到 WS 的消息
 - 同频道内的多请求仍通过 `correlation_id` 过滤（如同频道两个 HTTP 请求）
 - `orchestrator.serve()` 从 `InboundMessage.source` 提取频道并路由到正确队列
-- WeChatBot consumer 读取 `outbound("wechat")`，只接收自己的消息
+- WechatChannel consumer 读取 `outbound("wechat")`，只接收自己的消息
 
 ## WebSocket 的请求取消
 

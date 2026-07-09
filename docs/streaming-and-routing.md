@@ -87,7 +87,7 @@ AgentCore._call_llm()  (core/runner.py:749-831)
 │                                                                      │
 │  # channel 从 InboundMessage.source 提取：                          │
 │  #   "http" → SSE consumer, "websocket" → WS consumer               │
-│  #   "wechat" → WeChatBot consumer                                  │
+│  #   "wechat" → WechatChannel consumer                                  │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -149,7 +149,7 @@ WeChat msg ────────►│ inbound("wechat:...")            │�
 Orchestrator ──────►│  outbound("cli")      ──────────►│ CLI (全消费)
                     │  outbound("http")     ──────────►│ SSE (过滤 cid)
                     │  outbound("websocket")───────────►│ WS  (过滤 cid)
-                    │  outbound("wechat")   ──────────►│ WeChatBot consumer
+                    │  outbound("wechat")   ──────────►│ WechatChannel consumer
                     └──────────────────────────────────┘
 ```
 
@@ -297,7 +297,7 @@ class OutboundMessage:
 | **CLI** | `orchestrator.process_message()` 同步调用 | 无 MessageBus，回调直接更新 StreamingMessage（tui/widgets.py） | 无需过滤（单请求） | 直接渲染，零延迟 |
 | **HTTP SSE** | `POST /chat/{sid}` → inbound.put() | `async for` 读 outbound("http") 队列 | `out.correlation_id != cid` → skip | 流式响应 |
 | **WebSocket** | `{"type":"chat"...}` → inbound.put() | `async for` 读 outbound("websocket") 队列 | `out.correlation_id != cid` → skip | 支持 cancel（取消 in-flight task） |
-| **WeChat** | `_on_message()` → inbound.put() | 后台 consumer 读 outbound("wechat") 队列 | 只处理 `final` 消息 | 无流式，通过 itchat 发送 |
+| **WeChat** | `_on_message()` → inbound.put() | 后台 consumer 读 outbound("wechat") 队列 | 只处理 `final` 消息 | 无流式，通过 iLink 发送 |
 
 ## 设计要点
 

@@ -57,9 +57,6 @@ otel = [
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
-wechat = [
-    "itchat-uos>=1.4",
-]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -82,7 +79,6 @@ select = ["E", "F", "I", "N", "W", "UP"]
 mybot = "core.orchestrator:main"
 mybot-server = "core.server:main"
 mybot-wechat = "channels.wechat:main"
-mybot-weixin = "channels.weixin:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

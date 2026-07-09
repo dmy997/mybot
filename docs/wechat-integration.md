@@ -1,33 +1,13 @@
-# WeChat 接入方案
+# WeChat 接入方案 (iLink)
 
-mybot 提供两种微信接入方式，分别适用于不同场景。
-
-## 方案对比
-
-| | wechat (itchat) | weixin (iLink) |
-|---|---|---|
-| **入口** | `mybot-wechat` | `mybot-weixin` |
-| **文件** | `channels/wechat.py` | `channels/weixin.py` |
-| **协议** | itchat-uos (Web WeChat 模拟) | iLink HTTP 长轮询 (bot API) |
-| **bot 身份** | 登录的微信号本身就是 bot | 独立 bot 身份 (`@im.bot`) |
-| **封号风险** | 高 (个人号自动化) | 低 (官方 bot 接口) |
-| **挂机要求** | 需要手机/电脑保持登录 | 无需挂机,纯 HTTP |
-| **独立好友** | 否 (登录哪个号,哪个号就是 bot) | 是 (扫码授权,独立 mybot 好友) |
-| **群聊** | 支持 @ 触发 | 不支持 (bot API 限制) |
-| **媒体** | 图片/文件 (itchat 内置) | 图片/语音/视频/文件 (AES 加解密) |
-| **稳定性** | 依赖 itchat 逆向,易被封 | 半官方接口,较稳定 |
-| **实现状态** | 完整 (含小红书发布回调) | Phase 1: 纯文本 (媒体待移植) |
-
-## 推荐方案: iLink (`mybot-weixin`)
-
-符合用户的原始需求——**在微信中有一个独立的 "mybot" 好友,通过跟它对话来触发 bot 执行**。
+mybot 通过 iLink bot API (`mybot-wechat`) 接入微信，提供独立的 mybot 好友身份，符合原始需求——**在微信中有一个独立的 "mybot" 好友，通过跟它对话来触发 bot 执行**。
 
 ### 原理
 
 ```
 用户微信 → 扫码授权 → iLink 平台发放 bot_token
                             ↓
-mybot-weixin ← HTTP 长轮询 ← ilinkai.weixin.qq.com
+mybot-wechat ← HTTP 长轮询 ← ilinkai.weixin.qq.com
      ↓
 MessageBus → Orchestrator → LLM
      ↓
@@ -51,7 +31,7 @@ HTTP sendmessage → iLink 平台 → 用户微信
 
 2. **X-WECHAT-UIN**: 每次请求生成新的随机 uint32 → base64,不能复用。
 
-3. **状态持久化**: token、cursor、context_tokens 存在 `{workspace}/weixin/account.json`,重启自动恢复。
+3. **状态持久化**: token、cursor、context_tokens 存在 `{workspace}/wechat/account.json`,重启自动恢复。
 
 4. **消息去重**: 通过 message_id 做 1000 条 LRU 去重,防止重复处理。
 
@@ -60,7 +40,7 @@ HTTP sendmessage → iLink 平台 → 用户微信
 ### 使用
 
 ```bash
-mybot-weixin
+mybot-wechat
 # 终端显示二维码 → 微信扫码确认
 # 后续启动自动加载 account.json,无需重新扫码
 ```
@@ -85,41 +65,16 @@ mybot-weixin
 - 输入状态指示 (typing indicator)
 - tool hints 缓冲合并
 
-## 备用方案: itchat (`mybot-wechat`)
-
-基于 itchat-uos 模拟 Web WeChat 登录,直接接管一个微信号。
-
-### 适用场景
-
-- 需要群聊 @ 触发
-- 已有小号可以登录
-- 临时测试
-
-### 限制
-
-- 登录的号本身就是 bot,没有独立身份
-- 登录主号则无法与 bot 独立对话
-- Web WeChat 协议不稳定,有封号风险
-- 需要保持登录状态
-
-### 使用
-
-```bash
-mybot-wechat
-```
-
 ## 架构: MessageBus 解耦
 
-两个通道使用相同的 MessageBus 模式与 Orchestrator 解耦:
-
 ```
-外部消息 → ChannelAdapter._on_message()
+外部消息 → WechatChannel._on_message()
   → _parse() → ChannelMessage (归一化)
   → MessageBus.inbound(session_key)
   → Orchestrator.serve(bus, session_key)
-  → MessageBus.outbound("weixin"|"wechat")
-  → ChannelAdapter._consume_outbound()
-  → 平台发送
+  → MessageBus.outbound("wechat")
+  → WechatChannel._consume_outbound()
+  → iLink sendmessage
 ```
 
-`channels/base.py` 定义统一接口 (`BaseChannel` ABC + `ChannelMessage` 归一化模型),新增通道只需实现 `start()` / `shutdown()` / `send_reply()` 三个方法。
+`channels/base.py` 定义统一接口 (`BaseChannel` ABC + `ChannelMessage` 归一化模型)，新增通道只需实现 `start()` / `shutdown()` / `send_reply()` 三个方法。

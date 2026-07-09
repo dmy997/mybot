@@ -30,6 +30,7 @@ from config import Config
 from loguru import logger
 
 from observability.metrics import REGISTRY
+from observability.persistence import store as _obs_store
 from observability.recent import recent
 
 from .message_bus import InboundMessage, MessageBus
@@ -157,6 +158,50 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
     # HTTP endpoints
     # ------------------------------------------------------------------
 
+    def _get_logs(limit: int, session_key: str | None) -> list[dict[str, object]]:
+        """Merge recent in-memory log events with persisted session data."""
+        items = recent.get_logs(min(limit, 500))
+
+        # If session specified and recent has few/zero matches, supplement from disk
+        if session_key:
+            recent_matches = sum(
+                1 for e in items if e.get("data", {}).get("session_key") == session_key  # type: ignore[union-attr]
+            )
+            if recent_matches < limit and _obs_store is not None:
+                persisted = _obs_store.load_events(session_key, limit)
+                # Deduplicate: skip events already in recent buffer (match by timestamp + event_type)
+                recent_keys = {
+                    (e.get("timestamp"), e.get("event_type"))  # type: ignore[union-attr]
+                    for e in items
+                }
+                for evt in persisted:
+                    key = (evt.get("timestamp"), evt.get("event_type"))
+                    if key not in recent_keys:
+                        items.append(evt)
+                        recent_keys.add(key)
+                # Sort by timestamp descending, cap at limit
+                items = sorted(items, key=lambda e: e.get("timestamp", 0), reverse=True)[:limit]  # type: ignore[arg-type,return-value]
+        return items
+
+    def _get_traces(limit: int, session_key: str | None) -> list[dict[str, object]]:
+        """Merge recent in-memory spans with persisted session data."""
+        spans = recent.get_spans(min(limit, 200))
+
+        if session_key and _obs_store is not None:
+            # Collect trace_ids already in recent data
+            recent_trace_ids = {s.get("trace_id") for s in spans}
+            recent_span_ids = {s.get("span_id") for s in spans}
+
+            persisted = _obs_store.load_spans(session_key, limit)
+            for s in persisted:
+                if s.get("span_id") not in recent_span_ids:
+                    spans.append(s)
+                    recent_span_ids.add(s.get("span_id"))
+
+            # Sort by end_time descending, cap at limit
+            spans = sorted(spans, key=lambda s: s.get("end_time") or 0, reverse=True)[:limit]  # type: ignore[arg-type,return-value]
+        return spans
+
     async def health(request: Request) -> JSONResponse:  # noqa: ARG001
         return JSONResponse({"status": "ok"})
 
@@ -170,14 +215,22 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         })
 
     async def logs_endpoint(request: Request) -> JSONResponse:  # noqa: ARG001
-        """Return recent structured log events."""
+        """Return recent structured log events, optionally filtered by session."""
         limit = int(request.query_params.get("limit", "100"))
-        return JSONResponse(recent.get_logs(min(limit, 500)))
+        session_key = request.query_params.get("session_key")
+        return JSONResponse(_get_logs(limit, session_key))
 
     async def traces_endpoint(request: Request) -> JSONResponse:  # noqa: ARG001
-        """Return recent trace spans."""
+        """Return recent trace spans, optionally filtered by session."""
         limit = int(request.query_params.get("limit", "100"))
-        return JSONResponse(recent.get_spans(min(limit, 200)))
+        session_key = request.query_params.get("session_key")
+        return JSONResponse(_get_traces(limit, session_key))
+
+    async def sessions_obs_endpoint(request: Request) -> JSONResponse:  # noqa: ARG001
+        """Return list of sessions that have observability data."""
+        if _obs_store is None:
+            return JSONResponse([])
+        return JSONResponse(_obs_store.list_sessions())
 
     async def chat_sse(request: Request) -> JSONResponse | StreamingResponse:
         if not _check_auth(request):
@@ -538,6 +591,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         Route("/metrics", metrics),
         Route("/logs", logs_endpoint),
         Route("/traces", traces_endpoint),
+        Route("/observability/sessions", sessions_obs_endpoint),
         Route("/chat/{session_id}", chat_sse, methods=["POST"]),
         Route("/events/{session_id}", push_events, methods=["GET"]),
         Route("/sessions", list_sessions, methods=["GET"]),

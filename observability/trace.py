@@ -92,6 +92,29 @@ class Tracer:
         from observability.recent import recent
         recent.add_span(span)
 
+        # Persist to per-session JSONL file
+        from observability.persistence import store as _persist
+        if _persist is not None:
+            try:
+                sk = _find_session_key(span)
+                if sk:
+                    _persist.save_span(sk, {
+                        "trace_id": span.context.trace_id,
+                        "span_id": span.context.span_id,
+                        "parent_span_id": span.context.parent_span_id,
+                        "name": span.name,
+                        "start_time": span.start_time,
+                        "end_time": span.end_time,
+                        "latency_ms": round(span.latency_ms, 3),
+                        "status": span.status,
+                        "attributes": dict(span.attributes),
+                        "events": list(span.events),
+                        "input": dict(span.input) if span.input else None,
+                        "output": dict(span.output) if span.output else None,
+                    })
+            except Exception:
+                pass  # best-effort
+
     # -- span creation ---------------------------------------------------------
 
     def start_trace(self, name: str, **attributes: Any) -> Span:
@@ -214,3 +237,17 @@ class Tracer:
 
 tracer = Tracer()
 """Global tracer instance shared across the process."""
+
+
+def _find_session_key(span: Span) -> str | None:
+    """Walk up the span tree to find a ``session_key`` attribute."""
+    sk = span.attributes.get("session_key")
+    if sk:
+        return sk
+    parent = span._parent
+    while parent is not None:
+        sk = parent.attributes.get("session_key")
+        if sk:
+            return sk
+        parent = parent._parent
+    return None

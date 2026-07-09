@@ -192,6 +192,14 @@ def emit(event: Any, *, level: str = "INFO", session_key: str | None = None) -> 
     from observability.recent import recent
     recent.add_log(event_type, data)
 
+    # Persist to per-session JSONL file for survival across restarts
+    from observability.persistence import store as _persist
+    if _persist is not None and session_key:
+        try:
+            _persist.save_event(session_key, event_type, data)
+        except Exception:
+            pass  # persistence is best-effort, never crash the caller
+
 
 def _to_dict(obj: Any) -> dict[str, Any]:
     """Convert a dataclass instance (or nested list of them) to a flat dict."""

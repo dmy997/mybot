@@ -368,6 +368,50 @@ MYBOT_OTEL_ENABLED=1 mybot
 
 每条 trace 展示完整的 `agent.run → llm.chat → tool.execute` 调用树，包括模型名称、token 消耗、工具名称和执行耗时。
 
+## 六、本地持久化（持久化存储，进程重启不丢失）
+
+`observability/persistence.py`
+
+### 存储格式
+
+每个 session 一个 JSONL 文件：`{workspace}/observability/{session_key}.jsonl`
+
+```jsonl
+{"type":"event","session_key":"abc123","event_type":"LLMCallEvent","timestamp":1752595200.0,"data":{"model":"gpt-4","tokens_in":100,"latency_ms":1234.5}}
+{"type":"span","session_key":"abc123","trace_id":"a1b2c3","span_id":"d4e5f6","parent_span_id":null,"name":"agent.run","latency_ms":2500.0,"status":"ok","attributes":{"session_key":"abc123"}}
+```
+
+### ObservabilityStore
+
+```python
+class ObservabilityStore:
+    def save_event(session_key, event_type, data): ...   # 追加 JSONL
+    def save_span(session_key, span_entry): ...           # 追加 JSONL
+    def load_events(session_key, limit=200): ...          # 读取最近 N 条事件
+    def load_spans(session_key, limit=200): ...           # 读取最近 N 条 span
+    def list_sessions() -> list[str]: ...                 # 列出有观测数据的 session
+    def trim(session_key, max_events, max_spans): ...     # 裁剪旧数据
+```
+
+### 挂钩点
+
+- `observability/log.py:emit()` — 每次结构化日志发出时，若 session_key 非空则持久化
+- `observability/trace.py:Tracer._store_recent()` — 每个 span 完成时，向上查找 root span 的 session_key 并持久化
+- `observability/persistence.store` — 模块级单例，由 `Orchestrator.__init__` 调用 `init_store(workspace)` 初始化
+
+### HTTP 端点
+
+- `GET /logs?session_key=X` — 合并内存 recent 缓冲 + 持久化文件，去重返回
+- `GET /traces?session_key=X` — 同上，按 span_id 去重
+- `GET /observability/sessions` — 返回有观测数据的 session 列表
+
+### 设计要点
+
+- **best-effort**: 持久化失败不影响主流程（try/except + pass）
+- **线程安全**: 每个 session 文件独立 `threading.Lock`，追加写入不阻塞其他 session
+- **惰性读取**: 仅在 `/logs` 或 `/traces` 请求携带 `session_key` 参数时才读磁盘
+- **trim 机制**: `max_events=2000, max_spans=1000` 硬上限，防止文件无限增长
+
 ## 代码调用链
 
 ### 系统启动：可观测性初始化

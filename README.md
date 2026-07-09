@@ -22,7 +22,7 @@
 - **上下文管理** — 非破坏性压缩、会话中断修复、空闲自动压缩
 - **可观测性** — 结构化日志（loguru）、自定义指标/追踪，以及可选的 OpenTelemetry → Jaeger 桥接
 - **断点恢复** — 长任务崩溃后可从检查点续跑，避免重新推理
-- **多频道接入** — 可扩展频道架构（BaseChannel ABC），支持 CLI、Web UI、微信个人号；MessageBus 每通道独立出站队列，消息不丢失
+- **多频道接入** — 可扩展频道架构（BaseChannel ABC），支持 CLI、Web UI、微信 iLink 机器人；MessageBus 每通道独立出站队列，消息不丢失
 - **13 个内置 Skill** — docx、pptx、pdf、xlsx、canvas-design、frontend-design、algorithmic-art、brand-guidelines、internal-comms、mcp-builder、skill-creator、slack-gif-creator、theme-factory、web-artifacts-builder、webapp-testing
 
 ## 架构
@@ -58,7 +58,7 @@ HTTP/WS/WeChat 或 CLI → Orchestrator → ContextManager.build_messages()
 | ContextManager | `context/context_manager.py` | 会话持久化、空闲压缩、token 预算压缩、中断修复 |
 | MemoryStore | `memory/store.py` | 类型化长期记忆的文件 I/O |
 | BaseChannel | `channels/base.py` | 频道抽象——ChannelMessage、send_reply、build_session_key |
-| WeChatBot | `channels/wechat.py` | 微信个人号频道——itchat-uos → MessageBus → Orchestrator |
+| WechatChannel | `channels/wechat.py` | 微信 iLink 机器人频道——iLink API → MessageBus → Orchestrator |
 | SkillsLoader | `core/skills.py` | 基于文件的 Skill 发现（YAML），自动注入 system prompt |
 
 ### Agent 范式
@@ -79,7 +79,6 @@ cp .env.example .env   # 然后填入 API 密钥
 
 ```bash
 pip install -e ".[otel]"     # OpenTelemetry → Jaeger 桥接
-pip install -e ".[wechat]"   # 微信个人号频道
 ```
 
 ## 快速开始
@@ -92,9 +91,9 @@ mybot
 mybot-server
 # 浏览器打开 http://127.0.0.1:8080
 
-# 微信个人号
+# 微信 iLink 机器人
 mybot-wechat
-# 终端显示二维码，手机微信扫码登录
+# 终端显示二维码，手机微信扫码授权
 
 # WebSocket
 websocat ws://127.0.0.1:8080/ws/default
@@ -241,7 +240,7 @@ python -m evals --benchmark gaia                                              # 
 - MCP（Model Context Protocol）集成 — 连接外部工具服务器
 - Memory Dream 系统 — 两阶段 LLM 记忆合并（Consolidator 实时摘要 + Dream 周期回顾）
 - 混合搜索 + 时间衰减 — SQLite + sqlite-vec + FTS5，30 天半衰期指数衰减
-- 可扩展频道架构 + 微信个人号频道 — BaseChannel ABC，MessageBus 每通道路由
+- 可扩展频道架构 + 微信 iLink 机器人频道 — BaseChannel ABC，MessageBus 每通道路由
 - 混合搜索可观测性 — 终端和 Web UI 日志视图显示搜索模式
 
 ### P2 — 质量与可靠性

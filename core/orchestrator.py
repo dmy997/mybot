@@ -32,6 +32,7 @@ from core.events import SessionCreated, bus
 from core.message_bus import InboundMessage, MessageBus, OutboundMessage
 from observability import LogConfig, init_logging
 from observability.otel_bridge import auto_install as auto_install_otel
+from observability.persistence import init_store as init_obs_store
 from observability.subscribers import install as install_subscribers
 from observability.trace import tracer
 from services.scheduled_tasks import ScheduledTaskService
@@ -148,6 +149,7 @@ class Orchestrator:
         init_logging(log_config)
         install_subscribers(debug=(log_config is not None and log_config.level == "DEBUG"))
         auto_install_otel(tracer)
+        init_obs_store(self.workspace)
 
         # Generate default settings.json if not present
         from config import Config
