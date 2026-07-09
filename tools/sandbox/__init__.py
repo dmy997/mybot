@@ -15,7 +15,7 @@ Configuration
 
 from __future__ import annotations
 
-import os
+from config import Config
 
 from .base import SandboxBackend, SandboxResult
 from .bubblewrap import BubblewrapSandbox
@@ -46,7 +46,7 @@ def create_sandbox(
         Absolute path to the agent workspace directory.  Required for
         backends that bind-mount the workspace into the container.
     """
-    name = backend or os.getenv("MYBOT_SANDBOX_BACKEND", "none").strip().lower()
+    name = backend or Config.sandbox_backend.strip().lower()
 
     if name == "bubblewrap":
         return BubblewrapSandbox(workspace)

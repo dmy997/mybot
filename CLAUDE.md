@@ -32,10 +32,10 @@ mybot-server           # HTTP/WS server (core.server:main), then open http://127
 ## Package Layout (flat, no `mybot/` subdirectory)
 
 - `providers/` — LLM backend abstraction (`LLMProvider` base, `OpenAICompatibleProvider`, retry logic, error types, factory)
-- `core/` — Orchestrator, Dispatcher, AgentCore (runner), Agent base class, Middleware chain, SkillsLoader, HTTP/WS server
+- `core/` — Orchestrator (composed from 4 mixins: MCPServices, ToolRegistry, SessionLifecycle, IdleCompression), Dispatcher, AgentCore (runner), Agent base class, Middleware chain, SkillsLoader, HTTP/WS server
 - `agents/` — ReAct Agent (single-pass) + PlanSolve Agent (two-phase). Auto-discovered via `discover_agents()`
 - `evals/` — Agent evaluation system (custom YAML tasks + BFCL/GAIA benchmarks)
-- `context/` — ContextManager (system prompt assembly, compression, session repair) + SessionManager (JSON persistence)
+- `context/` — ContextManager composed from 4 mixins: CoreContextMixin (build_messages, compress), PromptBuilderMixin (system prompt, repair), MemoryOperationsMixin (remember/forget/recall), SessionPersistenceMixin (save/list/delete/expire). + SessionManager (JSON persistence with hard-cap pruning + TTL expiry)
 - `tools/` — bash, file R/W, grep, webfetch, websearch, memory CRUD, subagent, `schedule_task` (create/list/cancel periodic tasks), ToolRegistry, ToolGuard security
 - `services/` — `CronScheduler` (self-driven timer, cron-expression + interval jobs) + `ScheduledTaskService` (chat-created push tasks + system side-effect tasks like Xiaohongshu). See `docs/scheduled-tasks.md`
 - `memory/` — Long-term file-based memory (MemoryStore, Consolidator + Dream pipeline)
@@ -87,16 +87,20 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 
 **`Dispatcher`** (`core/dispatcher.py`): Four-layer routing (regex commands → keyword heuristics → optional LLM classification → default). The LLM classifier is instantiated internally when `provider` is given — uses a cheap model for <10 token responses.
 
-**`ContextManager`** (`context/context_manager.py`): Unified context assembly and compression. Key behaviors:
+**`ContextManager`** (`context/context_manager.py` + `context/context_manager_mixins.py`): Unified context assembly via 4 mixins. Key behaviors:
 - Compression is **non-destructive**: `session.messages` is never modified. `CompactionService` advances `consolidated_cursor` to skip old messages; `Consolidator` appends LLM summaries to `memory/history.jsonl`
 - System prompt assembly: base prompt → skills → tools → memory context (SOUL.md, USER.md, MEMORY.md) → file context → recent history
 - Session repair on load: detects unmatched tool calls, missing assistant responses (3 interruption patterns)
 - Idle compression + token-budget compression share the same `compress()` method
+- Session hard cap (`prune_by_count`, default 2000 msgs) decoupled from consolidation
+- Session TTL expiry (`purge_expired_sessions`, default 30 days) runs hourly in serve loop
 
 **`Tool` / `ToolRegistry` / `ToolGuard`** (`tools/`):
 - Every tool extends `Tool` ABC: set `name`, `description`, `parameters` (JSON Schema), `capabilities`, `_scopes`, `_parallel`
 - `ToolGuard` maps capabilities to security checks: SHELL → injection detection, NETWORK → SSRF check, FILE_READ/WRITE → sensitive path blocklist
 - Tools are auto-discovered by `discover_tools()`, scanning for `Tool` subclasses
+
+**Orchestrator mixins** (`core/orchestrator_mixins.py`): Decomposed into MCPServicesMixin (MCP + cron + scheduled tasks), ToolRegistryMixin (tool discovery/registration), SessionLifecycleMixin (session CRUD + memory + dispatcher), and IdleCompressionMixin (idle compression + session expiry).
 
 **Auto-discovery**: Both agents (`agents/discover_agents()`) and tools (`tools/discover_tools()`) use `pkgutil.iter_modules` + `inspect.getmembers` to find subclasses at import time. New agents/tools are picked up automatically.
 
@@ -140,6 +144,8 @@ All settings live in `~/.mybot/settings.json` under the `"env"` key (JSON, follo
 | `COMPRESS_RATIO` | `0.5` | Fraction of context window for recent messages during compression |
 | `CONSOLIDATION_RATIO` | `0.7` | Fraction triggering background consolidation |
 | `IDLE_COMPRESS_SECONDS` | `300` | Seconds of inactivity before idle compression (0=disabled) |
+| `MAX_SESSION_MESSAGES` | `2000` | Hard cap on session message count — oldest pruned first |
+| `SESSION_TTL_DAYS` | `30` | Days of inactivity before session auto-deletion (0=disabled) |
 
 ## Settings File (`~/.mybot/settings.json`)
 
@@ -166,7 +172,9 @@ Per-model context window configuration (JSON, follows Claude Code's `~/.claude/s
     "block_buffer_ratio": 0.017,
     "compress_ratio": 0.5,
     "consolidation_ratio": 0.7,
-    "idle_compress_seconds": 300
+    "idle_compress_seconds": 300,
+    "max_session_messages": 2000,
+    "session_ttl_days": 30
   }
 }
 ```

@@ -137,6 +137,32 @@ class SessionManager:
         )
         return removed
 
+    def prune_by_count(self, key: str, max_messages: int = 2000) -> int:
+        """Hard cap: remove oldest messages when the session exceeds *max_messages*.
+
+        Unlike :meth:`prune_archived_messages`, this acts unconditionally and
+        does not depend on consolidation having run.  The consolidated cursor
+        and ``last_consolidated`` are shifted to stay consistent.
+
+        Returns the number of messages pruned (0 if under the limit).
+        """
+        session = self.sessions.get(key)
+        if session is None:
+            return 0
+        excess = len(session.messages) - max_messages
+        if excess <= 0:
+            return 0
+        removed = excess
+        session.messages = session.messages[excess:]
+        session.consolidated_cursor = max(0, session.consolidated_cursor - excess)
+        session.last_consolidated = max(0, session.last_consolidated - excess)
+        self.save_session(session)
+        logger.debug(
+            "Hard-pruned {} messages from session {!r} ({} remaining, limit={})",
+            removed, key, len(session.messages), max_messages,
+        )
+        return removed
+
     # -- concurrency -------------------------------------------------------------
 
     def _get_write_lock(self, key: str) -> asyncio.Lock:
@@ -219,6 +245,35 @@ class SessionManager:
             logger.debug("Session {!r} deleted", key)
             return True
         return False
+
+    def purge_expired_sessions(self, ttl_days: int = 30) -> int:
+        """Delete session JSON files older than *ttl_days* on disk.
+
+        In-memory cached sessions are also evicted.  Returns the number of
+        sessions deleted.  *ttl_days* of 0 disables expiry.
+        """
+        if ttl_days <= 0:
+            return 0
+        cutoff = datetime.now().timestamp() - (ttl_days * 86400)
+        deleted = 0
+        for path in sorted(self.sessions_dir.glob("*.json")):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                continue
+            key = path.stem
+            self.sessions.pop(key, None)
+            try:
+                path.unlink()
+                deleted += 1
+                logger.debug("Expired session {!r} deleted (mtime={})", key, mtime)
+            except OSError:
+                pass
+        if deleted:
+            logger.info("Purged {} expired session(s)", deleted)
+        return deleted
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all session files with metadata.

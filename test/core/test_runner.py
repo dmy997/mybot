@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from config import Config
 from core.events import AgentStarted, bus
 from core.runner import AgentCore, AgentInput
 from providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -704,7 +705,7 @@ class TestAgentCoreCheckpoint:
         assert core._checkpointing_enabled(spec) is False
 
     def test_checkpoint_disabled_by_default(self, core, monkeypatch):
-        monkeypatch.delenv("MYBOT_CHECKPOINT", raising=False)
+        monkeypatch.setattr(Config, "mybot_checkpoint", "")
         spec = AgentInput(session_key="s1")
         assert core._checkpointing_enabled(spec) is False
 

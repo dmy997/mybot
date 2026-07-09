@@ -8,9 +8,10 @@ Providers are detected at init time from environment variables.
 
 from __future__ import annotations
 
-import os
 import re
 from abc import ABC, abstractmethod
+
+from config import Config
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
@@ -289,18 +290,18 @@ def _detect_providers(timeout: int = DEFAULT_TIMEOUT) -> dict[str, SearchProvide
     providers: dict[str, SearchProvider] = {}
 
     # Tavily — preferred (AI-optimized, reliable)
-    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    tavily_key = Config.tavily_api_key
     if tavily_key:
         providers["tavily"] = TavilySearchProvider(tavily_key, timeout=timeout)
 
     # Google Custom Search
-    google_key = os.getenv("GOOGLE_API_KEY", "")
-    google_cse = os.getenv("GOOGLE_CSE_ID", "")
+    google_key = Config.google_api_key
+    google_cse = Config.google_cse_id
     if google_key and google_cse:
         providers["google"] = GoogleSearchProvider(google_key, google_cse, timeout=timeout)
 
     # Bing
-    bing_key = os.getenv("BING_API_KEY", "")
+    bing_key = Config.bing_api_key
     if bing_key:
         providers["bing"] = BingSearchProvider(bing_key, timeout=timeout)
 

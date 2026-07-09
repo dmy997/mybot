@@ -20,8 +20,6 @@ import json
 import sys
 from pathlib import Path
 
-from loguru import logger
-
 
 def _create_provider():
     """Create an LLM provider from environment config."""
@@ -99,8 +97,6 @@ async def _run_custom_tasks(args):
 
 async def _run_benchmark(args):
     """Run Layer 2 community benchmark evaluation."""
-    from evals.reporter import MarkdownReporter, TerminalReporter
-
     provider = _create_provider()
 
     if args.benchmark == "bfcl":

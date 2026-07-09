@@ -16,7 +16,6 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import signal
 from pathlib import Path
@@ -28,7 +27,9 @@ from core.message_bus import InboundMessage, MessageBus
 
 _WECHAT = "wechat"
 _MAX_MSG_CHARS = 2000
-_FALLBACK_CHAT = os.getenv("XIAOHONGSHU_FALLBACK_CHAT", "filehelper")
+from config import Config
+
+_FALLBACK_CHAT = Config.xiaohongshu_fallback_chat
 
 
 class WeChatBot(BaseChannel):

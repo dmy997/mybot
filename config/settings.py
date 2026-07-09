@@ -28,6 +28,8 @@ _DEFAULT_THRESHOLDS: dict[str, float | int] = {
     "compress_ratio": 0.5,
     "consolidation_ratio": 0.7,
     "idle_compress_seconds": 300,
+    "max_session_messages": 2000,
+    "session_ttl_days": 30,
 }
 
 _DEFAULT_MODELS: list[dict] = [
@@ -54,8 +56,19 @@ _DEFAULT_ENV: dict[str, str] = {
     "COMPRESS_RATIO": "0.5",
     "CONSOLIDATION_RATIO": "0.7",
     "IDLE_COMPRESS_SECONDS": "300",
+    "MAX_SESSION_MESSAGES": "2000",
+    "SESSION_TTL_DAYS": "30",
     "MYBOT_HOST": "127.0.0.1",
     "MYBOT_PORT": "8080",
+    "MYBOT_API_KEY": "",
+    "MYBOT_CHECKPOINT": "",
+    "MYBOT_SANDBOX_BACKEND": "none",
+    "TAVILY_API_KEY": "",
+    "GOOGLE_API_KEY": "",
+    "GOOGLE_CSE_ID": "",
+    "BING_API_KEY": "",
+    "XIAOHONGSHU_FALLBACK_CHAT": "filehelper",
+    "DUMP_LLM_MESSAGES": "",
     "HYBRID_SEARCH_ENABLED": "true",
     "EMBEDDING_MODEL": "all-MiniLM-L6-v2",
 }
@@ -75,7 +88,7 @@ class ModelWindowConfig:
 
 @dataclass
 class ThresholdsConfig:
-    """Token-budget threshold ratios."""
+    """Token-budget and session threshold ratios."""
 
     warning_buffer_ratio: float = 0.11
     auto_compact_buffer_ratio: float = 0.072
@@ -83,6 +96,8 @@ class ThresholdsConfig:
     compress_ratio: float = 0.5
     consolidation_ratio: float = 0.7
     idle_compress_seconds: int = 300
+    max_session_messages: int = 2000
+    session_ttl_days: int = 30
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +225,12 @@ def load_thresholds(data: dict | None = None) -> ThresholdsConfig:
         ),
         idle_compress_seconds=int(
             t.get("idle_compress_seconds", _DEFAULT_THRESHOLDS["idle_compress_seconds"])
+        ),
+        max_session_messages=int(
+            t.get("max_session_messages", _DEFAULT_THRESHOLDS["max_session_messages"])
+        ),
+        session_ttl_days=int(
+            t.get("session_ttl_days", _DEFAULT_THRESHOLDS["session_ttl_days"])
         ),
     )
 

@@ -13,6 +13,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -27,22 +28,20 @@ import json as _json
 from loguru import logger
 
 from context.context_manager import ContextManager
-from core.events import SessionCreated, SessionDeleted, bus
+from core.events import SessionCreated, bus
 from core.message_bus import InboundMessage, MessageBus, OutboundMessage
-from memory.dream import Dream
 from observability import LogConfig, init_logging
 from observability.otel_bridge import auto_install as auto_install_otel
 from observability.subscribers import install as install_subscribers
 from observability.trace import tracer
-from services.cron import CronScheduler
 from services.scheduled_tasks import ScheduledTaskService
 from services.xiaohongshu import XIAOHONGSHU_SESSION_KEY, xiaohongshu_prompt
 from tools import ToolRegistry
-from tools.mcp.client_manager import MCPClientManager
 from tools.schedule_task import ScheduleTaskTool
-from tools.tool import Tool
 
+from .background_service import BackgroundService
 from .dispatcher import Dispatcher
+from .mcp_service import MCPService
 from .runner import AgentInput
 from .session_context import SessionContext
 from .session_context import reset as reset_session
@@ -135,11 +134,15 @@ class Orchestrator:
         log_config: LogConfig | None = None,
         middleware: MiddlewareChain | None = None,
         mcp_config_path: str | Path | None = None,
+        max_session_messages: int = 2000,
+        session_ttl_days: int = 30,
     ) -> None:
         self._running = False
         self.workspace = Path(workspace).expanduser().resolve()
         self._compress_idle_seconds = idle_compress_seconds
         self._compressing_sessions: set[str] = set()
+        self._session_ttl_days = session_ttl_days
+        self._last_purge_ts = 0.0
 
         # Observability — configure loguru + event bus subscribers once
         init_logging(log_config)
@@ -147,18 +150,19 @@ class Orchestrator:
         auto_install_otel(tracer)
 
         # Generate default settings.json if not present
+        from config import Config
         from config.settings import generate_default_settings
         generate_default_settings()
 
         # Hybrid search store (graceful degradation if unavailable)
         hybrid_store = None
-        if os.getenv("HYBRID_SEARCH_ENABLED", "true").lower() == "true":
+        if Config.hybrid_search_enabled:
             try:
                 from memory.hybrid_store import HybridStore
 
                 hybrid_store = HybridStore(
                     db_path=os.path.join(str(self.workspace), "memory", "search.db"),
-                    embedding_model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
+                    embedding_model_name=Config.embedding_model,
                 )
             except Exception:
                 logger.warning(
@@ -180,6 +184,8 @@ class Orchestrator:
             compress_model=compress_model,
             disabled_skills=disabled_skills,
             hybrid_store=hybrid_store,
+            max_session_messages=max_session_messages,
+            session_ttl_days=session_ttl_days,
         )
 
         # Dispatcher (accept pre-built or auto-discover agents)
@@ -202,34 +208,24 @@ class Orchestrator:
         )
         self._register_default_tools()
 
-        # MCP (Model Context Protocol) integration
-        self._mcp_manager: MCPClientManager | None = None
-        self._mcp_config_path: Path | None = (
-            Path(mcp_config_path).expanduser().resolve() if mcp_config_path else None
-        )
-        self._setup_mcp()
-
-        # Cron — self-driven periodic task scheduler
-        cron_dir = self.workspace / "cron"
-        self._dream = Dream(
-            store=self.ctx.store,
-            provider=provider,
-            model=compress_model or "",
-        )
-        self.cron = CronScheduler(
-            state_dir=cron_dir,
-            on_job=self._on_cron_job,
-        )
-        self.cron.register_job("dream", interval_hours=2)
-
-        # Unified scheduled tasks (chat-created + system) on top of cron.
-        # `deliver` is wired later by the entry point (channel-specific);
-        # `run_agent` runs internal side-effect tasks via the agent pipeline.
-        self._scheduled = ScheduledTaskService(
+        # MCP (Model Context Protocol) integration — composition
+        self._mcp = MCPService(self._tools)
+        self._mcp.load_config(
+            Path(mcp_config_path).expanduser().resolve() if mcp_config_path else None,
             self.workspace,
-            self.cron,
-            run_agent=self._run_scheduled_agent,
         )
+
+        # Background services (cron + Dream + scheduled tasks) — composition
+        self._bg = BackgroundService(
+            self.workspace,
+            self.ctx.store,
+            provider,
+            compress_model or "",
+            on_run_agent=self._run_scheduled_agent,
+        )
+        self.cron = self._bg.cron  # backward-compat alias
+
+        self._scheduled = self._bg.scheduled_tasks
         self._scheduled.seed_system_task(
             task_id="xiaohongshu",
             schedule="0 20 * * *",
@@ -239,94 +235,6 @@ class Orchestrator:
         )
         self._scheduled.load()
         self._tools.register(ScheduleTaskTool(self._scheduled))
-
-    def _register_default_tools(self) -> None:
-        """Auto-discover and register tools available in the ``"core"`` scope."""
-        from tools import discover_tools
-        from tools.subagent import SubAgentTool
-
-        all_tools = discover_tools(workspace=self.workspace)
-        for name, tool in all_tools.items():
-            if tool.available_in("core"):
-                self._tools.register(tool)
-            else:
-                logger.debug("Tool {!r} skipped (not available in 'core' scope)", name)
-
-        # Register the sub-agent delegation tool (needs provider + parent registry)
-        self._tools.register(SubAgentTool(self.ctx.provider, self._tools, workspace=self.workspace))
-
-        # Register memory tools (need context manager access)
-        from tools.memory_tools import MemoryForgetTool, MemoryRecallTool, MemoryRememberTool
-        self._tools.register(MemoryRememberTool(self.ctx))
-        self._tools.register(MemoryRecallTool(self.ctx))
-        self._tools.register(MemoryForgetTool(self.ctx))
-
-    # -- MCP -----------------------------------------------------------------
-
-    def _setup_mcp(self) -> None:
-        """Load MCP config (if any) and create the client manager but don't connect yet."""
-        from tools.mcp.client_manager import load_mcp_config  # noqa: F811
-
-        config_path = self._mcp_config_path
-        if config_path is None:
-            default = self.workspace / "mcp_servers.json"
-            if default.exists():
-                config_path = default
-
-        if config_path is not None and Path(config_path).exists():
-            try:
-                servers = load_mcp_config(config_path)
-                if servers:
-                    self._mcp_manager = MCPClientManager(self._tools)
-                    self._mcp_manager.configure(servers)
-                    logger.info(
-                        "MCP config loaded from {!s}: {!s} server(s)",
-                        config_path, len(servers),
-                    )
-            except Exception:
-                logger.exception("Failed to load MCP config from {!s}", config_path)
-
-    async def start_mcp(self) -> None:
-        """Connect to configured MCP servers and register their tools."""
-        if self._mcp_manager is not None:
-            await self._mcp_manager.start()
-
-    async def stop_mcp(self) -> None:
-        """Disconnect all MCP servers and unregister their tools."""
-        if self._mcp_manager is not None:
-            await self._mcp_manager.stop()
-
-    # -- Cron / Dream ---------------------------------------------------------
-
-    async def _run_scheduled_agent(
-        self, session_key: str, prompt: str, skills: list[str] | None,
-    ) -> None:
-        """Run an internal side-effect scheduled task through the agent pipeline."""
-        await self.process_message(
-            session_key=session_key,
-            user_input=prompt,
-            skills=skills,
-            source="cron",
-        )
-
-    async def _on_cron_job(self, name: str) -> None:
-        """Route cron job *name* to the appropriate handler."""
-        if name == "dream":
-            await self._dream.run()
-        else:
-            await self._scheduled.fire(name)
-
-    async def start_services(self) -> None:
-        """Start background services (MCP + cron)."""
-        await self.start_mcp()
-        await self.cron.start()
-
-    async def stop_services(self) -> None:
-        """Stop background services (MCP + cron)."""
-        self.cron.stop()
-        await self.stop_mcp()
-
-    # -- helpers ---------------------------------------------------------------
 
     # -- single-message processing --------------------------------------------
 
@@ -548,78 +456,6 @@ class Orchestrator:
             finally:
                 reset_session(token)
 
-    # -- idle compression -------------------------------------------------------
-
-    async def _compress_idle_sessions(self, active_session_key: str) -> None:
-        """Scan all sessions and compress those that have been idle too long.
-
-        Only sessions whose last update exceeds ``_compress_idle_seconds``
-        are compressed.  The active session and sessions already being
-        compressed are skipped.
-        """
-        idle_seconds = self._compress_idle_seconds
-        if idle_seconds <= 0:
-            return
-
-        try:
-            now = time.time()
-            for sess in self.ctx.list_sessions():
-                key = sess.get("key", "")
-                if not key:
-                    continue
-                if key == active_session_key:
-                    continue
-                if key in self._compressing_sessions:
-                    continue
-
-                updated_str = sess.get("updated_at", "")
-                if not updated_str:
-                    continue
-                try:
-                    from datetime import datetime
-                    updated_at = datetime.fromisoformat(updated_str)
-                    updated_ts = updated_at.timestamp()
-                except (ValueError, TypeError, OSError):
-                    continue
-
-                if now - updated_ts <= idle_seconds:
-                    continue
-
-                self._compressing_sessions.add(key)
-                asyncio.create_task(
-                    self._compress_stale_session(key),
-                    name=f"idle-compress-{key}",
-                )
-        except Exception:
-            logger.opt(exception=True).debug("Idle compression scan failed")
-
-    async def _compress_stale_session(self, session_key: str) -> None:
-        """Compress a stale session: keep the 10 most recent messages, summarise the rest."""
-        try:
-            # Load the full session to check message count
-            session = self.ctx.session.get_session(session_key)
-            cursor = session.consolidated_cursor
-            unsummarised = len(session.messages) - cursor
-            if unsummarised <= 10:
-                return  # nothing to compress
-
-            logger.info(
-                "Idle compression: {!r} has {} unsummarised messages, compressing...",
-                session_key, unsummarised,
-            )
-            n = await self.ctx.compress(session_key, keep_recent=10)
-            if n > 0:
-                logger.info(
-                    "Idle compression: {!r} compressed {} messages (kept last 10)",
-                    session_key, n,
-                )
-        except Exception:
-            logger.opt(exception=True).warning(
-                "Idle compression failed for {!r}", session_key,
-            )
-        finally:
-            self._compressing_sessions.discard(session_key)
-
     # -- MessageBus-based serving ---------------------------------------------
 
     async def serve(self, bus_msg: MessageBus, session_key: str) -> None:
@@ -668,6 +504,7 @@ class Orchestrator:
                     raw = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     await self._compress_idle_sessions(session_key)
+                    await self._purge_expired_sessions()
                     continue
 
                 if raw is None:  # sentinel
@@ -742,7 +579,52 @@ class Orchestrator:
             self._running = False
             logger.info("serve() ended for session {!r}", session_key)
 
-    # -- delegation -----------------------------------------------------------
+    # ========================================================================
+    # Tool registry (inlined from ToolRegistryMixin)
+    # ========================================================================
+
+    def _register_default_tools(self) -> None:
+        """Auto-discover and register tools available in the ``"core"`` scope."""
+        from tools import discover_tools
+        from tools.memory_tools import MemoryForgetTool, MemoryRecallTool, MemoryRememberTool
+        from tools.subagent import SubAgentTool
+
+        all_tools = discover_tools(workspace=self.workspace)
+        for name, tool in all_tools.items():
+            if tool.available_in("core"):
+                self._tools.register(tool)
+            else:
+                logger.debug("Tool {!r} skipped (not available in 'core' scope)", name)
+
+        self._tools.register(SubAgentTool(
+            self.ctx.provider, self._tools, workspace=self.workspace,
+        ))
+        self._tools.register(MemoryRememberTool(self.ctx))
+        self._tools.register(MemoryRecallTool(self.ctx))
+        self._tools.register(MemoryForgetTool(self.ctx))
+
+    def register_tool(self, tool: object) -> None:
+        """Register a tool for agent use."""
+        self._tools.register(tool)
+        self.ctx._invalidate_static()
+
+    def unregister_tool(self, name: str) -> None:
+        """Remove a previously registered tool."""
+        self._tools.unregister(name)
+        self.ctx._invalidate_static()
+
+    def get_tool(self, name: str) -> object | None:
+        """Return a registered core-scope tool by name, or ``None``."""
+        return self._tools.get(name)
+
+    @property
+    def tools(self) -> ToolRegistry:
+        """The tool registry (mutable — use ``register_tool`` to populate)."""
+        return self._tools
+
+    # ========================================================================
+    # Session lifecycle (inlined from SessionLifecycleMixin)
+    # ========================================================================
 
     @property
     def sessions(self) -> list[dict[str, Any]]:
@@ -751,13 +633,14 @@ class Orchestrator:
 
     def delete_session(self, key: str) -> bool:
         """Delete a session and its on-disk data."""
-        ok = self.ctx.delete_session(key)
+        ok: bool = self.ctx.delete_session(key)
         if ok:
             try:
                 loop = asyncio.get_running_loop()
+                from core.events import SessionDeleted, bus
                 loop.create_task(bus.publish(SessionDeleted(session_key=key)))
             except RuntimeError:
-                pass  # no event loop (e.g. sync test), skip event
+                pass
         return ok
 
     def remember(
@@ -780,47 +663,133 @@ class Orchestrator:
         return self.ctx.recall(query, top_n=top_n)
 
     @property
-    def tools(self) -> ToolRegistry:
-        """The tool registry (mutable — use ``register_tool`` to populate)."""
-        return self._tools
-
-    def register_tool(self, tool: Tool) -> None:
-        """Register a tool for agent use."""
-        self._tools.register(tool)
-        self.ctx._invalidate_static()
-
-    def unregister_tool(self, name: str) -> None:
-        """Remove a previously registered tool."""
-        self._tools.unregister(name)
-        self.ctx._invalidate_static()
+    def context(self) -> ContextManager:
+        """The internal :class:`ContextManager`."""
+        return self.ctx
 
     @property
     def dispatcher(self) -> Dispatcher:
         """The internal :class:`Dispatcher`."""
         return self._dispatcher
 
+    # ========================================================================
+    # Idle compression (inlined from IdleCompressionMixin)
+    # ========================================================================
+
+    async def _compress_idle_sessions(self, active_session_key: str) -> None:
+        """Scan all sessions and compress those that have been idle too long."""
+        idle_seconds: int = self._compress_idle_seconds
+        if idle_seconds <= 0:
+            return
+
+        try:
+            now = time.time()
+            for sess in self.ctx.list_sessions():
+                key: str = sess.get("key", "")
+                if not key:
+                    continue
+                if key == active_session_key:
+                    continue
+                if key in self._compressing_sessions:
+                    continue
+
+                updated_str: str = sess.get("updated_at", "")
+                if not updated_str:
+                    continue
+                try:
+                    updated_at = datetime.fromisoformat(updated_str)
+                    updated_ts = updated_at.timestamp()
+                except (ValueError, TypeError, OSError):
+                    continue
+
+                if now - updated_ts <= idle_seconds:
+                    continue
+
+                self._compressing_sessions.add(key)
+                asyncio.create_task(
+                    self._compress_stale_session(key),
+                    name=f"idle-compress-{key}",
+                )
+        except Exception:
+            logger.opt(exception=True).debug("Idle compression scan failed")
+
+    async def _compress_stale_session(self, session_key: str) -> None:
+        """Compress a stale session: keep the 10 most recent messages, summarise the rest."""
+        try:
+            session = self.ctx.session.get_session(session_key)
+            cursor = session.consolidated_cursor
+            unsummarised = len(session.messages) - cursor
+            if unsummarised <= 10:
+                return
+
+            logger.info(
+                "Idle compression: {!r} has {} unsummarised messages, compressing...",
+                session_key, unsummarised,
+            )
+            n = await self.ctx.compress(session_key, keep_recent=10)
+            if n > 0:
+                logger.info(
+                    "Idle compression: {!r} compressed {} messages (kept last 10)",
+                    session_key, n,
+                )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Idle compression failed for {!r}", session_key,
+            )
+        finally:
+            self._compressing_sessions.discard(session_key)
+
+    async def _purge_expired_sessions(self) -> None:
+        """Purge sessions that have been inactive beyond ``session_ttl_days``.
+
+        Runs at most once per hour to avoid redundant filesystem scans.
+        """
+        now = time.time()
+        if now - self._last_purge_ts < 3600:
+            return
+        self._last_purge_ts = now
+        try:
+            deleted: int = self.ctx.purge_expired_sessions()
+            if deleted:
+                logger.info("Purged {} expired session(s)", deleted)
+        except Exception:
+            logger.opt(exception=True).warning("Session expiry purge failed")
+
+    # ========================================================================
+    # Services (inlined from MCPServicesMixin)
+    # ========================================================================
+
+    async def _run_scheduled_agent(
+        self, session_key: str, prompt: str, skills: list[str] | None,
+    ) -> None:
+        """Run an internal side-effect scheduled task through the agent pipeline."""
+        await self.process_message(
+            session_key=session_key,
+            user_input=prompt,
+            skills=skills,
+            source="cron",
+        )
+
+    async def start_services(self) -> None:
+        """Start background services (MCP + cron)."""
+        await self._mcp.start()
+        await self._bg.start()
+
+    async def stop_services(self) -> None:
+        """Stop background services (MCP + cron)."""
+        self._bg.stop()
+        await self._mcp.stop()
+
     @property
     def scheduled_tasks(self) -> ScheduledTaskService:
         """The unified scheduled-task service (chat-created + system tasks)."""
-        return self._scheduled
-
-    def get_tool(self, name: str):
-        """Return a registered core-scope tool by name, or ``None``.
-
-        Used by entry points to wire channel-specific hooks onto a tool after
-        registration (e.g. the Xiaohongshu publish-fallback push callback).
-        """
-        return self._tools.get(name)
-
-    @property
-    def context(self) -> ContextManager:
-        """The internal :class:`ContextManager`."""
-        return self.ctx
+        return self._bg.scheduled_tasks
 
 
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     """CLI entry point — launch the Textual chat UI."""

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from config import Config
 from core.message_bus import OutboundMessage
 from core.orchestrator import OrchestratorResult
 from core.server import _sse_event, create_app
@@ -229,7 +230,7 @@ class TestPushEvents:
 
 class TestAuth:
     def test_no_auth_when_key_not_set(self, orchestrator, monkeypatch):
-        monkeypatch.delenv("MYBOT_API_KEY", raising=False)
+        monkeypatch.setattr(Config, "mybot_api_key", "")
         from starlette.testclient import TestClient
         app = create_app(orchestrator)
         client = TestClient(app)
@@ -237,7 +238,7 @@ class TestAuth:
         assert resp.status_code == 200
 
     def test_auth_required_when_key_set(self, orchestrator, monkeypatch):
-        monkeypatch.setenv("MYBOT_API_KEY", "secret-token")
+        monkeypatch.setattr(Config, "mybot_api_key", "secret-token")
         from starlette.testclient import TestClient
         app = create_app(orchestrator)
         client = TestClient(app)
@@ -245,7 +246,7 @@ class TestAuth:
         assert resp.status_code == 401
 
     def test_auth_with_correct_token(self, orchestrator, monkeypatch):
-        monkeypatch.setenv("MYBOT_API_KEY", "secret-token")
+        monkeypatch.setattr(Config, "mybot_api_key", "secret-token")
         from starlette.testclient import TestClient
         app = create_app(orchestrator)
         client = TestClient(app)
@@ -253,7 +254,7 @@ class TestAuth:
         assert resp.status_code == 200
 
     def test_auth_with_wrong_token(self, orchestrator, monkeypatch):
-        monkeypatch.setenv("MYBOT_API_KEY", "secret-token")
+        monkeypatch.setattr(Config, "mybot_api_key", "secret-token")
         from starlette.testclient import TestClient
         app = create_app(orchestrator)
         client = TestClient(app)

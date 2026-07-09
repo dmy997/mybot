@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import uuid
 from pathlib import Path
 from typing import Any
 
+from config import Config
 from loguru import logger
 
 from observability.metrics import REGISTRY
@@ -57,7 +57,7 @@ def _sse_event(event: str, data: Any = None) -> str:
 
 def _check_auth(request: Any) -> bool:
     """Return True if the request is authenticated."""
-    expected = os.getenv("MYBOT_API_KEY", "")
+    expected = Config.mybot_api_key
     if not expected:
         return True  # auth disabled
     auth = request.headers.get("Authorization", "")
@@ -68,7 +68,7 @@ def _check_auth(request: Any) -> bool:
 
 def _ws_check_auth(headers: list) -> bool:
     """Return True if the WebSocket connection is authenticated."""
-    expected = os.getenv("MYBOT_API_KEY", "")
+    expected = Config.mybot_api_key
     if not expected:
         return True
     for key, value in headers:
@@ -561,8 +561,8 @@ def main() -> None:
     from config import Config
     from providers.openai_compatible_provider import OpenAICompatibleProvider
 
-    host = os.getenv("MYBOT_HOST", "127.0.0.1")
-    port = int(os.getenv("MYBOT_PORT", "8080"))
+    host = Config.mybot_host
+    port = Config.mybot_port
 
     provider = OpenAICompatibleProvider(
         api_key=Config.api_key,

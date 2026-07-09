@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from config import Config
 from tools.websearch_tool import (
     DuckDuckGoProvider,
     GoogleSearchProvider,
@@ -78,40 +79,56 @@ class TestProviderDetection:
         assert "duckduckgo" in providers
 
     def test_google_disabled_without_key(self, monkeypatch):
-        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-        monkeypatch.delenv("GOOGLE_CSE_ID", raising=False)
+        monkeypatch.setattr(Config, "google_api_key", "")
+        monkeypatch.setattr(Config, "google_cse_id", "")
+        monkeypatch.setattr(Config, "tavily_api_key", "")
+        monkeypatch.setattr(Config, "bing_api_key", "")
         providers = _detect_providers()
         assert "google" not in providers
 
     def test_google_disabled_without_cse(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_API_KEY", "key")
-        monkeypatch.delenv("GOOGLE_CSE_ID", raising=False)
+        monkeypatch.setattr(Config, "google_api_key", "key")
+        monkeypatch.setattr(Config, "google_cse_id", "")
+        monkeypatch.setattr(Config, "tavily_api_key", "")
+        monkeypatch.setattr(Config, "bing_api_key", "")
         providers = _detect_providers()
         assert "google" not in providers
 
     def test_google_enabled_with_both(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_API_KEY", "key")
-        monkeypatch.setenv("GOOGLE_CSE_ID", "cse")
+        monkeypatch.setattr(Config, "google_api_key", "key")
+        monkeypatch.setattr(Config, "google_cse_id", "cse")
+        monkeypatch.setattr(Config, "tavily_api_key", "")
+        monkeypatch.setattr(Config, "bing_api_key", "")
         providers = _detect_providers()
         assert "google" in providers
 
     def test_bing_disabled_without_key(self, monkeypatch):
-        monkeypatch.delenv("BING_API_KEY", raising=False)
+        monkeypatch.setattr(Config, "bing_api_key", "")
+        monkeypatch.setattr(Config, "tavily_api_key", "")
+        monkeypatch.setattr(Config, "google_api_key", "")
         providers = _detect_providers()
         assert "bing" not in providers
 
     def test_bing_enabled_with_key(self, monkeypatch):
-        monkeypatch.setenv("BING_API_KEY", "key")
+        monkeypatch.setattr(Config, "bing_api_key", "key")
+        monkeypatch.setattr(Config, "tavily_api_key", "")
+        monkeypatch.setattr(Config, "google_api_key", "")
+        monkeypatch.setattr(Config, "google_cse_id", "")
         providers = _detect_providers()
         assert "bing" in providers
 
     def test_tavily_disabled_without_key(self, monkeypatch):
-        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.setattr(Config, "tavily_api_key", "")
+        monkeypatch.setattr(Config, "bing_api_key", "")
+        monkeypatch.setattr(Config, "google_api_key", "")
         providers = _detect_providers()
         assert "tavily" not in providers
 
     def test_tavily_enabled_with_key(self, monkeypatch):
-        monkeypatch.setenv("TAVILY_API_KEY", "key")
+        monkeypatch.setattr(Config, "tavily_api_key", "key")
+        monkeypatch.setattr(Config, "bing_api_key", "")
+        monkeypatch.setattr(Config, "google_api_key", "")
+        monkeypatch.setattr(Config, "google_cse_id", "")
         providers = _detect_providers()
         assert "tavily" in providers
 
@@ -232,13 +249,16 @@ class TestMultiSource:
             assert "Tavily Title" in result.content
 
     @pytest.mark.asyncio
-    async def test_all_with_single_provider(self):
+    async def test_all_with_single_provider(self, monkeypatch):
         """source='all' with only one provider should still work."""
+        monkeypatch.setattr(Config, "tavily_api_key", "")
+        monkeypatch.setattr(Config, "google_api_key", "")
+        monkeypatch.setattr(Config, "google_cse_id", "")
+        monkeypatch.setattr(Config, "bing_api_key", "")
         tool = WebSearchTool()
         # DDG is the only provider when no API keys are set
         assert len(tool._providers) == 1
 
-        # Actually, this test would hit real DDG, so let's mock
         mock_results = [SearchResult("Only DDG", "https://ddg.com", "snippet")]
         with patch.object(DuckDuckGoProvider, "search", AsyncMock(return_value=mock_results)):
             result = await tool.execute("test", source="all", max_results=5)

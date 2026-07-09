@@ -40,15 +40,8 @@ class TestBaseAgentAbstract:
 
 
 class TestBaseAgentMessages:
-    def test_msg(self):
-        m = BaseAgent._msg("user", "hello")
-        assert m == {"role": "user", "content": "hello"}
-
     def test_user(self):
         assert BaseAgent._user("hi") == {"role": "user", "content": "hi"}
-
-    def test_system(self):
-        assert BaseAgent._system("prompt") == {"role": "system", "content": "prompt"}
 
 
 # ---------------------------------------------------------------------------

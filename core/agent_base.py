@@ -45,16 +45,8 @@ class BaseAgent(ABC):
     # -- shared message builders -------------------------------------------
 
     @staticmethod
-    def _msg(role: str, content: str) -> dict[str, Any]:
-        return {"role": role, "content": content}
-
-    @staticmethod
     def _user(content: str) -> dict[str, Any]:
         return {"role": "user", "content": content}
-
-    @staticmethod
-    def _system(content: str) -> dict[str, Any]:
-        return {"role": "system", "content": content}
 
     # -- spec builders -----------------------------------------------------
 

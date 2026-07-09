@@ -494,7 +494,7 @@ class TestToolIntegration:
         assert "bash" in registry
         assert "read" in registry
         assert "write" in registry
-        assert len(registry) == 7  # bash, ls, read, write, webfetch, grep, websearch
+        assert len(registry) == 8  # bash, ls, read, write, webfetch, grep, websearch, xiaohongshu_publish
 
     def test_tool_definitions_valid(self, workspace):
         from tools import ToolRegistry, discover_tools
@@ -504,7 +504,7 @@ class TestToolIntegration:
             registry.register(tool)
 
         definitions = registry.get_definitions()
-        assert len(definitions) == 7  # bash, ls, read, write, webfetch, grep, websearch
+        assert len(definitions) == 8  # bash, ls, read, write, webfetch, grep, websearch, xiaohongshu_publish
         for d in definitions:
             assert d["type"] == "function"
             assert d["function"]["name"]
@@ -519,7 +519,7 @@ class TestToolIntegration:
         # Should not contain Tool or ToolResult
         assert "tool" not in tools_dict
         assert "ToolResult" not in tools_dict
-        assert len(tools_dict) == 7  # bash, ls, read, write, webfetch, grep, websearch
+        assert len(tools_dict) == 8  # bash, ls, read, write, webfetch, grep, websearch, xiaohongshu_publish
 
     def test_discover_tools_returns_instances(self, workspace):
         from tools import Tool, discover_tools
@@ -541,7 +541,7 @@ class TestToolIntegration:
         # bash is not available in "memory" scope
         core_tools = registry.for_scope("core")
         core_names = {t.name for t in core_tools}
-        assert core_names == {"bash", "ls", "read", "write", "webfetch", "grep", "websearch"}
+        assert core_names == {"bash", "ls", "read", "write", "webfetch", "grep", "websearch", "xiaohongshu_publish"}
 
         memory_tools = registry.for_scope("memory")
         memory_names = {t.name for t in memory_tools}

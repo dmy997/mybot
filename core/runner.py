@@ -7,6 +7,7 @@ import json
 import os
 import time
 from collections.abc import Awaitable, Callable
+from config import Config
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -191,11 +192,11 @@ def _dump_llm_messages(
 
     Output path: ``{workspace}/debug/{session_key}__step{step_count:03d}__{ts}.json``
     """
-    if not os.environ.get("DUMP_LLM_MESSAGES"):
+    if not Config.dump_llm_messages:
         return
 
-    workspace = os.environ.get("WORKSPACE", os.path.expanduser("~/.mybot/workspace"))
-    debug_dir = Path(workspace) / "debug"
+    workspace = Config.workspace
+    debug_dir = Path(workspace).expanduser() / "debug"
     try:
         debug_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -484,7 +485,7 @@ class AgentCore:
             return False
         if spec.checkpoint:
             return True
-        env = os.environ.get("MYBOT_CHECKPOINT", "").strip().lower()
+        env = Config.mybot_checkpoint.strip().lower()
         return env in ("1", "true", "yes")
 
     def _checkpoint_path(self, spec: AgentInput) -> Path:
@@ -492,7 +493,7 @@ class AgentCore:
         if self._workspace:
             base = self._workspace
         else:
-            base = Path(os.environ.get("WORKSPACE", "~/.mybot/workspace")).expanduser().resolve()
+            base = Path(Config.workspace).expanduser().resolve()
         return base / "sessions" / f"{spec.session_key}_checkpoint.json"
 
     def _save_checkpoint(
@@ -1188,10 +1189,10 @@ if __name__ == "__main__":
     load_dotenv()
 
     llm = OpenAICompatibleProvider(
-        os.getenv("OPENAI_API_KEY"),
-        os.getenv("OPENAI_API_BASE"),
-        name=os.getenv("PROVIDER_NAME", "openrouter"),
-        default_model=os.getenv("LLM_MODEL_ID", "deepseek/deepseek-v4-flash")
+        Config.api_key,
+        Config.api_base,
+        name=Config.provider_name,
+        default_model=Config.default_model,
     )
     core = AgentCore(provider=llm)
 
