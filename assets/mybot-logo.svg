@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FF8C42"/>
+      <stop offset="100%" stop-color="#FF6B1A"/>
+    </linearGradient>
+    <linearGradient id="earL" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#E55D00"/>
+      <stop offset="100%" stop-color="#FF8C42"/>
+    </linearGradient>
+    <linearGradient id="earR" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#E55D00"/>
+      <stop offset="100%" stop-color="#FF8C42"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="248" fill="url(#bg)"/>
+
+  <!-- Left ear -->
+  <ellipse cx="136" cy="128" rx="64" ry="80" fill="url(#earL)" transform="rotate(-12, 136, 128)"/>
+  <ellipse cx="136" cy="128" rx="42" ry="58" fill="#FFF3E0" opacity="0.35" transform="rotate(-12, 136, 128)"/>
+
+  <!-- Right ear -->
+  <ellipse cx="376" cy="128" rx="64" ry="80" fill="url(#earR)" transform="rotate(12, 376, 128)"/>
+  <ellipse cx="376" cy="128" rx="42" ry="58" fill="#FFF3E0" opacity="0.35" transform="rotate(12, 376, 128)"/>
+
+  <!-- Face -->
+  <ellipse cx="256" cy="272" rx="176" ry="168" fill="#FFB366"/>
+
+  <!-- Snout mask -->
+  <ellipse cx="256" cy="340" rx="120" ry="96" fill="#FFF3E0"/>
+
+  <!-- Left eye -->
+  <ellipse cx="200" cy="258" rx="20" ry="22" fill="#3E2723"/>
+  <ellipse cx="205" cy="252" rx="6" ry="7" fill="#FFFFFF"/>
+
+  <!-- Right eye -->
+  <ellipse cx="312" cy="258" rx="20" ry="22" fill="#3E2723"/>
+  <ellipse cx="317" cy="252" rx="6" ry="7" fill="#FFFFFF"/>
+
+  <!-- Nose -->
+  <ellipse cx="256" cy="310" rx="22" ry="16" fill="#3E2723"/>
+  <ellipse cx="250" cy="306" rx="6" ry="4" fill="#FFFFFF" opacity="0.5"/>
+
+  <!-- Mouth -->
+  <path d="M 240 328 Q 256 348 272 328" fill="none" stroke="#3E2723" stroke-width="4" stroke-linecap="round"/>
+  <line x1="256" y1="326" x2="256" y2="340" stroke="#3E2723" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Tongue -->
+  <path d="M 248 340 Q 248 368 256 368 Q 264 368 264 340" fill="#FF6B6B"/>
+
+  <!-- Left cheek blush -->
+  <ellipse cx="148" cy="316" rx="32" ry="20" fill="#FFAB91" opacity="0.5"/>
+
+  <!-- Right cheek blush -->
+  <ellipse cx="364" cy="316" rx="32" ry="20" fill="#FFAB91" opacity="0.5"/>
+</svg>

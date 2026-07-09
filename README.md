@@ -1,5 +1,9 @@
 # mybot
 
+<p align="center">
+  <img src="assets/mybot-logo.svg" alt="mybot logo" width="128" height="128">
+</p>
+
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-820%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
