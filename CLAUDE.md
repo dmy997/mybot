@@ -37,7 +37,7 @@ mybot-server           # HTTP/WS server (core.server:main), then open http://127
 - `evals/` — Agent evaluation system (custom YAML tasks + BFCL/GAIA benchmarks)
 - `context/` — ContextManager composed from 4 mixins: CoreContextMixin (build_messages, compress), PromptBuilderMixin (system prompt, repair), MemoryOperationsMixin (remember/forget/recall), SessionPersistenceMixin (save/list/delete/expire). + SessionManager (JSON persistence with hard-cap pruning + TTL expiry)
 - `tools/` — bash, file R/W, grep, webfetch, websearch, memory CRUD, subagent, `schedule_task` (create/list/cancel periodic tasks), ToolRegistry, ToolGuard security
-- `services/` — `CronScheduler` (self-driven timer, cron-expression + interval jobs) + `ScheduledTaskService` (chat-created push tasks + system side-effect tasks like Xiaohongshu). See `docs/scheduled-tasks.md`
+- `services/` — `CronScheduler` (self-driven timer, cron-expression + interval jobs) + `ScheduledTaskService` (chat-created push tasks + system side-effect tasks like Xiaohongshu) + `HitlService` / `HitlMiddleware` (human-in-the-loop confirmation). See `docs/scheduled-tasks.md` and `docs/hitl.md`
 - `memory/` — Long-term file-based memory (MemoryStore, Consolidator + Dream pipeline)
 - `observability/` — Structured logging (loguru), Prometheus-style metrics, span tracing, rich CLI display
 - `config/` — `.env` auto-loading, typed `Config` class
@@ -84,6 +84,8 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 **`AgentInput` / `AgentOutput`** (`core/runner.py`): The universal I/O contract. `AgentInput` carries messages + tools + streaming callbacks (`on_content_delta`, `on_thinking_delta`, `on_tool_call_delta`, `on_tool_execute_start/end`, `on_new_turn`). `AgentOutput` carries full message history so callers can continue the conversation.
 
 **Middleware** (`core/middleware.py`): Chain-of-responsibility pattern. `MiddlewareChain` nests `call_next` closures so middleware[n] wraps middleware[n+1]. Five hook points: `on_agent_start`, `on_agent_step` (can abort loop), `on_llm_call` (modify messages/model before, inspect response after), `on_tool_execute` (block/modify/cache results), `on_agent_end`. Shared mutable state via `MiddlewareContext.data`.
+
+**HITL** (`services/hitl.py`): Human-in-the-loop tool authorization. `HitlMiddleware` (AgentMiddleware) pauses tool execution in `on_tool_execute` when `HITL_MODE=confirm` and the tool has SHELL/FILE_WRITE/NETWORK/DELEGATE capabilities. `HitlService` uses `asyncio.Future` to block until the user approves/denies via channel-specific UI (CLI confirm dialog, HTTP `/hitl/respond`, WeChat y/n reply). Default mode is `bypass` (auto-execute all).
 
 **`Dispatcher`** (`core/dispatcher.py`): Four-layer routing (regex commands → keyword heuristics → optional LLM classification → default). The LLM classifier is instantiated internally when `provider` is given — uses a cheap model for <10 token responses.
 

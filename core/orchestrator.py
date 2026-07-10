@@ -17,8 +17,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:
-    from core.middleware import MiddlewareChain
 
 # ---------------------------------------------------------------------------
 # Helper — format tool args for inline display
@@ -43,6 +41,7 @@ from tools.schedule_task import ScheduleTaskTool
 from .background_service import BackgroundService
 from .dispatcher import Dispatcher
 from .mcp_service import MCPService
+from .middleware import MiddlewareChain
 from .runner import AgentInput
 from .session_context import SessionContext
 from .session_context import reset as reset_session
@@ -202,6 +201,13 @@ class Orchestrator:
             self._dispatcher = Dispatcher(
                 agents, provider=provider, classify_model=compress_model
             )
+
+        # HITL (Human-in-the-loop) — must be initialized before agents
+        from services.hitl import create_hitl_service_and_middleware
+        self.hitl_service, _hitl_mw = create_hitl_service_and_middleware()
+        if middleware is None:
+            middleware = MiddlewareChain()
+        middleware.add(_hitl_mw)
 
         # Tools — main agent gets full access guard
         from tools.guard import ToolGuard as _ToolGuard

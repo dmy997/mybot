@@ -154,6 +154,21 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
 
     orchestrator.scheduled_tasks.set_deliver(_deliver_scheduled)
 
+    # Register HITL on_request callback — pushes hitl_confirm events to
+    # the HTTP outbound queue so SSE streams can forward them to the browser.
+    if hasattr(orchestrator, "hitl_service"):
+        def _on_hitl_request(req: Any) -> None:
+            try:
+                bus_msg.outbound("http").put_nowait(OutboundMessage(
+                    req.session_key, "", "hitl_confirm",
+                    {"request_id": req.request_id, "tool_name": req.tool_name,
+                     "arguments": req.arguments, "capabilities": list(req.capabilities)},
+                ))
+            except asyncio.QueueFull:
+                logger.warning("HITL confirm event dropped — http queue full")
+
+        orchestrator.hitl_service.add_listener(_on_hitl_request)
+
     # ------------------------------------------------------------------
     # HTTP endpoints
     # ------------------------------------------------------------------
@@ -269,8 +284,12 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                     out = await bus_msg.outbound("http").get()
                     if out is None:
                         break
-                    if out.correlation_id != cid:
-                        continue  # not for this request
+                    if out.correlation_id != cid and out.msg_type != "hitl_confirm":
+                        continue  # not for this request (except HITL which uses session_key)
+
+                    if out.msg_type == "hitl_confirm":
+                        yield _sse_event("hitl_confirm", out.data)
+                        continue
 
                     if out.msg_type == "delta":
                         yield _sse_event("delta", {"token": out.data})
@@ -572,6 +591,38 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
 
     _ui_html: bytes | None = None
 
+    async def hitl_respond(request: Request) -> JSONResponse:
+        """Resolve a pending HITL confirmation request.
+
+        Body: ``{"request_id": "...", "decision": "approved" | "denied"}``
+        """
+        if not _check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        request_id = (body.get("request_id") or "").strip()
+        decision = (body.get("decision") or "denied").strip()
+
+        if not request_id:
+            return JSONResponse({"error": "request_id is required"}, status_code=400)
+
+        hitl_svc = getattr(orchestrator, "hitl_service", None)
+        if hitl_svc is None:
+            return JSONResponse({"error": "HITL service not available"}, status_code=400)
+
+        ok = hitl_svc.respond(request_id, decision)
+        if not ok:
+            return JSONResponse(
+                {"error": "request not found or already resolved"},
+                status_code=404,
+            )
+
+        return JSONResponse({"status": "ok", "request_id": request_id, "decision": decision})
+
     async def index(request: Request) -> HTMLResponse:
         nonlocal _ui_html
         if _ui_html is None:
@@ -588,6 +639,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
     app = Starlette(routes=[
         Route("/", index),
         Route("/health", health),
+        Route("/hitl/respond", hitl_respond, methods=["POST"]),
         Route("/metrics", metrics),
         Route("/logs", logs_endpoint),
         Route("/traces", traces_endpoint),

@@ -94,7 +94,25 @@ class ChatApp(App):
         self._history_path: Path = (
             self._orche.workspace / "sessions" / f"{session_key}_input_history.json"
         )
+        # Register HITL confirmation callback — shows ConfirmScreen dialog
+        if hasattr(self._orche, "hitl_service"):
+            self._orche.hitl_service.add_listener(self._on_hitl_request)
         super().__init__()
+
+    def _on_hitl_request(self, req: Any) -> None:
+        """Show a confirmation dialog for a HITL request."""
+
+        msg = (
+            f"Allow tool execution?\n\n"
+            f"Tool: {req.tool_name}\n"
+            f"Args: {_fmt_args(req.arguments)}"
+        )
+        self.push_screen(
+            ConfirmScreen(msg),
+            lambda result: self._orche.hitl_service.respond(
+                req.request_id, "approved" if result else "denied",
+            ),
+        )
 
     # -- composition ----------------------------------------------------------
 

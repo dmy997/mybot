@@ -284,6 +284,40 @@ input { font-family: inherit; }
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* HITL modal */
+#hitl-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  display: none; justify-content: center; align-items: center; z-index: 1000;
+}
+#hitl-overlay.active { display: flex; }
+#hitl-dialog {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; padding: 24px; max-width: 480px; width: 90%;
+  box-shadow: 0 8px 32px rgba(0,0,0,.4);
+}
+#hitl-dialog h3 { font-size: 16px; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+#hitl-dialog .hitl-warn { color: #f0a040; font-size: 13px; margin-bottom: 16px; }
+#hitl-dialog .hitl-field { margin-bottom: 12px; }
+#hitl-dialog .hitl-field .hitl-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
+#hitl-dialog .hitl-field pre {
+  background: #0d1117; border-radius: 6px; padding: 10px 12px; font-size: 12px;
+  overflow-x: auto; max-height: 160px; overflow-y: auto; white-space: pre-wrap;
+  word-break: break-all; line-height: 1.4; margin: 0;
+}
+#hitl-dialog .hitl-caps { display: flex; gap: 6px; flex-wrap: wrap; }
+#hitl-dialog .hitl-cap {
+  font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  background: rgba(108,99,255,.15); color: var(--accent);
+}
+#hitl-dialog .hitl-buttons { display: flex; gap: 10px; margin-top: 20px; }
+#hitl-dialog .hitl-buttons button {
+  flex: 1; padding: 10px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; border: none;
+}
+#hitl-btn-approve { background: var(--ok); color: #111; }
+#hitl-btn-approve:hover { opacity: .85; }
+#hitl-btn-deny { background: var(--danger); color: #fff; }
+#hitl-btn-deny:hover { opacity: .85; }
 </style>
 </head>
 <body>
@@ -322,6 +356,30 @@ input { font-family: inherit; }
   </div>
 </div>
 
+<!-- HITL confirmation modal -->
+<div id="hitl-overlay">
+  <div id="hitl-dialog">
+    <h3>HITL Confirmation</h3>
+    <div class="hitl-warn">This tool requires your approval to execute.</div>
+    <div class="hitl-field">
+      <div class="hitl-label">Tool</div>
+      <pre id="hitl-tool-name"></pre>
+    </div>
+    <div class="hitl-field">
+      <div class="hitl-label">Arguments</div>
+      <pre id="hitl-tool-args"></pre>
+    </div>
+    <div class="hitl-field">
+      <div class="hitl-label">Capabilities</div>
+      <div id="hitl-tool-caps" class="hitl-caps"></div>
+    </div>
+    <div class="hitl-buttons">
+      <button id="hitl-btn-approve" onclick="respondHitl('approved')">Approve</button>
+      <button id="hitl-btn-deny" onclick="respondHitl('denied')">Deny</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let currentSession = 'default';
 let isStreaming = false;
@@ -332,6 +390,7 @@ let messageHistory = [];
 let historyIndex = -1;
 let historyDraft = '';
 let currentGoal = null;
+let _pendingHitlRequestId = null;
 
 const _HISTORY_MAX = 200;
 
@@ -438,6 +497,10 @@ function _connectPushEvents(sessionKey) {
     console.warn('Push error:', e.data);
   });
 
+  _pushSource.addEventListener('hitl_confirm', function(e) {
+    _onHitlConfirm(JSON.parse(e.data));
+  });
+
   _pushSource.onerror = function() {
     if (asstEl && !textBuffer) { asstEl.remove(); }
     asstEl = null; contentEl = null; thinkingBlock = null; toolBlock = null; textBuffer = '';
@@ -456,6 +519,43 @@ function _saveMessageHistory(sessionKey) {
     localStorage.setItem(_historyKey(sessionKey), JSON.stringify(messageHistory));
   } catch { /* storage full — ignore */ }
 }
+
+// =========================================================================
+// HITL confirmation
+// =========================================================================
+function _onHitlConfirm(data) {
+  _pendingHitlRequestId = data.request_id;
+  document.getElementById('hitl-tool-name').textContent = data.tool_name || 'unknown';
+  document.getElementById('hitl-tool-args').textContent = JSON.stringify(data.arguments || {}, null, 2);
+  const capsEl = document.getElementById('hitl-tool-caps');
+  capsEl.innerHTML = (data.capabilities || []).map(function(c) {
+    return '<span class="hitl-cap">' + esc(c) + '</span>';
+  }).join('') || '<span class="hitl-cap">none</span>';
+  document.getElementById('hitl-overlay').classList.add('active');
+  document.getElementById('hitl-btn-approve').focus();
+}
+
+async function respondHitl(decision) {
+  if (!_pendingHitlRequestId) return;
+  const rid = _pendingHitlRequestId;
+  _pendingHitlRequestId = null;
+  document.getElementById('hitl-overlay').classList.remove('active');
+  try {
+    await fetch('/hitl/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: rid, decision: decision }),
+    });
+  } catch (e) {
+    console.warn('HITL respond failed:', e);
+  }
+}
+
+document.addEventListener('keydown', function(e) {
+  if (!_pendingHitlRequestId) return;
+  if (e.key === 'Escape') { e.preventDefault(); respondHitl('denied'); }
+  else if (e.key === 'Enter') { e.preventDefault(); respondHitl('approved'); }
+});
 
 // =========================================================================
 // Session management
@@ -1052,6 +1152,10 @@ async function sendMessage() {
 
           case 'error':
             contentEl.innerHTML += '<div class="error-msg">Error: ' + esc(data.message || '') + '</div>';
+            break;
+
+          case 'hitl_confirm':
+            _onHitlConfirm(data);
             break;
         }
       }

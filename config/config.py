@@ -199,6 +199,22 @@ class Config:
     (``XIAOHONGSHU_FALLBACK_CHAT``)."""
 
     # ------------------------------------------------------------------
+    # Human-in-the-loop
+    # ------------------------------------------------------------------
+
+    hitl_mode: str = os.getenv("HITL_MODE", "confirm")
+    """HITL mode: ``"confirm"`` (require user approval for dangerous tools,
+    default) or ``"bypass"`` (auto-execute all).  (``HITL_MODE``)."""
+
+    hitl_bypass_tools: str = os.getenv("HITL_BYPASS_TOOLS", "")
+    """Comma-separated tool names to bypass confirmation even in confirm mode
+    (``HITL_BYPASS_TOOLS``)."""
+
+    hitl_timeout_seconds: int = int(os.getenv("HITL_TIMEOUT_SECONDS", "120"))
+    """Seconds to wait for user confirmation before auto-denying
+    (``HITL_TIMEOUT_SECONDS``)."""
+
+    # ------------------------------------------------------------------
     # Paths
     # ------------------------------------------------------------------
 
@@ -263,6 +279,11 @@ class Config:
 
         # Channel-specific
         cls.xiaohongshu_fallback_chat = os.getenv("XIAOHONGSHU_FALLBACK_CHAT", "filehelper")
+
+        # HITL
+        cls.hitl_mode = os.getenv("HITL_MODE", "confirm")
+        cls.hitl_bypass_tools = os.getenv("HITL_BYPASS_TOOLS", "")
+        cls.hitl_timeout_seconds = int(os.getenv("HITL_TIMEOUT_SECONDS", "120"))
 
         # Hybrid search
         cls.hybrid_search_enabled = (

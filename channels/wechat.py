@@ -154,6 +154,9 @@ class WechatChannel(BaseChannel):
         self._chat_ids: dict[str, str] = {}
         self._serve_tasks: dict[str, asyncio.Task] = {}
 
+        # HITL: pending confirmation session → request_id
+        self._pending_hitl: dict[str, str] = {}
+
         # Persistent state directory (set in start())
         self._state_dir: Path | None = None
         self._last_persist_time: float = 0.0
@@ -192,6 +195,11 @@ class WechatChannel(BaseChannel):
 
         self._orchestrator.scheduled_tasks.set_deliver(self._deliver_scheduled)
         await self._orchestrator.start_services()
+
+        # Register HITL listener — sends WeChat confirmation message
+        _hitl_svc = getattr(self._orchestrator, "hitl_service", None)
+        if _hitl_svc:
+            _hitl_svc.add_listener(self._on_hitl_request)
 
         ws_root = Path(self._orchestrator.workspace)
         self._state_dir = ws_root / "wechat"
@@ -616,6 +624,23 @@ class WechatChannel(BaseChannel):
             len(msg.text),
         )
 
+        # Check if this is a HITL response (y/n to pending confirmation)
+        _pending_req_id = self._pending_hitl.get(msg.session_key)
+        if _pending_req_id:
+            _text_lower = msg.text.strip().lower()
+            if _text_lower in ("y", "yes", "是", "同意", "允许"):
+                _hitl_svc = getattr(self._orchestrator, "hitl_service", None)
+                if _hitl_svc:
+                    _hitl_svc.respond(_pending_req_id, "approved")
+                self._pending_hitl.pop(msg.session_key, None)
+                return
+            elif _text_lower in ("n", "no", "否", "拒绝"):
+                _hitl_svc = getattr(self._orchestrator, "hitl_service", None)
+                if _hitl_svc:
+                    _hitl_svc.respond(_pending_req_id, "denied")
+                self._pending_hitl.pop(msg.session_key, None)
+                return
+
         self._chat_ids[msg.session_key] = msg.chat_id
         await self._bus.inbound(msg.session_key).put(InboundMessage(
             session_key=msg.session_key,
@@ -627,6 +652,42 @@ class WechatChannel(BaseChannel):
         if msg.session_key not in self._serve_tasks:
             self._serve_tasks[msg.session_key] = asyncio.create_task(
                 self._orchestrator.serve(self._bus, msg.session_key)
+            )
+
+    async def _on_hitl_request(self, req: Any) -> None:
+        """Send a WeChat message asking the user to approve or deny a tool."""
+        chat_id = self._chat_ids.get(req.session_key)
+        if chat_id is None:
+            logger.warning(
+                "WechatChannel: no chat_id for HITL session {!r}", req.session_key,
+            )
+            return
+
+        self._pending_hitl[req.session_key] = req.request_id
+
+        ctx_token = self._context_tokens.get(chat_id, "")
+        if not ctx_token:
+            await self._refresh_context_tokens()
+            ctx_token = self._context_tokens.get(chat_id, "")
+        if not ctx_token:
+            logger.error("WechatChannel: no context_token for HITL message")
+            return
+
+        args_brief = str(req.arguments)
+        if len(args_brief) > 200:
+            args_brief = args_brief[:200] + "..."
+
+        text = (
+            f"⚠️ HITL 确认\n"
+            f"工具: {req.tool_name}\n"
+            f"参数: {args_brief}\n\n"
+            f"回复 y 允许，回复 n 拒绝（60s超时自动拒绝）"
+        )
+        try:
+            await self._send_text(chat_id, text, ctx_token)
+        except Exception:
+            logger.opt(exception=True).warning(
+                "WechatChannel: failed to send HITL confirm for {!r}", req.request_id,
             )
 
     async def _deliver_scheduled(self, task) -> None:
