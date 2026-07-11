@@ -32,6 +32,7 @@ import httpx
 from loguru import logger
 
 from channels.base import BaseChannel, ChannelMessage, build_orchestrator
+from config import Config
 from core.message_bus import InboundMessage, MessageBus
 
 # ---------------------------------------------------------------------------
@@ -154,7 +155,7 @@ class WechatChannel(BaseChannel):
         self._chat_ids: dict[str, str] = {}
         self._serve_tasks: dict[str, asyncio.Task] = {}
 
-        # HITL: pending confirmation session → request_id
+        # HITL: pending confirmation chat_id → request_id
         self._pending_hitl: dict[str, str] = {}
 
         # Persistent state directory (set in start())
@@ -625,20 +626,20 @@ class WechatChannel(BaseChannel):
         )
 
         # Check if this is a HITL response (y/n to pending confirmation)
-        _pending_req_id = self._pending_hitl.get(msg.session_key)
+        _pending_req_id = self._pending_hitl.get(msg.chat_id)
         if _pending_req_id:
             _text_lower = msg.text.strip().lower()
             if _text_lower in ("y", "yes", "是", "同意", "允许"):
                 _hitl_svc = getattr(self._orchestrator, "hitl_service", None)
                 if _hitl_svc:
                     _hitl_svc.respond(_pending_req_id, "approved")
-                self._pending_hitl.pop(msg.session_key, None)
+                self._pending_hitl.pop(msg.chat_id, None)
                 return
             elif _text_lower in ("n", "no", "否", "拒绝"):
                 _hitl_svc = getattr(self._orchestrator, "hitl_service", None)
                 if _hitl_svc:
                     _hitl_svc.respond(_pending_req_id, "denied")
-                self._pending_hitl.pop(msg.session_key, None)
+                self._pending_hitl.pop(msg.chat_id, None)
                 return
 
         self._chat_ids[msg.session_key] = msg.chat_id
@@ -656,39 +657,75 @@ class WechatChannel(BaseChannel):
 
     async def _on_hitl_request(self, req: Any) -> None:
         """Send a WeChat message asking the user to approve or deny a tool."""
+
         chat_id = self._chat_ids.get(req.session_key)
         if chat_id is None:
-            logger.warning(
-                "WechatChannel: no chat_id for HITL session {!r}", req.session_key,
-            )
-            return
+            # System sessions (e.g. scheduled tasks) have no WeChat mapping.
+            # Fall back to the configured operator chat for review.
+            if req.tool_name == "xiaohongshu_publish":
+                chat_id = Config.xiaohongshu_fallback_chat
+            else:
+                logger.warning(
+                    "WechatChannel: no chat_id for HITL session {!r}", req.session_key,
+                )
+                return
 
-        self._pending_hitl[req.session_key] = req.request_id
+        self._pending_hitl[chat_id] = req.request_id
 
         ctx_token = self._context_tokens.get(chat_id, "")
         if not ctx_token:
             await self._refresh_context_tokens()
             ctx_token = self._context_tokens.get(chat_id, "")
+
+        if req.tool_name == "xiaohongshu_publish":
+            text = self._format_xiaohongshu_hitl(req)
+        else:
+            text = self._format_generic_hitl(req)
+
         if not ctx_token:
             logger.error("WechatChannel: no context_token for HITL message")
             return
 
-        args_brief = str(req.arguments)
-        if len(args_brief) > 200:
-            args_brief = args_brief[:200] + "..."
-
-        text = (
-            f"⚠️ HITL 确认\n"
-            f"工具: {req.tool_name}\n"
-            f"参数: {args_brief}\n\n"
-            f"回复 y 允许，回复 n 拒绝（60s超时自动拒绝）"
-        )
         try:
             await self._send_text(chat_id, text, ctx_token)
         except Exception:
             logger.opt(exception=True).warning(
                 "WechatChannel: failed to send HITL confirm for {!r}", req.request_id,
             )
+
+    @staticmethod
+    def _format_generic_hitl(req: Any) -> str:
+        args_brief = str(req.arguments)
+        if len(args_brief) > 200:
+            args_brief = args_brief[:200] + "..."
+        return (
+            f"⚠️ HITL 确认\n"
+            f"工具: {req.tool_name}\n"
+            f"参数: {args_brief}\n\n"
+            f"回复 y 允许，回复 n 拒绝（60s超时自动拒绝）"
+        )
+
+    @staticmethod
+    def _format_xiaohongshu_hitl(req: Any) -> str:
+        args = req.arguments or {}
+        title = str(args.get("title", "")).strip()
+        content = str(args.get("content", "")).strip()
+        caption = str(args.get("caption", "")).strip()
+
+        lines = [
+            "📕 小红书发布确认",
+            "",
+            f"标题: {title}",
+            "",
+            "内容:",
+            content,
+        ]
+        if caption:
+            lines.append("")
+            lines.append(f"配文: {caption}")
+        lines.append("")
+        lines.append("回复 y 发布，回复 n 取消（60s超时自动取消）")
+        return "\n".join(lines)
 
     async def _deliver_scheduled(self, task) -> None:
         """Push a scheduled task prompt onto the bus for the target session."""
@@ -873,8 +910,6 @@ class WechatChannel(BaseChannel):
 def main() -> None:
     """Entry point for ``mybot-wechat``."""
     from pathlib import Path
-
-    from config import Config
 
     orchestrator = build_orchestrator()
 

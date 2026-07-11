@@ -206,7 +206,7 @@ class Config:
     """HITL mode: ``"confirm"`` (require user approval for dangerous tools,
     default) or ``"bypass"`` (auto-execute all).  (``HITL_MODE``)."""
 
-    hitl_bypass_tools: str = os.getenv("HITL_BYPASS_TOOLS", "")
+    hitl_bypass_tools: str = os.getenv("HITL_BYPASS_TOOLS", "xiaohongshu_publish")
     """Comma-separated tool names to bypass confirmation even in confirm mode
     (``HITL_BYPASS_TOOLS``)."""
 
@@ -282,7 +282,7 @@ class Config:
 
         # HITL
         cls.hitl_mode = os.getenv("HITL_MODE", "confirm")
-        cls.hitl_bypass_tools = os.getenv("HITL_BYPASS_TOOLS", "")
+        cls.hitl_bypass_tools = os.getenv("HITL_BYPASS_TOOLS", "xiaohongshu_publish")
         cls.hitl_timeout_seconds = int(os.getenv("HITL_TIMEOUT_SECONDS", "120"))
 
         # Hybrid search
