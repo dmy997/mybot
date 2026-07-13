@@ -11,7 +11,7 @@ mybot 的 TUI 基于 [Textual](https://textual.textualize.io/) 8.2.7 构建，�
 ```
 tui/
 ├── __init__.py    # 包入口，导出 ChatApp
-├── app.py         # ChatApp 主应用（~458 行）
+├── app.py         # ChatApp 主应用（489 行）
 ├── widgets.py     # 自定义 Widget 组件（~354 行）
 ├── screens.py     # 模态弹窗（~107 行）
 └── theme.css      # 暗色主题（~72 行）
@@ -531,6 +531,10 @@ def _confirm_exit(self) -> None:
 
 ```python
 class SessionListScreen(ModalScreen[None]):
+    def __init__(self, sessions: list[dict]) -> None:
+        self._sessions = sessions
+        super().__init__()
+
     def compose(self) -> ComposeResult:
         with Container(id="dialog"):
             yield Label(f"Sessions ({len(self._sessions)})")

@@ -11,7 +11,7 @@ User / LLM 请求
 ┌─────────────────────────────────────────────────────┐
 │  L1: ToolGuard — 基于能力的安全策略（能力 → 检查）    │
 │  tools/guard.py:224  pre_check()                    │
-│  · SHELL → 命令注入检测（8 类注入模式）               │
+│  · SHELL → 命令注入检测（9 类注入模式）               │
 │  · NETWORK → SSRF 防护（内网 IP / 元数据端点拦截）     │
 │  · FILE_R/W → 敏感路径拦截（密钥、凭证、.git）        │
 └─────────────────────────────────────────────────────┘
@@ -20,7 +20,7 @@ User / LLM 请求
 ┌─────────────────────────────────────────────────────┐
 │  L2: Regex 拦截列表 — 命令字符串模式匹配              │
 │  tools/bash_tool.py:102  _contains_dangerous_pattern() │
-│  · 15 个危险正则模式（rm -rf /、sudo、curl|sh 等）   │
+│  · 12 个危险正则模式（rm -rf /、sudo、curl|sh 等）   │
 │  · 4 个禁止子串（__import__、eval、exec、compile）    │
 └─────────────────────────────────────────────────────┘
       │ 通过
@@ -133,14 +133,14 @@ def _check_command_injection(self, arguments) -> str | None:
     command = arguments.get("command", "")
     # 1. 先剥离带引号的 heredoc 体（避免 Markdown 反引号误报）
     command = _strip_quoted_heredocs(command)
-    # 2. 逐一匹配 8 种注入模式
+    # 2. 逐一匹配 9 种注入模式
     for pattern in _EXTRA_INJECTION_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
             return f"injection pattern detected: {pattern}"
     return None
 ```
 
-检测的 8 类注入模式（`tools/guard.py:118-128`）：
+检测的 9 类注入模式（`tools/guard.py:118-128`）：
 
 | 模式 | 正则 | 拦截意图 |
 |------|------|----------|
@@ -220,7 +220,7 @@ L2 防线是 BashTool 的内部检查，在命令传递给沙箱之前执行。
 # tools/bash_tool.py:102
 def _contains_dangerous_pattern(command: str) -> str | None:
     cmd = command.strip()
-    # 第一步：15 个危险正则模式
+    # 第一步：12 个危险正则模式
     for pattern in _DANGEROUS_PATTERNS:
         if re.search(pattern, cmd, re.IGNORECASE):
             return pattern
@@ -231,7 +231,7 @@ def _contains_dangerous_pattern(command: str) -> str | None:
     return None
 ```
 
-### 15 个危险正则模式（`tools/bash_tool.py:36-58`）
+### 12 个危险正则模式（`tools/bash_tool.py:36-58`）
 
 | # | 模式 | 拦截意图 |
 |---|------|----------|
@@ -454,7 +454,7 @@ BashTool.execute(command)
         ├─ 长度检查 (MAX_COMMAND_LENGTH = 4096)
         │
         ├─► L2: _contains_dangerous_pattern(command)
-        │      ├─ 15 个危险正则模式
+        │      ├─ 12 个危险正则模式
         │      └─ 4 个禁止子串
         │
         ▼ [L2 通过]

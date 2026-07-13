@@ -47,6 +47,12 @@ class ChannelMessage:
     raw: dict = field(default_factory=dict, repr=False)
     """Original platform message dict for channel-specific needs."""
 
+    files: list[dict] = field(default_factory=list, repr=False)
+    """Downloaded file attachments: ``[{"name": str, "path": str, "url": str}]``."""
+
+    images: list[str] = field(default_factory=list, repr=False)
+    """Base64 data URLs of images attached to this message."""
+
 
 # ---------------------------------------------------------------------------
 # Abstract base class
@@ -88,6 +94,12 @@ class BaseChannel(ABC):
         Called after ``_process_message()`` produces a response.
         """
 
+    async def send_file(
+        self, file_path: str, filename: str, msg: ChannelMessage,
+    ) -> None:
+        """Send a file to the platform.  Override in channels that support it."""
+        pass
+
     # -- Shared helpers ------------------------------------------------------
 
     @staticmethod
@@ -104,13 +116,14 @@ class BaseChannel(ABC):
         Override if the channel needs pre/post-processing (e.g. rate limiting,
         command parsing, message dedup).
         """
-        if not msg.text:
+        if not msg.text and not msg.images:
             return None
 
         collector: list[str] = []
         result = await self._orchestrator.process_message(
             session_key=msg.session_key,
-            user_input=msg.text,
+            user_input=msg.text or "",
+            images=msg.images or None,
             on_delta=lambda t: collector.append(t),
         )
 

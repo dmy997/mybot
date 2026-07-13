@@ -250,7 +250,7 @@ class TavilySearchProvider(SearchProvider):
             "api_key": self._api_key,
             "query": query,
             "max_results": max_results,
-            "search_depth": "basic",
+            "search_depth": "advanced",
         }
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:

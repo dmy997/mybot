@@ -89,9 +89,12 @@ input { font-family: inherit; }
 #chat-header strong { color: var(--text); }
 #messages { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 8px; }
 
-.message { max-width: 85%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.6; overflow-wrap: break-word; }
+.message { max-width: 85%; padding: 8px 14px; border-radius: 12px; font-size: 14px; line-height: 1.6; overflow-wrap: break-word; display: flex; flex-direction: column; }
 .message.user { align-self: flex-end; background: var(--bubble-user); border-bottom-right-radius: 4px; }
 .message.assistant { align-self: flex-start; background: var(--bubble-assistant); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+.msg-time { font-size: 10px; color: var(--text-muted); margin-top: 4px; }
+.message.user .msg-time { align-self: flex-end; }
+.message.assistant .msg-time { align-self: flex-start; }
 .message.assistant p { margin: 4px 0; }
 .message.assistant pre {
   background: #0d1117; border-radius: 6px; padding: 12px; overflow-x: auto;
@@ -130,20 +133,59 @@ input { font-family: inherit; }
 .usage-badge { align-self: flex-end; font-size: 11px; color: var(--text-muted); padding: 2px 8px; }
 
 #input-area {
-  padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 10px;
+  padding: 12px 20px; border-top: 1px solid var(--border);
 }
-#input-area input {
+#paradigm-cards {
+  display: flex; gap: 8px; padding: 0 20px 8px; flex-wrap: wrap; align-items: center;
+}
+.paradigm-card {
+  padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text-muted);
+  cursor: pointer; transition: all .15s; user-select: none;
+  display: flex; align-items: center; gap: 5px;
+}
+.paradigm-card:hover { border-color: var(--accent); color: var(--text); }
+.paradigm-card.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.paradigm-card.active::before { content: '✓'; font-size: 10px; }
+.paradigm-card.reflect-card { border-style: dashed; }
+.paradigm-card.reflect-card.active { border-style: solid; background: #7c3aed; border-color: #7c3aed; }
+.paradigm-hint {
+  font-size: 11px; color: var(--text-muted); margin-left: auto; white-space: nowrap;
+}
+#input-row {
+  display: flex; gap: 10px;
+}
+#input-row input {
   flex: 1; padding: 12px 16px; background: var(--surface); color: var(--text);
   border: 1px solid var(--border); border-radius: 12px; font-size: 14px; outline: none;
 }
-#input-area input:focus { border-color: var(--accent); }
-#input-area input::placeholder { color: var(--text-muted); }
+#input-row input:focus { border-color: var(--accent); }
+#input-row input::placeholder { color: var(--text-muted); }
 #send-btn {
   padding: 12px 20px; background: var(--accent); color: #fff;
   border: none; border-radius: 12px; font-size: 14px; font-weight: 600;
 }
 #send-btn:hover:not(:disabled) { background: var(--accent-hover); }
 #send-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+#image-previews {
+  display: flex; gap: 8px; padding: 0 20px 8px; flex-wrap: wrap;
+}
+#image-previews:empty { display: none; }
+.image-preview-item {
+  position: relative; width: 64px; height: 64px; border-radius: 8px;
+  overflow: hidden; border: 2px solid var(--border);
+}
+.image-preview-item img {
+  width: 100%; height: 100%; object-fit: cover;
+}
+.image-preview-item .remove-btn {
+  position: absolute; top: 0; right: 0;
+  background: rgba(0,0,0,.7); color: #fff; border: none;
+  font-size: 14px; width: 20px; height: 20px; line-height: 20px;
+  cursor: pointer; border-radius: 0 0 0 6px; padding: 0;
+}
+#input-area.drop-active { outline: 2px dashed var(--accent); border-radius: 12px; }
 
 /* Observability view */
 #observability-view { flex: 1; display: none; flex-direction: column; min-height: 0; }
@@ -341,9 +383,19 @@ input { font-family: inherit; }
     </div>
     <div id="messages"></div>
     <div id="input-area">
-      <input id="message-input" type="text" placeholder="Type a message..." autofocus
-             onkeydown="handleInputKey(event)">
-      <button id="send-btn" onclick="sendMessage()">Send</button>
+      <div id="paradigm-cards">
+        <span style="font-size:11px;color:var(--text-muted);margin-right:4px;">Agent:</span>
+        <div class="paradigm-card" data-paradigm="plan_solve" onclick="toggleParadigm(this)">Plan</div>
+        <div class="paradigm-card" data-paradigm="deep_research" onclick="toggleParadigm(this)">Deep Research</div>
+        <div class="paradigm-card reflect-card" data-paradigm="reflect" onclick="toggleReflect(this)">Reflect</div>
+        <span class="paradigm-hint" id="paradigm-hint"></span>
+      </div>
+      <div id="image-previews"></div>
+      <div id="input-row">
+        <input id="message-input" type="text" placeholder="Type a message... (paste/drop images)" autofocus
+               onkeydown="handleInputKey(event)">
+        <button id="send-btn" onclick="sendMessage()">Send</button>
+      </div>
     </div>
   </div>
 
@@ -390,7 +442,10 @@ let messageHistory = [];
 let historyIndex = -1;
 let historyDraft = '';
 let currentGoal = null;
+let activeParadigm = null;
+let reflectEnabled = false;
 let _pendingHitlRequestId = null;
+let attachedImages = [];  // base64 data URLs
 
 const _HISTORY_MAX = 200;
 
@@ -483,7 +538,7 @@ function _connectPushEvents(sessionKey) {
     if (!textBuffer && data.content) {
       contentEl.innerHTML = marked.parse(data.content);
     }
-    if (data.usage) {
+    if (data.usage && (data.usage.prompt_tokens || data.usage.completion_tokens)) {
       let badge = document.createElement('div');
       badge.className = 'usage-badge';
       badge.textContent = 'in:' + (data.usage.prompt_tokens || '?')
@@ -495,6 +550,15 @@ function _connectPushEvents(sessionKey) {
 
   _pushSource.addEventListener('push_error', function(e) {
     console.warn('Push error:', e.data);
+  });
+
+  _pushSource.addEventListener('error', function(e) {
+    let data = JSON.parse(e.data);
+    _ensureBubble();
+    if (!textBuffer && data.message) {
+      contentEl.innerHTML = marked.parse('Error: ' + esc(data.message));
+    }
+    asstEl = null; contentEl = null; thinkingBlock = null; toolBlock = null; textBuffer = '';
   });
 
   _pushSource.addEventListener('hitl_confirm', function(e) {
@@ -669,10 +733,10 @@ async function loadHistory(sessionKey) {
 
     messages.forEach(m => {
       if (m.role === 'user') {
-        const div = addBubble('user', '');
+        const div = addBubble('user', '', m.timestamp);
         div.querySelector('.msg-content').innerHTML = marked.parse(m.content || '');
       } else if (m.role === 'assistant') {
-        const asstEl = addBubble('assistant', '');
+        const asstEl = addBubble('assistant', '', m.timestamp);
         const contentEl = asstEl.querySelector('.msg-content');
         if (m.content) contentEl.innerHTML = marked.parse(m.content);
 
@@ -1037,26 +1101,185 @@ function handleInputKey(event) {
   }
 }
 
+function _updateParadigmHint() {
+  const hint = document.getElementById('paradigm-hint');
+  const parts = [];
+  if (activeParadigm) {
+    const labels = { plan_solve: '/plan', deep_research: '/research' };
+    parts.push(labels[activeParadigm] || '');
+  }
+  if (reflectEnabled) parts.push('/reflect');
+  hint.textContent = parts.length ? parts.join(' ') : 'react';
+  hint.style.color = parts.length ? 'var(--accent)' : 'var(--text-muted)';
+}
+
+function toggleParadigm(card) {
+  const paradigm = card.dataset.paradigm;
+  const wasActive = card.classList.contains('active');
+
+  // Deselect all paradigm cards (not reflect)
+  document.querySelectorAll('.paradigm-card:not(.reflect-card)').forEach(c => c.classList.remove('active'));
+  activeParadigm = null;
+
+  if (!wasActive) {
+    card.classList.add('active');
+    activeParadigm = paradigm;
+  }
+  _updateParadigmHint();
+}
+
+function toggleReflect(card) {
+  reflectEnabled = !reflectEnabled;
+  card.classList.toggle('active', reflectEnabled);
+  _updateParadigmHint();
+}
+
+// -- image attachment --------------------------------------------------
+
+function _addImageFromFile(file) {
+  if (!file || !file.type || !file.type.startsWith('image/')) {
+    console.log('mybot: _addImageFromFile skipped', file ? file.type : 'null-file');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = function() {
+    attachedImages.push(reader.result);
+    _renderImagePreviews();
+    console.log('mybot: image added, count=' + attachedImages.length);
+  };
+  reader.onerror = function() {
+    console.error('mybot: FileReader error', reader.error);
+  };
+  reader.readAsDataURL(file);
+}
+
+function _removeImage(idx) {
+  attachedImages.splice(idx, 1);
+  _renderImagePreviews();
+}
+
+function _renderImagePreviews() {
+  const container = document.getElementById('image-previews');
+  if (!container) {
+    console.error('mybot: #image-previews not found');
+    return;
+  }
+  container.innerHTML = '';
+  attachedImages.forEach(function(url, i) {
+    const div = document.createElement('div');
+    div.className = 'image-preview-item';
+    const img = document.createElement('img');
+    img.src = url;
+    div.appendChild(img);
+    const btn = document.createElement('button');
+    btn.className = 'remove-btn';
+    btn.textContent = '×';
+    btn.onclick = function() { _removeImage(i); };
+    div.appendChild(btn);
+    container.appendChild(div);
+  });
+}
+
+// -- paste handler for clipboard images --
+
+document.addEventListener('paste', function(e) {
+  try {
+    const cd = e.clipboardData;
+    if (!cd || !cd.items) {
+      console.log('mybot: paste — no clipboardData.items');
+      return;
+    }
+    for (let i = 0; i < cd.items.length; i++) {
+      const item = cd.items[i];
+      console.log('mybot: paste item[' + i + '] type=' + item.type + ' kind=' + item.kind);
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        console.log('mybot: paste — image item detected, file=' + (file ? file.name || file.type : 'null'));
+        if (file) {
+          _addImageFromFile(file);
+        } else {
+          console.warn('mybot: getAsFile() returned null for image clipboard item');
+        }
+      }
+    }
+  } catch (err) {
+    console.error('mybot: paste handler error', err);
+  }
+});
+
+// -- drag-and-drop handler --------------------------------------------------
+
+const _inputArea = document.getElementById('input-area');
+
+_inputArea.addEventListener('dragover', function(e) {
+  e.preventDefault();
+  _inputArea.classList.add('drop-active');
+});
+
+_inputArea.addEventListener('dragleave', function(e) {
+  _inputArea.classList.remove('drop-active');
+});
+
+_inputArea.addEventListener('drop', function(e) {
+  e.preventDefault();
+  _inputArea.classList.remove('drop-active');
+  const files = e.dataTransfer && e.dataTransfer.files;
+  if (!files) return;
+  for (let i = 0; i < files.length; i++) {
+    _addImageFromFile(files[i]);
+  }
+});
+
+
 async function sendMessage() {
   if (activeObsView) switchView('chat');
 
   const input = document.getElementById('message-input');
   const btn = document.getElementById('send-btn');
-  const message = input.value.trim();
-  if (!message || isStreaming) return;
+  let message = input.value.trim();
+  if (!message && !attachedImages.length || isStreaming) return;
+
+  // Prepend paradigm prefixes
+  const prefixes = [];
+  if (reflectEnabled) prefixes.push('/reflect');
+  if (activeParadigm) {
+    const cmdMap = { plan_solve: '/plan', deep_research: '/research' };
+    prefixes.push(cmdMap[activeParadigm] || '');
+  }
+  if (prefixes.length) message = prefixes.join(' ') + ' ' + message;
+
+  // Capture images before clearing
+  const imagesToSend = attachedImages.length ? attachedImages.slice() : null;
+
+  console.log('mybot: sendMessage textLen=' + message.length + ' images=' + (imagesToSend ? imagesToSend.length : 0));
 
   messageHistory.push(message);
   historyIndex = messageHistory.length;
   historyDraft = '';
   _saveMessageHistory(currentSession);
   input.value = '';
+  attachedImages = [];
+  _renderImagePreviews();
   isStreaming = true;
   btn.disabled = true;
 
   const msgContainer = document.getElementById('messages');
-  addBubble('user', message);
+  const userBubble = addBubble('user', message, new Date().toISOString());
+  // Show image thumbnails in the user bubble
+  if (imagesToSend && imagesToSend.length) {
+    const imgsDiv = document.createElement('div');
+    imgsDiv.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;';
+    imagesToSend.forEach(function(url) {
+      const img = document.createElement('img');
+      img.src = url;
+      img.style.cssText = 'max-width:120px;max-height:80px;border-radius:4px;border:1px solid var(--border);';
+      imgsDiv.appendChild(img);
+    });
+    userBubble.querySelector('.msg-content').appendChild(imgsDiv);
+  }
 
-  const asstEl = addBubble('assistant', '');
+  const asstEl = addBubble('assistant', '', new Date().toISOString());
   const contentEl = asstEl.querySelector('.msg-content');
 
   let thinkingBlock = null, thinkingBody = null;
@@ -1067,7 +1290,11 @@ async function sendMessage() {
     const resp = await fetch('/chat/' + currentSession, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, goal: currentGoal }),
+      body: JSON.stringify({
+        message,
+        goal: currentGoal,
+        images: imagesToSend || undefined,
+      }),
     });
 
     if (!resp.ok) {
@@ -1141,7 +1368,7 @@ async function sendMessage() {
             break;
 
           case 'done':
-            if (data.usage) {
+            if (data.usage && (data.usage.prompt_tokens || data.usage.completion_tokens)) {
               const badge = document.createElement('div');
               badge.className = 'usage-badge';
               badge.textContent = 'in:' + (data.usage.prompt_tokens || '?')
@@ -1171,14 +1398,22 @@ async function sendMessage() {
   }
 }
 
-function addBubble(role, text) {
+function addBubble(role, text, ts) {
   const msgs = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'message ' + role;
-  div.innerHTML = '<div class="msg-content">' + (text ? esc(text) : '') + '</div>';
+  const timeStr = ts ? formatTime(new Date(ts)) : formatTime(new Date());
+  div.innerHTML = '<div class="msg-content">' + (text ? esc(text) : '') + '</div>'
+    + '<div class="msg-time">' + esc(timeStr) + '</div>';
   msgs.appendChild(div);
   scrollDown();
   return div;
+}
+
+function formatTime(date) {
+  const h = date.getHours().toString().padStart(2, '0');
+  const m = date.getMinutes().toString().padStart(2, '0');
+  return h + ':' + m;
 }
 
 function createThinkBlock(parent) {

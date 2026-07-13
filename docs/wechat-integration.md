@@ -27,11 +27,11 @@ HTTP sendmessage → iLink 平台 → 用户微信
 
 ### 关键细节
 
-1. **context_token 90s 过期**: 用户发消息时 iLink 下发 `context_token`,回复时必须回传。该 token 服务端约 90s 过期,定时推送 (如海龟汤 20:00) 前需先 `getconfig` 刷新,否则静默丢消息。目前 Phase 1 未实现自动刷新,连续对话中没问题。
+1. **context_token 90s 过期**: 用户发消息时 iLink 下发 `context_token`,回复时必须回传。该 token 服务端约 90s 过期,定时推送 (如海龟汤 20:00) 前需先 `getconfig` 刷新,否则静默丢消息。自动刷新已在 `_refresh_context_tokens()` 中实现，定时推送前自动调用 `getconfig` 刷新 token。
 
 2. **X-WECHAT-UIN**: 每次请求生成新的随机 uint32 → base64,不能复用。
 
-3. **状态持久化**: token、cursor、context_tokens 存在 `{workspace}/wechat/account.json`,重启自动恢复。
+3. **状态持久化**: token、get_updates_buf、context_tokens 存在 `{workspace}/wechat/account.json`,重启自动恢复。
 
 4. **消息去重**: 通过 message_id 做 1000 条 LRU 去重,防止重复处理。
 
@@ -56,12 +56,13 @@ mybot-wechat
 - 用户 allowlist
 - 会话过期处理
 
-**Phase 2 (待实现)**: 媒体支持
-- 图片/语音/视频/文件下载 + AES-128-ECB 解密
-- 媒体文件上传 + AES 加密 + CDN 发送
+**Phase 2 (已完成)**: 媒体支持
+- 图片/语音/视频/文件下载（`_download_file()`）
+- 图片下载为 data URL（`file_to_data_url()`，通过 `utils.images`）
+- 媒体文件上传 + CDN 发送
 
-**Phase 3 (待实现)**: 可靠性增强
-- context_token 自动刷新 (防 90s 过期)
+**Phase 3 (部分完成)**: 可靠性增强
+- context_token 自动刷新（已实现 `_refresh_context_tokens()`）
 - 输入状态指示 (typing indicator)
 - tool hints 缓冲合并
 

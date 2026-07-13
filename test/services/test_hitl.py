@@ -189,14 +189,14 @@ class TestHitlMiddleware:
     """Test the HitlMiddleware AgentMiddleware integration."""
 
     @pytest.fixture
-    def tools(self) -> ToolRegistry:
+    def tools(self, tmp_path) -> ToolRegistry:
         """A minimal ToolRegistry with bash and read tools."""
-        from tools.bash import BashTool
-        from tools.file_read import FileReadTool
+        from tools.bash_tool import BashTool
+        from tools.file_tools import ReadTool
 
         registry = ToolRegistry()
-        registry.register(BashTool())
-        registry.register(FileReadTool())
+        registry.register(BashTool(tmp_path))
+        registry.register(ReadTool(tmp_path))
         return registry
 
     @pytest.mark.asyncio

@@ -28,11 +28,12 @@ CronScheduler (cron "0 20 * * *")
               source="cron",
             )
           → Agent loads SKILL.md into system prompt
-            → Read state.json → decide phase (tangmian/tangdi)
-              → Generate content (LLM, following skill instructions)
-                → Write output file
-                  → Call xiaohongshu_publish tool
+            → Read state.json → get series info
+              → Generate both 汤面 + 汤底 in one LLM call
+                → Write output files (tangmian.md + tangdi.md)
+                  → Call xiaohongshu_publish tool (content=汤面, content2=汤底)
                     → scripts/xhs_publish.py → Playwright → 小红书
+                    → 生成两张图片: 第一张汤面, 第二张汤底
 ```
 
 **关键设计决策**：定时层不做任何实际工作——只在到点时把一条 prompt 注入 agent。Agent 拥有完整的上下文（skill 指令 + 工具能力 + LLM 能力），负责从状态检查到最终发布的全链路。系统任务用 `system=True` 保护，用户无法通过聊天取消。
@@ -63,11 +64,13 @@ workspace/xiaohongshu/
 
 `SKILL.md` 定义了 agent 的完整行为：
 
-1. **读取状态** — `read` 工具读 `state.json`，获取 phase、series、last_tangmian_content
-2. **生成汤面** — 创作 200-500 字谜题，小红书排版，结尾"答案明天揭晓"
-3. **生成汤底** — 读取上次汤面，写出 300-600 字解答，逐步推理
-4. **发布** — 调用 `xiaohongshu_publish` tool，传入 title + content
-5. **更新状态** — `write` 工具原子更新 state.json，切换 phase
+1. **读取状态** — `read` 工具读 `state.json`，获取 series、last_tangmian_content
+2. **同时生成汤面和汤底** — 在同一 LLM 调用中创作汤面（200-500 字谜题）和汤底（300-600 字解答推理），小红书排版
+3. **保存内容** — 写入 `<date>_tangmian.md` 和 `<date>_tangdi.md` 两个输出文件
+4. **发布** — 调用 `xiaohongshu_publish` tool，传入 `title`、`content`（汤面）、`content2`（汤底）、`caption`
+5. **更新状态** — `write` 工具原子更新 state.json，递增 series 编号
+
+Prompt 中明确要求："重要：content 和 content2 都要提供，这样脚本会生成两张图片——第一张显示汤面，第二张显示汤底。"
 
 Agent 通过 skill 指令自然知道该做什么——无需硬编码工作流。
 

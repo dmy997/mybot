@@ -45,6 +45,7 @@ _DEFAULT_ENV: dict[str, str] = {
     "PROVIDER_NAME": "openrouter",
     "LLM_MODEL_ID": "deepseek/deepseek-v4-flash",
     "LIGHT_MODEL_NAME": "deepseek/deepseek-v4-flash",
+    "MULTIMODAL_MODEL": "openai/gpt-4o-mini",
     "OPENAI_API_KEY": "",
     "OPENAI_API_BASE": "https://openrouter.ai/api/v1",
     "LLM_TIMEOUT": "60",

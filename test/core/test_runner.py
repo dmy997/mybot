@@ -13,7 +13,7 @@ import pytest
 
 from config import Config
 from core.events import AgentStarted, bus
-from core.runner import AgentCore, AgentInput
+from core.runner import AgentCore, AgentInput, AgentOutput
 from providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from tools import Tool, ToolRegistry, ToolResult
 
@@ -1014,3 +1014,131 @@ class TestAgentCoreCheckpoint:
         await core.run(spec)
 
         assert not core._checkpoint_path(spec).exists()
+
+
+# ---------------------------------------------------------------------------
+# Reflection
+# ---------------------------------------------------------------------------
+
+
+class TestReflectionDefaults:
+    def test_reflect_false_by_default(self):
+        spec = AgentInput()
+        assert spec.reflect is False
+        assert spec.reflect_model is None
+
+    def test_output_has_reflection_fields(self):
+        out = AgentOutput()
+        assert out.reflected is False
+        assert out.prereflect_content == ""
+
+
+@pytest.fixture
+def reflect_provider():
+    """Provider that returns content followed by a distinct reflected version."""
+    p = MagicMock(spec=LLMProvider)
+    p.chat_with_retry = AsyncMock(
+        side_effect=[
+            _make_response(content="原始回答"),
+            _make_response(content="反思后的改进回答"),
+        ]
+    )
+    return p
+
+
+class TestReflection:
+    @pytest.mark.asyncio
+    async def test_reflect_enabled_produces_reflected_output(self, reflect_provider, tools):
+        core = AgentCore(reflect_provider)
+        spec = AgentInput(
+            init_messages=[{"role": "user", "content": "测试问题"}],
+            tools=tools,
+            reflect=True,
+        )
+        output = await core.run(spec)
+        assert output.reflected is True
+        assert output.content == "反思后的改进回答"
+        assert output.prereflect_content == "原始回答"
+
+    @pytest.mark.asyncio
+    async def test_reflect_disabled_skips_reflection(self, reflect_provider, tools):
+        core = AgentCore(reflect_provider)
+        spec = AgentInput(
+            init_messages=[{"role": "user", "content": "测试问题"}],
+            tools=tools,
+            reflect=False,
+        )
+        output = await core.run(spec)
+        assert output.reflected is False
+        assert output.content == "原始回答"
+        assert output.prereflect_content == ""
+
+    @pytest.mark.asyncio
+    async def test_reflect_appends_to_messages(self, reflect_provider, tools):
+        core = AgentCore(reflect_provider)
+        spec = AgentInput(
+            init_messages=[{"role": "user", "content": "测试问题"}],
+            tools=tools,
+            reflect=True,
+        )
+        output = await core.run(spec)
+        roles = [m["role"] for m in output.messages]
+        assert roles.count("user") >= 2
+        assert roles.count("assistant") >= 2
+
+    @pytest.mark.asyncio
+    async def test_reflect_failure_falls_back_to_original(self, tools):
+        failing = MagicMock(spec=LLMProvider)
+        failing.chat_with_retry = AsyncMock(
+            side_effect=[
+                _make_response(content="原始回答"),
+                Exception("reflect call failed"),
+            ]
+        )
+        core = AgentCore(failing)
+        spec = AgentInput(
+            init_messages=[{"role": "user", "content": "测试问题"}],
+            tools=tools,
+            reflect=True,
+        )
+        output = await core.run(spec)
+        assert output.content == "原始回答"
+        assert output.reflected is False
+
+    @pytest.mark.asyncio
+    async def test_reflect_not_triggered_on_empty_content(self, reflect_provider, tools):
+        p = MagicMock(spec=LLMProvider)
+        p.chat_with_retry = AsyncMock(side_effect=[_make_response(content="")])
+        core = AgentCore(p)
+        spec = AgentInput(
+            init_messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            reflect=True,
+        )
+        output = await core.run(spec)
+        assert output.reflected is False
+
+    @pytest.mark.asyncio
+    async def test_reflect_with_tool_calls_before_reflection(self, tools):
+        p = MagicMock(spec=LLMProvider)
+        p.chat_with_retry = AsyncMock(
+            side_effect=[
+                _make_response(
+                    tool_calls=[_make_tc("echo", {"message": "hi"})],
+                    finish_reason="tool_calls",
+                ),
+                _make_response(content="工具结果分析"),
+                _make_response(content="反思修正后的分析"),
+            ]
+        )
+        core = AgentCore(p)
+        spec = AgentInput(
+            init_messages=[{"role": "user", "content": "用工具帮我"}],
+            tools=tools,
+            reflect=True,
+        )
+        output = await core.run(spec)
+        assert output.reflected is True
+        assert output.content == "反思修正后的分析"
+        assert output.prereflect_content == "工具结果分析"
+        assert "echo" in output.tools_used

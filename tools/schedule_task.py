@@ -117,9 +117,7 @@ class ScheduleTaskTool(Tool):
         )
 
     def _list(self) -> ToolResult:
-        ctx = get_current()
-        session_key = ctx.session_key if ctx else None
-        tasks = self._service.list_tasks(session_key=session_key)
+        tasks = self._service.list_tasks(session_key=None)
         if not tasks:
             return ToolResult(success=True, content="当前没有定时任务。")
         lines = ["当前定时任务："]

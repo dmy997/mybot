@@ -12,9 +12,12 @@ Usage::
 
 from __future__ import annotations
 
+import atexit
 import threading
 from dataclasses import dataclass, field
 from typing import Any
+
+from loguru import logger
 
 # ---------------------------------------------------------------------------
 # Counter
@@ -215,3 +218,64 @@ REGISTRY.histogram("agent_steps", description="Steps per agent run")
 REGISTRY.counter("agent_errors_total", description="Total number of agent error exits")
 REGISTRY.gauge("active_sessions", description="Number of sessions in memory")
 REGISTRY.counter("agent_stall_warnings_total", description="Stall detection warnings")
+
+# -- persistence -----------------------------------------------------------
+
+_save_timer: threading.Timer | None = None
+_save_interval = 60  # seconds between auto-saves
+
+
+def _get_persistence_store():
+    """Lazy-import to avoid circular dependency at module load time."""
+    from observability.persistence import store
+    return store
+
+
+def restore_metrics() -> int:
+    """Restore counter/gauge values from disk.  Returns number of restored metrics."""
+    obs_store = _get_persistence_store()
+    if obs_store is None:
+        return 0
+    data = obs_store.load_metrics()
+    if data is None:
+        return 0
+    n = 0
+    for name, value in data.get("counters", {}).items():
+        c = REGISTRY._counters.get(name)
+        if c is not None:
+            with c._lock:
+                c._value = max(c._value, int(value))
+            n += 1
+    for name, value in data.get("gauges", {}).items():
+        g = REGISTRY._gauges.get(name)
+        if g is not None:
+            with g._lock:
+                g._value = float(value)
+            n += 1
+    logger.info("Restored {} metrics from disk", n)
+    return n
+
+
+def _save_metrics() -> None:
+    obs_store = _get_persistence_store()
+    if obs_store is None:
+        return
+    snap = REGISTRY.collect_all()
+    obs_store.save_metrics({
+        "counters": snap.counters,
+        "gauges": snap.gauges,
+    })
+
+
+def _schedule_auto_save() -> None:
+    global _save_timer
+    _save_metrics()
+    _save_timer = threading.Timer(_save_interval, _schedule_auto_save)
+    _save_timer.daemon = True
+    _save_timer.start()
+
+
+def start_metrics_persistence() -> None:
+    """Start periodic metrics auto-save (every 60 s) and register exit hook."""
+    _schedule_auto_save()
+    atexit.register(_save_metrics)

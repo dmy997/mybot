@@ -78,6 +78,12 @@ class Config:
     (``LIGHT_MODEL_NAME``).  Falls back to ``LLM_MODEL_ID``, then to
     ``"deepseek/deepseek-v4-flash"``."""
 
+    multimodal_model: str = os.getenv(
+        "MULTIMODAL_MODEL", "openai/gpt-4o-mini"
+    )
+    """Vision-capable model auto-switched to when images are attached but the
+    current model does not support multimodal input (``MULTIMODAL_MODEL``)."""
+
     # ------------------------------------------------------------------
     # Timeouts
     # ------------------------------------------------------------------
@@ -214,6 +220,44 @@ class Config:
     """Seconds to wait for user confirmation before auto-denying
     (``HITL_TIMEOUT_SECONDS``)."""
 
+    hitl_server_url: str = os.getenv(
+        "HITL_SERVER_URL",
+        f"http://127.0.0.1:{os.getenv('MYBOT_PORT', '8080')}",
+    )
+    """Server URL for cross-process HITL bridge polling
+    (``HITL_SERVER_URL``).  Defaults to ``http://127.0.0.1:8080``."""
+
+    # ------------------------------------------------------------------
+    # Reflection
+    # ------------------------------------------------------------------
+
+    reflect_enabled: bool = os.getenv("REFLECT_ENABLED", "false").lower() == "true"
+    """Enable reflection by default for all agent runs (``REFLECT_ENABLED``).
+    Can be overridden per-run via ``AgentInput.reflect``."""
+
+    reflect_model: str = os.getenv("REFLECT_MODEL", "")
+    """Model override for reflection calls (``REFLECT_MODEL``).
+    Empty = same model as primary."""
+
+    reflect_temperature: float = float(os.getenv("REFLECT_TEMPERATURE", "0.3"))
+    """Temperature for reflection calls (``REFLECT_TEMPERATURE``)."""
+
+    reflect_max_tokens: int = int(os.getenv("REFLECT_MAX_TOKENS", "4096"))
+    """Max output tokens for a reflection call (``REFLECT_MAX_TOKENS``)."""
+
+    reflect_prompt: str = os.getenv(
+        "REFLECT_PROMPT",
+        "请仔细检查你上面的回答，从以下角度逐一审查：\n"
+        "1. 事实准确性 — 是否有事实错误或幻觉？引用的数据、日期、名称是否准确？\n"
+        "2. 逻辑完整性 — 推理链条是否有漏洞？结论是否由分析自然推导而来？\n"
+        "3. 覆盖度 — 是否遗漏了用户问题中的要点？\n"
+        "4. 表述清晰度 — 是否简洁明了、无歧义、无冗余？\n"
+        "\n"
+        "如果发现问题，请给出修正后的完整回答（不是补充，是完整替换）。\n"
+        "如果没有问题，请简要说明\"已核实无误\"后输出你原有的完整回答。",
+    )
+    """System prompt for the reflection pass (``REFLECT_PROMPT``)."""
+
     # ------------------------------------------------------------------
     # Paths
     # ------------------------------------------------------------------
@@ -243,6 +287,9 @@ class Config:
         cls.default_model = os.getenv("LLM_MODEL_ID", "deepseek/deepseek-v4-flash")
         cls.light_model = os.getenv(
             "LIGHT_MODEL_NAME", os.getenv("LLM_MODEL_ID", "deepseek/deepseek-v4-flash")
+        )
+        cls.multimodal_model = os.getenv(
+            "MULTIMODAL_MODEL", "openai/gpt-4o-mini"
         )
 
         # Timeouts & workspace
@@ -284,6 +331,23 @@ class Config:
         cls.hitl_mode = os.getenv("HITL_MODE", "confirm")
         cls.hitl_bypass_tools = os.getenv("HITL_BYPASS_TOOLS", "xiaohongshu_publish")
         cls.hitl_timeout_seconds = int(os.getenv("HITL_TIMEOUT_SECONDS", "120"))
+        cls.hitl_server_url = os.getenv(
+            "HITL_SERVER_URL",
+            f"http://127.0.0.1:{os.getenv('MYBOT_PORT', '8080')}",
+        )
+
+        # Reflection
+        cls.reflect_enabled = (
+            os.getenv("REFLECT_ENABLED", "false").lower() == "true"
+        )
+        cls.reflect_model = os.getenv("REFLECT_MODEL", "")
+        cls.reflect_temperature = float(
+            os.getenv("REFLECT_TEMPERATURE", "0.3")
+        )
+        cls.reflect_max_tokens = int(
+            os.getenv("REFLECT_MAX_TOKENS", "4096")
+        )
+        cls.reflect_prompt = os.getenv("REFLECT_PROMPT", cls.reflect_prompt)
 
         # Hybrid search
         cls.hybrid_search_enabled = (

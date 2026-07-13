@@ -1,4 +1,4 @@
-<!-- Generated: 2026-07-10 | Files scanned: ~90 | Token estimate: ~450 -->
+<!-- Generated: 2026-07-13 | Files scanned: ~100 | Token estimate: ~480 -->
 
 # Data — Storage Layout
 
@@ -16,7 +16,7 @@
 │   ├── MEMORY.md                 # Memory index (pointers)
 │   ├── {slug}.md                 # Type-specific memories
 │   ├── history.jsonl             # Consolidation summaries
-│   └── hybrid_store.db           # SQLite FTS5 + sqlite-vec index
+│   └── search.db               # SQLite FTS5 + sqlite-vec index
 ├── wechat/
 │   └── account.json              # iLink bot token + state
 ├── xiaohongshu/
@@ -30,14 +30,15 @@
 ## Session Format (`sessions/{key}.json`)
 ```json
 {
-  "session_key": "20260710-xxx",
+  "key": "20260713-xxx",
   "messages": [
-    {"role": "user", "content": "...", "timestamp": 1.0},
+    {"role": "user", "content": "...", "timestamp": "2026-07-13T12:00:00"},
     {"role": "assistant", "content": "...", "tool_calls": [...]}
   ],
   "consolidated_cursor": 0,
-  "created_at": "2026-07-10T...",
-  "last_active": "2026-07-10T..."
+  "created_at": "2026-07-13T12:00:00",
+  "updated_at": "2026-07-13T12:00:00",
+  "metadata": {}
 }
 ```
 
@@ -47,13 +48,14 @@
 {"type":"span","session_key":"s1","trace_id":"abc","span_id":"s1","name":"agent.run",...}
 ```
 
-## Memory Types (`memory/types.py`)
-| Type | Purpose | Files |
-|------|---------|-------|
-| `user` | Who the user is, preferences | `user_*.md` |
-| `feedback` | How to approach work | `feedback_*.md` |
-| `project` | Project context, deadlines | `project_*.md` |
-| `reference` | External system pointers | `reference_*.md` |
+## Memory Files (`memory/types.py`)
+| File | Manager | Purpose |
+|------|---------|---------|
+| `SOUL.md` | MemoryStore / user edit | Bot identity and behavior principles |
+| `USER.md` | MemoryStore / user edit | User profile, preferences, tech stack |
+| `MEMORY.md` | Dream (LLM merge) | Long-term memory maintained by periodic Dream pipeline |
+| `history.jsonl` | Consolidator (LLM summary) | Append-only conversation summaries fed to Dream |
+| `memory/{slug}.md` | MemoryStore (remember/forget) | Individual fact memories created via `remember` tool |
 
 ## Hybrid Search (`memory/hybrid_store.py`)
 - **Vector**: sqlite-vec with sentence-transformers embeddings

@@ -1,4 +1,4 @@
-<!-- Generated: 2026-07-10 | Files scanned: ~90 | Token estimate: ~550 -->
+<!-- Generated: 2026-07-13 | Files scanned: ~100 | Token estimate: ~580 -->
 
 # Backend — API Routes & Middleware
 
@@ -7,7 +7,7 @@
 ```
 GET  /                         → index          (Web UI)
 GET  /health                   → health         (liveness)
-GET  /metrics                  → metrics        (Prometheus-style)
+GET  /metrics                  → metrics        (custom in-memory metrics registry — `observability/metrics.py` → `REGISTRY.collect_all()`)
 GET  /logs?limit=&session_key= → logs_endpoint  (structured logs)
 GET  /traces?limit=&session_key=→ traces_endpoint(spans)
 GET  /observability/sessions   → sessions_obs   (session list)
@@ -17,6 +17,8 @@ GET  /sessions                 → list_sessions
 GET  /sessions/{id}            → get_session
 GET  /sessions/{id}/messages   → get_session_messages
 DELETE /sessions/{id}          → delete_session
+POST  /hitl/respond            → hitl_respond   (HITL 确认/拒绝)
+GET   /hitl/pending            → hitl_pending   (待处理 HITL 请求列表)
 WS   /ws/{session_id}          → ws_endpoint    (bidirectional)
 ```
 
@@ -54,7 +56,7 @@ Shared state: `MiddlewareContext.data` dict.
 | `ToolRegistry` | `tools/registry.py` | Orchestrator ctor |
 | `ToolGuard` | `tools/guard.py` | ToolRegistry |
 | `Dispatcher` | `core/dispatcher.py` | Orchestrator ctor |
-| `EventBus` | `core/events.py` | Orchestrator ctor |
+| `EventBus` | `core/events.py` | module-level singleton (`bus = EventBus()` at `core/events.py:256`)
 | `SkillsLoader` | `core/skills.py` | ContextManager |
 | `Consolidator` | `memory/consolidator.py` | ContextManager |
 | `Dream` | `memory/dream.py` | BackgroundService |

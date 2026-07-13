@@ -223,8 +223,9 @@ class TestExecute:
     async def test_happy_path(self):
         core = _FakeCore(
             [
-                AgentOutput(content='["sub1", "sub2"]'),
-                AgentOutput(content="<summary>S</summary><report>R</report>"),
+                AgentOutput(content='["sub1", "sub2"]'),      # decompose
+                AgentOutput(content="<summary>S</summary><report>R</report>"),  # synthesize
+                AgentOutput(content="[]"),                     # detect_gaps → no gaps
             ]
         )
         runner = AsyncMock()
@@ -253,8 +254,9 @@ class TestExecute:
     async def test_partial_failure_still_synthesizes(self):
         core = _FakeCore(
             [
-                AgentOutput(content='["a", "b"]'),
-                AgentOutput(content="<report>R</report>"),
+                AgentOutput(content='["a", "b"]'),            # decompose
+                AgentOutput(content="<report>R</report>"),    # synthesize
+                AgentOutput(content="[]"),                     # detect_gaps → no gaps
             ]
         )
         runner = AsyncMock()
@@ -268,6 +270,34 @@ class TestExecute:
         res = await topo.execute("topic", _blueprint(), ToolRegistry())
         assert res.full_report == "R"
         assert sum(1 for r in res.worker_results if not r.success) == 1
+
+    async def test_refinement_round_fills_gaps(self):
+        """When the lead finds gaps after round 1, a second fan-out runs."""
+        core = _FakeCore(
+            [
+                AgentOutput(content='["a", "b"]'),            # decompose R1
+                AgentOutput(content="<summary>S</summary><report>R1</report>"),  # synthesize R1
+                AgentOutput(content='["gap1"]'),              # detect_gaps → 1 gap
+                AgentOutput(content="<summary>S</summary><report>R2</report>"),  # synthesize R2
+                AgentOutput(content="[]"),                     # detect_gaps → no more
+            ]
+        )
+        runner = AsyncMock()
+        runner.run_all = AsyncMock(side_effect=[
+            # Round 1 workers
+            [
+                SubAgentResult(success=True, content="c1", task="a"),
+                SubAgentResult(success=True, content="c2", task="b"),
+            ],
+            # Round 2 (refinement) workers
+            [SubAgentResult(success=True, content="gap_content", task="gap1")],
+        ])
+        topo = OrchestratorWorkers(core, runner)
+        res = await topo.execute("topic", _blueprint(), ToolRegistry())
+        assert res.full_report == "R2"
+        assert len(res.subtasks) == 3  # ["a", "b", "gap1"]
+        assert len(res.worker_results) == 3
+        assert runner.run_all.call_count == 2
 
 
 # ---------------------------------------------------------------------------

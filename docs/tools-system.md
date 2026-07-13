@@ -211,7 +211,7 @@ _BLOCKED_PATH_PATTERNS = [
 def discover_tools(workspace=None, *, timeout=60) -> dict[str, Tool]:
     tools: dict[str, Tool] = {}
     tools_dir = Path(__file__).parent
-    _skip_modules = {"tool", "registry", "subagent", "memory_tools"}
+    _skip_modules = {"tool", "registry", "subagent", "memory_tools", "schedule_task"}
 
     for module_info in pkgutil.iter_modules([str(tools_dir)]):
         name = module_info.name
@@ -267,11 +267,11 @@ for idx, tc in serial_calls:
 ### 工具自动发现 → 注册 → 导出
 
 ```
-Orchestrator.__init__()                                  # core/orchestrator.py:92
+Orchestrator.__init__()                                  # core/orchestrator.py:142
   │
   ├─ tools_dict = discover_tools(workspace)               # tools/__init__.py
   │   └─ for module_info in pkgutil.iter_modules([tools_dir]):
-  │       ├─ 跳过 _ 开头模块 + tool/registry/subagent/memory_tools
+  │       ├─ 跳过 _ 开头模块 + tool/registry/subagent/memory_tools/schedule_task
   │       ├─ module = importlib.import_module(f"tools.{name}")
   │       ├─ for cls_name, cls in inspect.getmembers(module, inspect.isclass):
   │       │   if issubclass(cls, Tool) and cls is not Tool and cls.name:
@@ -284,7 +284,7 @@ Orchestrator.__init__()                                  # core/orchestrator.py:
   │   └─ for tool in tools_dict.values():
   │       registry.register(tool)                         # tools/registry.py
   │
-  └─ ContextManager._build_system_prompt()                # context/context_manager.py:524
+  └─ ContextManager._build_system_prompt()                # context/context_manager.py:289
       └─ tools = registry.get_definitions_for_scope(scope) #   tools/registry.py
           └─ [t.to_openai_schema() for t in self.for_scope(scope)]
               └─ {"type": "function", "function": {
@@ -297,7 +297,7 @@ Orchestrator.__init__()                                  # core/orchestrator.py:
 ### 工具执行全链路（从 AgentCore 到 Tool.execute）
 
 ```
-AgentCore._execute_tool_calls(tool_calls, tools)          # core/runner.py:989
+AgentCore._execute_tool_calls(tool_calls, tools)          # core/runner.py:1023
   │
   ├─ 分组:                                                # core/runner.py:994-1001
   │   parallel_group = [(i, tc) for i, tc in enumerate(tool_calls)

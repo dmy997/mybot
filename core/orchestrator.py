@@ -9,7 +9,9 @@ Wires ContextManager, Dispatcher, and Agents together. Handles:
 from __future__ import annotations
 
 import asyncio
+import ast
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -46,6 +48,28 @@ from .runner import AgentInput
 from .session_context import SessionContext
 from .session_context import reset as reset_session
 from .session_context import set_current as set_session
+
+
+import fnmatch as _fnmatch
+
+_NON_VISION_MODEL_PATTERNS = [
+    "deepseek/*",
+    "meta-llama/*",
+    "mistral/*",
+    "qwen/qwen-*-instruct",
+    "qwen/qwen-*-thinking",
+    "qwen/qwq-*",
+    "qwen/qwen2.5-*",
+    "qwen/qwen3-*",
+]
+
+
+def _model_supports_vision(model_id: str) -> bool:
+    """Return ``False`` if *model_id* matches a known non-vision pattern."""
+    for pat in _NON_VISION_MODEL_PATTERNS:
+        if _fnmatch.fnmatch(model_id.lower(), pat):
+            return False
+    return True
 
 
 def _summarize_tool_args(args_json: str) -> str:
@@ -150,6 +174,10 @@ class Orchestrator:
         auto_install_otel(tracer)
         init_obs_store(self.workspace)
 
+        from observability.metrics import restore_metrics, start_metrics_persistence
+        restore_metrics()
+        start_metrics_persistence()
+
         # Generate default settings.json if not present
         from config import Config
         from config.settings import generate_default_settings
@@ -189,6 +217,14 @@ class Orchestrator:
             session_ttl_days=session_ttl_days,
         )
 
+        # HITL (Human-in-the-loop) — must be initialized before agents
+        # so the middleware chain is injected into AgentCore at agent creation.
+        from services.hitl import create_hitl_service_and_middleware
+        self.hitl_service, _hitl_mw = create_hitl_service_and_middleware()
+        if middleware is None:
+            middleware = MiddlewareChain()
+        middleware.add(_hitl_mw)
+
         # Dispatcher (accept pre-built or auto-discover agents)
         if dispatcher is not None:
             self._dispatcher = dispatcher
@@ -201,13 +237,6 @@ class Orchestrator:
             self._dispatcher = Dispatcher(
                 agents, provider=provider, classify_model=compress_model
             )
-
-        # HITL (Human-in-the-loop) — must be initialized before agents
-        from services.hitl import create_hitl_service_and_middleware
-        self.hitl_service, _hitl_mw = create_hitl_service_and_middleware()
-        if middleware is None:
-            middleware = MiddlewareChain()
-        middleware.add(_hitl_mw)
 
         # Tools — main agent gets full access guard
         from tools.guard import ToolGuard as _ToolGuard
@@ -257,6 +286,7 @@ class Orchestrator:
         temperature: float | None = None,
         goal: str | None = None,
         skills: list[str] | None = None,
+        images: list[str] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_done: Callable[[], Awaitable[None]] | None = None,
@@ -279,8 +309,17 @@ class Orchestrator:
         (HTTP/WS, CLI via MessageBus).  The caller is responsible for
         rendering or forwarding output appropriately.
         """
-        if not user_input.strip():
+        if not user_input.strip() and not images:
             raise ValueError("user_input must not be empty")
+
+        # Detect /reflect modifier prefix
+        _REFLECT_RE = re.compile(r"^/reflect\b", re.IGNORECASE)
+        reflect = False
+        if _REFLECT_RE.search(user_input.strip()):
+            reflect = True
+            user_input = _REFLECT_RE.sub("", user_input.strip()).strip()
+            if not user_input:
+                raise ValueError("user_input must not be empty after /reflect")
 
         paradigm: str = "unknown"
 
@@ -303,6 +342,31 @@ class Orchestrator:
                 from config.settings import resolve_context_window
 
                 effective_model = model or Config.default_model
+
+                if images:
+                    logger.warning(
+                        "process_message: {} image(s) attached, effective_model={}, "
+                        "supports_vision={}, multimodal_model={}",
+                        len(images), effective_model,
+                        _model_supports_vision(effective_model),
+                        Config.multimodal_model,
+                    )
+
+                if images and not _model_supports_vision(effective_model):
+                    return OrchestratorResult(
+                        content=(
+                            f"抱歉，当前模型 `{effective_model}` 不支持多模态图片输入。"
+                            f"请在设置中将 `MULTIMODAL_MODEL` 配置为一个支持视觉的模型"
+                            f"（如 `google/gemini-2.5-flash`），"
+                            f"或通过环境变量 `LLM_MODEL_ID` 切换到视觉模型后重试。"
+                        ),
+                        session_key=session_key,
+                        paradigm="none",
+                        usage={},
+                        stop_reason="error",
+                        error="model does not support multimodal input",
+                    )
+
                 mwc = resolve_context_window(effective_model)
 
                 # 2. Build messages (includes repair, token-budget compression)
@@ -312,6 +376,7 @@ class Orchestrator:
                         user_input,
                         tools=self._tools,
                         skills=active_skills or None,
+                        images=images,
                         context_window=mwc.context_window,
                         max_output_tokens=mwc.max_output_tokens,
                     )
@@ -367,6 +432,7 @@ class Orchestrator:
                     on_tool_execute_start=on_tool_execute_start,
                     on_tool_execute_end=on_tool_execute_end,
                     on_new_turn=_on_new_turn_wrapper,
+                    reflect=reflect or Config.reflect_enabled,
                 )
 
                 # 5. Run agent (interruptible)
@@ -436,8 +502,42 @@ class Orchestrator:
                             "Consolidation skipped for {!r}", session_key,
                         )
 
+                content = output.content or ""
+
+                # When an image request hits a model error (e.g. 403 region
+                # block), replace the raw API error with a plain friendly
+                # message so the user never sees a stack trace.
+                if output.error and images:
+                    content = (
+                        f"抱歉，图片处理失败。\n\n"
+                        f"当前使用的视觉模型 `{effective_model}` 返回了错误，"
+                        f"可能是该模型在您的地区不可用或未开通。\n\n"
+                        f"**解决方法**：设置环境变量 `MULTIMODAL_MODEL` 为另一个"
+                        f"可用的视觉模型（如 `openai/gpt-4o`、"
+                        f"`google/gemini-2.5-flash`、`qwen/qwen-vl-max`），"
+                        f"然后重启服务。\n\n"
+                        f"原始错误：{output.error}"
+                    )
+                    # Persist the friendly reply so it survives page reloads
+                    output.messages.append({
+                        "role": "assistant",
+                        "content": content,
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    output.error = "image processing failed"
+
+                if not content and not output.error:
+                    content = "抱歉，模型未能生成回复。请检查 API 配置或稍后重试。"
+
+                logger.warning(
+                    "process_message result: content_len={}, error={}, "
+                    "usage={}, stop_reason={}",
+                    len(content), output.error,
+                    output.usage, output.stop_reason,
+                )
+
                 return OrchestratorResult(
-                    content=output.content,
+                    content=content,
                     session_key=session_key,
                     paradigm=paradigm,
                     usage=output.usage,
@@ -523,6 +623,9 @@ class Orchestrator:
                 channel = msg.source or "default"
                 _dropped_logged = False  # reset per inbound message
 
+                # Track file artifacts written by tools during this turn
+                file_artifacts: set[str] = set()
+
                 async def _on_delta(token: str) -> None:
                     _safe_put(OutboundMessage(session_key, cid, "delta", token), channel)
 
@@ -547,6 +650,17 @@ class Orchestrator:
 
                 async def _on_tool_exec_end(ev: dict[str, Any]) -> None:
                     _safe_put(OutboundMessage(session_key, cid, "tool_exec_end", ev), channel)
+                    # Track files written by the WriteTool
+                    if ev.get("name") == "write" and ev.get("status") == "success":
+                        detail = str(ev.get("detail", ""))
+                        m = re.match(r"^Wrote \d+ bytes to (.+)$", detail.strip())
+                        if m:
+                            try:
+                                path = ast.literal_eval(m.group(1))
+                                if isinstance(path, str):
+                                    file_artifacts.add(path)
+                            except (ValueError, SyntaxError):
+                                pass
 
                 async def _on_new_turn() -> None:
                     _safe_put(OutboundMessage(session_key, cid, "new_turn", None), channel)
@@ -562,6 +676,7 @@ class Orchestrator:
                         max_tokens=msg.max_tokens,
                         goal=msg.goal,
                         skills=msg.skills,
+                        images=msg.images or None,
                         on_delta=_on_delta,
                         on_thinking=_on_thinking,
                         on_thinking_done=_on_thinking_done,
@@ -576,7 +691,9 @@ class Orchestrator:
                         {"content": result.content, "usage": result.usage,
                          "stop_reason": result.stop_reason,
                          "paradigm": result.paradigm,
-                         "elapsed_ms": (time.monotonic() - t_start) * 1000},
+                         "error": result.error,
+                         "elapsed_ms": (time.monotonic() - t_start) * 1000,
+                         "file_artifacts": sorted(file_artifacts)},
                     ), channel)
                 except Exception as exc:
                     logger.opt(exception=True).error(

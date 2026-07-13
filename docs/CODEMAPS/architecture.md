@@ -1,4 +1,4 @@
-<!-- Generated: 2026-07-10 | Files scanned: ~90 | Token estimate: ~600 -->
+<!-- Generated: 2026-07-13 | Files scanned: ~100 | Token estimate: ~650 -->
 
 # Architecture
 
@@ -19,7 +19,7 @@ mybot-wechat   → channels.wechat:main             (iLink WeChat bot)
        ▼               ▼                 ▼
 ┌─────────────────────────────────────────────────┐
 │              Orchestrator                        │
-│  core/orchestrator.py (~800 lines)               │
+│  core/orchestrator.py (~994 lines)               │
 │  + background_service.py (cron + scheduled)      │
 │  + mcp_service.py (MCP lifecycle)                │
 └────────┬───────────────────┬────────────────────┘
@@ -29,7 +29,7 @@ mybot-wechat   → channels.wechat:main             (iLink WeChat bot)
 │  context/        │  │  core/dispatcher.py   │
 │  + SessionStore  │  │  4-layer routing:     │
 │  + MemoryService │  │  cmd→keyword→LLM→def  │
-│  + Compaction    │  └──────────┬───────────┘
+│  + CompactionService    │  └──────────┬───────────┘
 │  + TokenBudget   │             ▼
 └────────┬────────┘  ┌──────────────────────┐
          ▼           │    Agent Layer        │
@@ -56,16 +56,17 @@ mybot-wechat   → channels.wechat:main             (iLink WeChat bot)
 
 | Layer | Dir | Key Files | Lines |
 |-------|-----|-----------|-------|
-| Entry | `channels/`, `core/server.py`, `tui/` | wechat.py, server.py | ~2000 |
-| Orchestration | `core/` | orchestrator.py, runner.py, dispatcher.py | ~2200 |
-| Context | `context/` | context_manager.py, session_store.py, memory_service.py | ~1500 |
-| Memory | `memory/` | store.py, hybrid_store.py, consolidator.py, dream.py | ~1200 |
-| Agents | `agents/` | react_agent.py, plan_solve_agent.py, deep_research_agent.py | ~800 |
-| Providers | `providers/` | openai_compatible_provider.py, base.py | ~1000 |
-| Tools | `tools/` | tool.py, guard.py, registry.py + sandbox/ + mcp/ | ~2000 |
-| Observability | `observability/` | log.py, metrics.py, trace.py, persistence.py | ~1200 |
-| Services | `services/` | cron.py, scheduled_tasks.py | ~600 |
-| Config | `config/` | config.py, settings.py | ~300 |
+| Entry | `channels/`, `core/server.py`, `tui/` | wechat.py, server.py, app.py, widgets.py | ~3228 |
+| Channels | `channels/` | base.py, wechat.py | ~1469 |
+| Orchestration | `core/` | orchestrator.py, runner.py, dispatcher.py | ~2571 |
+| Context | `context/` | context_manager.py, session_store.py, memory_service.py, compaction.py, token_budget.py | ~1501 |
+| Memory | `memory/` | store.py, hybrid_store.py, consolidator.py, dream.py | ~1510 |
+| Agents | `agents/` | react_agent.py, plan_solve_agent.py, deep_research_agent.py, team/ | ~863 |
+| Providers | `providers/` | base.py, openai_compatible_provider.py, errors.py | ~985 |
+| Tools | `tools/` | all .py files under tools/ (incl. sandbox/, mcp/) | ~3735 |
+| Observability | `observability/` | log.py, metrics.py, trace.py, persistence.py | ~1001 |
+| Services | `services/` | cron.py, hitl.py, scheduled_tasks.py, xiaohongshu.py | ~898 |
+| Config | `config/` | config.py, settings.py | ~621 |
 
 ## Data Flow
 ```

@@ -69,8 +69,14 @@ class OrchestratorWorkers:
         blueprint: TeamBlueprint,
         parent_tools: ToolRegistry,
     ) -> TeamResult:
-        """Run the full topology for *topic* under *blueprint*."""
-        subtasks = await self._decompose(topic, blueprint)
+        """Run the full topology for *topic* under *blueprint*.
+
+        Supports multi-round refinement: after the first fan-out + synthesis,
+        if the report identifies coverage gaps, the lead spawns a second
+        (smaller) wave of workers to fill them, up to *max_rounds*.
+        """
+        # -- Round 1: decompose → fan-out → synthesize --------------------------
+        subtasks = await self._decompose(topic, blueprint, parent_tools)
         if not subtasks:
             return TeamResult(
                 full_report="",
@@ -79,6 +85,81 @@ class OrchestratorWorkers:
             )
 
         worker_tools = self._select_tools(parent_tools, blueprint.worker.tool_names)
+        all_results: list[SubAgentResult] = []
+        all_subtasks: list[str] = list(subtasks)
+
+        results = await self._run_fan_out(subtasks, blueprint, worker_tools)
+        all_results.extend(results)
+
+        full_report, summary = await self._synthesize(
+            topic, subtasks, results, blueprint
+        )
+
+        # -- Refinement round(s): gap detection → extra workers → re-synthesize --
+        for rnd in range(2, blueprint.max_rounds + 1):
+            gap_subtasks = await self._detect_gaps(
+                topic, full_report, blueprint, parent_tools
+            )
+            if not gap_subtasks:
+                break
+
+            cap = max(1, blueprint.max_workers // 2)
+            gap_subtasks = gap_subtasks[:cap]
+            logger.info(
+                "Team '{}' round {}: {} gap-filling subtasks",
+                blueprint.name, rnd, len(gap_subtasks),
+            )
+
+            extra = await self._run_fan_out(gap_subtasks, blueprint, worker_tools)
+            all_results.extend(extra)
+            all_subtasks.extend(gap_subtasks)
+
+            full_report, summary = await self._synthesize(
+                topic, all_subtasks, all_results, blueprint
+            )
+
+        return TeamResult(
+            full_report=full_report,
+            summary=summary,
+            subtasks=all_subtasks,
+            worker_results=all_results,
+            usage=self._sum_usage(all_results),
+        )
+
+    # -- phases ---------------------------------------------------------------
+
+    async def _decompose(self, topic: str, blueprint: TeamBlueprint, parent_tools: ToolRegistry) -> list[str]:
+        from core.runner import AgentInput
+
+        lead_tools = self._select_tools(parent_tools, ("websearch", "webfetch"))
+
+        messages = [
+            {"role": "system", "content": blueprint.lead_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"研究主题：{topic}\n\n"
+                    f"请将其分解为最多 {blueprint.max_workers} 个相互独立的子任务，"
+                    "只输出一个 JSON 字符串数组，不要额外说明。"
+                ),
+            },
+        ]
+        out = await self.core.run(
+            AgentInput(
+                init_messages=messages,
+                tools=lead_tools,
+                model=blueprint.lead_model,
+            )
+        )
+        return self._parse_subtasks(out.content, blueprint.max_workers)
+
+    async def _run_fan_out(
+        self,
+        subtasks: list[str],
+        blueprint: TeamBlueprint,
+        worker_tools: ToolRegistry,
+    ) -> list[SubAgentResult]:
+        """Spawn and run workers for *subtasks*, return their results."""
         specs = [
             SubAgentSpec(
                 task=st,
@@ -95,48 +176,50 @@ class OrchestratorWorkers:
         results = await self.runner.run_all(
             specs, max_concurrent=blueprint.max_concurrent
         )
-
         ok = sum(1 for r in results if r.success)
         logger.info(
             "Team '{}' fan-out: {}/{} workers succeeded",
             blueprint.name, ok, len(results),
         )
+        return results
 
-        full_report, summary = await self._synthesize(
-            topic, subtasks, results, blueprint
-        )
-        return TeamResult(
-            full_report=full_report,
-            summary=summary,
-            subtasks=subtasks,
-            worker_results=results,
-            usage=self._sum_usage(results),
-        )
+    async def _detect_gaps(
+        self,
+        topic: str,
+        report: str,
+        blueprint: TeamBlueprint,
+        parent_tools: ToolRegistry,
+    ) -> list[str]:
+        """Ask the lead to identify remaining coverage gaps from the report.
 
-    # -- phases ---------------------------------------------------------------
-
-    async def _decompose(self, topic: str, blueprint: TeamBlueprint) -> list[str]:
+        Returns a (possibly empty) list of gap-filling subtask strings.
+        """
         from core.runner import AgentInput
 
+        lead_tools = self._select_tools(parent_tools, ("websearch", "webfetch"))
         messages = [
             {"role": "system", "content": blueprint.lead_prompt},
             {
                 "role": "user",
                 "content": (
                     f"研究主题：{topic}\n\n"
-                    f"请将其分解为最多 {blueprint.max_workers} 个相互独立的子任务，"
-                    "只输出一个 JSON 字符串数组，不要额外说明。"
+                    f"以下是一份初步研究报告：\n\n{report[:3000]}\n\n"
+                    "请对照原始研究主题，检查报告中是否存在明显的信息缺口"
+                    "（如遗漏了某个实体、某个维度、或缺少关键数据）。"
+                    "如有缺口，请将其分解为最多 3 个补充研究子任务，"
+                    "输出一个 JSON 字符串数组。"
+                    "如果没有明显缺口，输出一个空数组 []。"
                 ),
             },
         ]
         out = await self.core.run(
             AgentInput(
                 init_messages=messages,
-                tools=ToolRegistry(),
+                tools=lead_tools,
                 model=blueprint.lead_model,
             )
         )
-        return self._parse_subtasks(out.content, blueprint.max_workers)
+        return self._parse_subtasks(out.content, 4)
 
     async def _synthesize(
         self,

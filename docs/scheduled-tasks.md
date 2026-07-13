@@ -150,27 +150,41 @@ tracer contextvar 模式，避免改动每个工具的签名。
 
 ## Orchestrator 装配
 
-`Orchestrator.__init__`（`core/orchestrator.py`）：
+`Orchestrator.__init__` 将定时任务初始化**委托**给 `BackgroundService.__init__()`（`core/background_service.py`），后者统一管理 `CronScheduler`、`ScheduledTaskService` 和 `Dream`：
 
 ```python
-self.cron.register_job("dream", interval_hours=2)          # dream 保持原生
-
-self._scheduled = ScheduledTaskService(
-    self.workspace, self.cron,
-    run_agent=self._run_scheduled_agent,                   # 内部副作用回调
+# core/orchestrator.py:256-273（片段）
+self._bg = BackgroundService(
+    self.workspace, self.ctx.store, provider, compress_model or "",
+    on_run_agent=self._run_scheduled_agent,
 )
-self._scheduled.seed_system_task(                          # 小红书系统任务
+self.cron = self._bg.cron                     # backward-compat alias
+
+self._scheduled = self._bg.scheduled_tasks
+self._scheduled.seed_system_task(             # 小红书系统任务
     task_id="xiaohongshu", schedule="0 20 * * *",
     prompt=xiaohongshu_prompt(self.workspace),
     session_key=XIAOHONGSHU_SESSION_KEY, skills=["xiaohongshu"],
 )
-self._scheduled.load()                                     # 恢复用户任务
-self._tools.register(ScheduleTaskTool(self._scheduled))    # 手动注册工具
+self._scheduled.load()                        # 恢复用户任务
+self._tools.register(ScheduleTaskTool(self._scheduled))  # 手动注册工具
 ```
 
-`_on_cron_job` 折叠成两支：`dream` 走原生 `dream.run()`，其余全部
-`await self._scheduled.fire(name)`。`deliver` 回调由入口点在
-`start_services()` 之前用 `scheduled_tasks.set_deliver(...)` 注入。
+BackgroundService 在构造时注册 dream cron job 并创建 ScheduledTaskService：
+
+```python
+# core/background_service.py:44-58
+self._dream = Dream(store=store, provider=provider, model=model)
+self.cron = CronScheduler(state_dir=..., on_job=self._on_cron_job)
+self.cron.register_job("dream", interval_hours=2)
+
+self._scheduled = ScheduledTaskService(
+    Path(workspace), self.cron,
+    run_agent=on_run_agent or _noop,
+)
+```
+
+`_on_cron_job` 路由：dream 走原生 `dream.run()`，其余全部 `await self._scheduled.fire(name)`。`deliver` 回调由入口点在 `start_services()` 之前用 `scheduled_tasks.set_deliver(...)` 注入。
 
 ## fire 路由
 

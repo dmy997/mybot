@@ -40,12 +40,12 @@ DEEP_RESEARCH = TeamBlueprint(
         system_prompt=_WORKER_PROMPT,
         tool_names=("websearch", "webfetch"),
         allow_network=True,
-        max_iterations=8,
-        timeout_seconds=180.0,
+        max_iterations=12,
+        timeout_seconds=300.0,
     ),
     synthesis_prompt=_SYNTH_PROMPT,
-    max_workers=5,
-    max_concurrent=3,
+    max_workers=8,
+    max_concurrent=4,
 )
 
 _CMD_RE = re.compile(r"^/research\b", re.IGNORECASE)

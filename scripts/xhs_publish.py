@@ -205,6 +205,7 @@ def publish(
     images: list[str] | None = None,
     caption: str = "",
     assist: bool = False,
+    content2: str = "",
 ) -> str:
     _check_playwright()
     from playwright.sync_api import sync_playwright
@@ -222,6 +223,8 @@ def publish(
     # image-note publish flow exposes the title/body inputs.
     if not images:
         images = [_text_to_image(title, content)]
+        if content2:
+            images.append(_text_to_image(title + "（答案）", content2))
 
     with sync_playwright() as p:
         # assist mode shows the browser so the user can click 发布 themselves;
@@ -249,11 +252,38 @@ def publish(
                 )
                 input()
             else:
-                # The shadow root is forced open (see _FORCE_OPEN_SHADOW), so the
-                # inner 发布 button resolves through the custom element host.
-                submit = page.locator("xhs-publish-btn >> text=发布").first
-                submit.scroll_into_view_if_needed()
-                submit.click()
+                # The shadow root is forced open (see _FORCE_OPEN_SHADOW), so
+                # we can reach the inner button via JavaScript.  A CSS locator
+                # like `xhs-publish-btn >> text=发布` is unreliable here because
+                # Playwright's `>>` chains selectors rather than piercing shadow
+                # DOM; evaluate() walks the open shadow root directly.
+                clicked = page.evaluate("""
+                () => {
+                    const hosts = document.querySelectorAll('xhs-publish-btn');
+                    for (const host of hosts) {
+                        const root = host.shadowRoot;
+                        if (!root) continue;
+                        const btn = root.querySelector(
+                            'button, [role="button"], .btn, .publish-btn, span'
+                        );
+                        if (btn) { btn.click(); return true; }
+                    }
+                    // Fallback: visible element whose trimmed text is exactly 发布
+                    for (const el of document.querySelectorAll(
+                        'button, [role="button"], span, div'
+                    )) {
+                        if (el.textContent.trim() === '发布' && el.offsetParent !== null) {
+                            el.click(); return true;
+                        }
+                    }
+                    return false;
+                }
+                """)
+                if not clicked:
+                    print("⚠ 未找到可点击的发布按钮，尝试 Playwright 点击...", file=sys.stderr)
+                    submit = page.locator("text=发布").first
+                    submit.scroll_into_view_if_needed()
+                    submit.click()
                 page.wait_for_timeout(3000)
                 # Dismiss any post-click confirm prompt.
                 for label in ("确认发布", "同意并发布", "继续发布"):
@@ -309,6 +339,7 @@ def main() -> None:
     parser.add_argument("--title", type=str)
     parser.add_argument("--content", type=str)
     parser.add_argument("--caption", type=str, default="")
+    parser.add_argument("--content2", type=str, default="")
     parser.add_argument("--images", type=str, nargs="*", default=[])
     parser.add_argument("--payload", type=str)
     args = parser.parse_args()
@@ -323,16 +354,18 @@ def main() -> None:
         content = payload.get("content", "")
         caption = payload.get("caption", "")
         images = payload.get("images", [])
+        content2 = payload.get("content2", "")
     else:
         title = args.title or ""
         content = args.content or ""
         caption = args.caption or ""
         images = args.images or []
+        content2 = args.content2 or ""
 
     if not title or not content:
         parser.error("--title and --content required (or use --payload)")
 
-    publish(title, content, images, caption, assist=args.assist)
+    publish(title, content, images, caption, assist=args.assist, content2=content2)
 
 
 if __name__ == "__main__":

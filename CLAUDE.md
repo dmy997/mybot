@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, HTTP/WS API, and extensible chat channels (WeChat). Designed to work with any OpenAI-compatible API endpoint. 820 tests, all passing.
+mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, HTTP/WS API, and extensible chat channels (WeChat). Designed to work with any OpenAI-compatible API endpoint. 961 tests, all passing.
 
 ## Development Setup
 
@@ -17,7 +17,7 @@ cp .env.example .env   # then fill in your keys
 
 ```bash
 ruff check .           # lint
-pytest                 # all 678 tests (pytest-asyncio, asyncio_mode = "auto")
+pytest                 # all 961 tests (pytest-asyncio, asyncio_mode = "auto")
 pytest test/core/test_middleware.py -v   # single file
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 ```

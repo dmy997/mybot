@@ -45,11 +45,17 @@ def init_store(workspace: Path) -> ObservabilityStore:
 class ObservabilityStore:
     """Thread-safe per-session JSONL persistence for observability data."""
 
+    _MAX_EVENTS = 2000
+    _MAX_SPANS = 1000
+    _TRIM_INTERVAL = 50  # writes between auto-trim checks
+    _MAX_SESSION_FILES = 200
+
     def __init__(self, workspace: Path) -> None:
         self._dir = Path(workspace).expanduser().resolve() / "observability"
         self._dir.mkdir(parents=True, exist_ok=True)
         self._locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        self._write_counts: dict[str, int] = {}
 
     # -- helpers ---------------------------------------------------------------
 
@@ -78,6 +84,7 @@ class ObservabilityStore:
         with self._get_lock(session_key):
             with open(self._path(session_key), "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+        self._maybe_trim(session_key)
 
     def save_span(self, session_key: str, span_entry: dict[str, Any]) -> None:
         """Append a completed span to the session JSONL file."""
@@ -90,6 +97,42 @@ class ObservabilityStore:
         with self._get_lock(session_key):
             with open(self._path(session_key), "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+        self._maybe_trim(session_key)
+
+    # -- auto-trim -------------------------------------------------------------
+
+    def _maybe_trim(self, session_key: str) -> None:
+        self._write_counts[session_key] = self._write_counts.get(session_key, 0) + 1
+        if self._write_counts[session_key] >= self._TRIM_INTERVAL:
+            self.trim(session_key, self._MAX_EVENTS, self._MAX_SPANS)
+            self._write_counts[session_key] = 0
+
+    def cleanup_stale_files(self, active_sessions: set[str] | None = None) -> int:
+        """Remove JSONL files for sessions that no longer exist, and cap total files.
+
+        Returns number of files removed.
+        """
+        removed = 0
+        jsonl_files = sorted(
+            [f for f in self._dir.glob("*.jsonl") if not f.stem.startswith("_")],
+            key=lambda p: p.stat().st_mtime,
+        )
+
+        # Phase 1: remove files for sessions that no longer exist
+        if active_sessions is not None:
+            for f in jsonl_files[:]:
+                if f.stem not in active_sessions:
+                    f.unlink(missing_ok=True)
+                    jsonl_files.remove(f)
+                    removed += 1
+
+        # Phase 2: cap total file count, oldest first
+        while len(jsonl_files) > self._MAX_SESSION_FILES:
+            jsonl_files[0].unlink(missing_ok=True)
+            jsonl_files.pop(0)
+            removed += 1
+
+        return removed
 
     # -- read ------------------------------------------------------------------
 
@@ -137,6 +180,49 @@ class ObservabilityStore:
         return [e[0] for e in entries]
 
     # -- trim ------------------------------------------------------------------
+
+    def _metrics_path(self) -> Path:
+        return self._dir / "_metrics.json"
+
+    def save_metrics(self, data: dict[str, Any]) -> None:
+        """Persist a metrics snapshot to disk (atomic write)."""
+        path = self._metrics_path()
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, default=str)
+        tmp.replace(path)
+
+    def load_metrics(self) -> dict[str, Any] | None:
+        """Load the last persisted metrics snapshot, or None."""
+        path = self._metrics_path()
+        if not path.exists():
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def load_all_events(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Load recent events across ALL sessions, newest first."""
+        return self._load_all_by_type("event", limit)
+
+    def load_all_spans(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Load recent spans across ALL sessions, newest first."""
+        return self._load_all_by_type("span", limit)
+
+    def _load_all_by_type(self, kind: str, limit: int) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for path in sorted(
+            self._dir.glob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        ):
+            if path.stem.startswith("_"):
+                continue
+            results.extend(self._load_by_type(path.stem, kind, limit))
+        results.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
+        return results[:limit]
 
     def trim(self, session_key: str, max_events: int = 2000, max_spans: int = 1000) -> None:
         """Trim old entries from a session file, keeping the most recent of each type."""

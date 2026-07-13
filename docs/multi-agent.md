@@ -50,7 +50,7 @@ DeepResearchAgent.run(spec)                       # agents/deep_research_agent.p
   └─ OrchestratorWorkers(core, runner).execute(topic, DEEP_RESEARCH, spec.tools)
         ├─ 1. _decompose  → lead loop（无工具）→ JSON 子任务数组（_parse_subtasks 容错）
         ├─ 2. fan-out     → 每子任务一个 worker（websearch+webfetch，allow_network）
-        │                    runner.run_all(max_concurrent=3) 并行 + 信号量限流
+        │                    runner.run_all(max_concurrent=4) 并行 + 信号量限流
         └─ 3. _synthesize → synthesis loop（无工具）→ <summary> + <report>
   ├─ _save_report(topic, full_report)             # {workspace}/research/{date}_{slug}.md
   └─ 返回 AgentOutput(content=摘要+文件路径, tool_events=worker 生命周期)
@@ -103,9 +103,9 @@ CronScheduler → ScheduledTaskService.fire("user:xxxx")
 
 ## 护栏
 
-- **成本/限流**：`TeamBlueprint.max_workers`（默认 5）+ `max_concurrent`（默认 3 信号量）；
-  worker 可用便宜模型（`WorkerRole.model`），synthesis 用强模型（`synthesis_model`）
-- **超时**：per-worker `timeout_seconds`（默认 180s），`asyncio.wait_for` 保护
+- **成本/限流**：`TeamBlueprint.max_workers`（默认 5，deep_research 实际设为 8）+ `max_concurrent`（默认 3 信号量，deep_research 实际设为 4）
+- **超时**：per-worker `timeout_seconds`（默认 180s，deep_research 实际设为 300s），`asyncio.wait_for` 保护
+- **模型**：deep_research 蓝图未设置 `WorkerRole.model` 或 `lead_model`/`synthesis_model`，所有角色（lead / worker / synthesis）使用相同的默认模型
 - **递归防护**：workers 不带 `delegate`、不带拓扑范式 → 不会无限嵌套
 
 ## 相关文档

@@ -28,12 +28,12 @@ def init_logging(config=None):
 
     # 文件: JSON Lines 格式，始终 DEBUG 级别
     if config.log_dir is not None:
-        logger.add(config.log_dir / "mybot_{time}.log", serialize=True, ...)
+        logger.add(config.log_dir / "mybot_{time:YYYY-MM-DD}.log", serialize=True, ...)
 ```
 
 ### 结构化事件类型
 
-四种类型化事件，所有字段自动绑定到 loguru 的 `extra`：
+五种类型化事件，所有字段自动绑定到 loguru 的 `extra`：
 
 ```python
 @dataclass
@@ -69,14 +69,26 @@ class AgentRunEvent:
     total_latency_ms: float
     stop_reason: str
     error: str | None = None
+
+@dataclass
+class MemorySearchEvent:
+    """Emitted when memory recall is performed."""
+
+    query: str
+    mode: str  # "hybrid" | "fts5_only" | "substring"
+    result_count: int
+    latency_ms: float = 0.0
+    session_key: str | None = None
 ```
 
 ### emit 辅助函数
 
 ```python
-def emit(event, *, level="INFO"):
+def emit(event, *, level="INFO", session_key=None):
     """将 dataclass 事件通过 loguru 发出，字段作为 extra 键。"""
     data = _to_dict(event)
+    if session_key is not None:
+        data["session_key"] = session_key
     event_type = type(event).__name__
     summary = ", ".join(f"{k}={v!r}" for k, v in data.items())
     logger.bind(event_type=event_type, **data).log(level, summary)
@@ -417,7 +429,7 @@ class ObservabilityStore:
 ### 系统启动：可观测性初始化
 
 ```
-Orchestrator.__init__()                                  # orchestrator.py:92
+Orchestrator.__init__()                                  # orchestrator.py:142
   │
   ├── init_logging(log_config)                           # orchestrator.py:134 → log.py:54
   │     ├── logger.remove()  # 移除默认 handler
@@ -527,9 +539,9 @@ AgentCore / ToolRegistry 产生事件
 ### 指标采集与暴露
 
 ```
-REGISTRY (全局单例, metrics.py:205)
+REGISTRY (全局单例, metrics.py:208)
   │
-  ├── 预定义指标 (metrics.py:207-217):
+  ├── 预定义指标 (metrics.py:210-220):
   │     counters:   llm_calls_total, llm_calls_errors_total,
   │                 llm_tokens_total, tool_calls_total,
   │                 tool_calls_errors_total, agent_errors_total,

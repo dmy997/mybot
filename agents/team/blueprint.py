@@ -59,6 +59,10 @@ class TeamBlueprint:
     synthesis_prompt: str
     max_workers: int = 5
     max_concurrent: int = 3
+    max_rounds: int = 2
+    """Maximum fan-out → synthesize rounds.  After round 1 the synthesizer
+    identifies coverage gaps; if gaps remain, the lead spawns a second
+    (smaller) wave of workers to fill them before the final synthesis."""
     lead_model: str | None = None
     synthesis_model: str | None = None
 

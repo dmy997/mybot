@@ -5,7 +5,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-820%20passed-green)](.)
+[![Tests](https://img.shields.io/badge/tests-961%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 受 **Claude Code**、**nanobot**、**OpenClaw** 启发，通过 Claude Code vibe coding 开发的个人 AI 助手框架。可读性强，高度模块化，轻量无冗余。
@@ -183,7 +183,7 @@ MYBOT_OTEL_ENABLED=1 mybot
 
 ```bash
 ruff check .                               # lint
-pytest                                     # 全部 820 个测试
+pytest                                     # 全部 961 个测试
 pytest test/core/test_middleware.py -v     # 单个测试文件
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 bash scripts/loc.sh                        # 按模块统计代码行数

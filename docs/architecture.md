@@ -45,7 +45,13 @@
 ```
 HTTP/WS or CLI → Orchestrator.process_message()
   │
-  ├─ ContextManager.build_messages()
+  ├─ 模型 & 多模态检测
+  │   ├─ 解析 per-model context_window / max_output_tokens
+  │   ├─ images 参数存在时检测视觉能力 (_model_supports_vision)
+  │   ├─ 不支持时返回友好错误（无自动切换）
+  │   └─ 配置项: MULTIMODAL_MODEL, _NON_VISION_MODEL_PATTERNS
+  │
+  ├─ ContextManager.build_messages(images, context_window, max_output_tokens)
   │   ├─ 修复中断的会话 (unmatched tool calls, missing responses)
   │   ├─ 组装 system prompt (base + memory + skills + tools + summaries)
   │   ├─ 加载会话历史 (cursor-based, 100-msg cap)
@@ -63,6 +69,8 @@ HTTP/WS or CLI → Orchestrator.process_message()
   └─ ContextManager.save_exchange() → 持久化到磁盘
       └─ prune_by_count() 硬上限检查
 ```
+
+> **多模态支持**: `Orchestrator.process_message()` 接受 `images: list[str] | None` 参数传入图片路径。在 `context/build_messages()` 之前，系统通过 `_model_supports_vision()` 函数（基于 `_NON_VISION_MODEL_PATTERNS` 的 fnmatch 模式匹配）检测当前模型是否支持视觉输入。若不支持，直接返回友好错误提示，不自动切换模型。可通过 `MULTIMODAL_MODEL` 配置项指定备选视觉模型。
 
 ## 核心组件
 
@@ -133,9 +141,10 @@ HTTP/WS or CLI → Orchestrator.process_message()
 所有 Agent 范式共享的执行运行时:
 - LLM 调用 loop + 工具调用 + 结果回传
 - 并行 vs 串行工具执行 (`asyncio.gather` 用于 parallel-safe 工具)
-- 7 步上下文压缩 (remove orphans → fill missing → summarize old → truncate long → token budget → repair)
+- **反思模式** (已完整实现): 主回答完成后，附加一次无工具的反思 LLM 调用，自我审查并改进回答质量。通过 `AgentInput.reflect` 或消息前缀 `/reflect` 开启；可通过 `REFLECT_ENABLED` (默认关闭)、`REFLECT_MODEL`、`REFLECT_TEMPERATURE`、`REFLECT_PROMPT`、`REFLECT_MAX_TOKENS` 配置
+- 3 步上下文压缩 (轻量级 _lightweight_compact: 1. 汇总旧工具结果 2. 移除孤立 tool result 3. 填充缺失 tool result; 或委托 CompactionService.micro_compact 三层压缩)
 - LLM 错误恢复 (context_length → compact & retry; content_filter → compliance hint & retry)
-- 50+ 步停滞检测
+- 停滞检测 (max(10, max_iterations × 75%), 默认 20 步时约 15 步触发警告)
 - Middleware hook: agent start/step/end, LLM call, tool execute
 
 ### Middleware (`core/middleware.py`)

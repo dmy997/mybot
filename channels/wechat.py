@@ -140,6 +140,7 @@ class WechatChannel(BaseChannel):
         self._bus = MessageBus()
         self._client: httpx.AsyncClient | None = None
         self._token: str = ""
+        self._bot_id: str = ""
         self._stop_event: asyncio.Event | None = None
         self._poll_task: asyncio.Task | None = None
         self._consumer_task: asyncio.Task | None = None
@@ -157,6 +158,10 @@ class WechatChannel(BaseChannel):
 
         # HITL: pending confirmation chat_id → request_id
         self._pending_hitl: dict[str, str] = {}
+        # Cross-process HITL: chat_id → request_id (requests from server process)
+        self._cross_pending_hitl: dict[str, str] = {}
+        self._cross_hitl_seen: set[str] = set()
+        self._cross_hitl_poller_task: asyncio.Task | None = None
 
         # Persistent state directory (set in start())
         self._state_dir: Path | None = None
@@ -214,6 +219,7 @@ class WechatChannel(BaseChannel):
         # Load existing token or login via QR
         state = self._load_state(self._state_dir)
         self._token = state["token"]
+        self._bot_id = state["bot_id"]
         self._get_updates_buf = state["get_updates_buf"]
         self._context_tokens = state["context_tokens"]
 
@@ -233,9 +239,15 @@ class WechatChannel(BaseChannel):
         else:
             logger.info("WechatChannel: loaded saved token")
 
+        # Refresh context tokens — cached ones may be stale after re-login
+        await self._refresh_context_tokens()
+
         self._stop_event = asyncio.Event()
         self._consumer_task = asyncio.create_task(self._consume_outbound())
         self._poll_task = asyncio.create_task(self._poll_loop())
+
+        # Start cross-process HITL bridge poller (after full initialization)
+        self._cross_hitl_poller_task = asyncio.create_task(self._poll_cross_hitl())
 
         await self._stop_event.wait()
 
@@ -243,7 +255,7 @@ class WechatChannel(BaseChannel):
         logger.info("WechatChannel: shutting down")
         if self._stop_event is not None and not self._stop_event.is_set():
             self._stop_event.set()
-        for task in [self._poll_task, self._consumer_task]:
+        for task in [self._poll_task, self._consumer_task, self._cross_hitl_poller_task]:
             if task and not task.done():
                 task.cancel()
         for task in self._serve_tasks.values():
@@ -286,7 +298,7 @@ class WechatChannel(BaseChannel):
     def _load_state(state_dir: Path) -> dict[str, Any]:
         state_file = state_dir / "account.json"
         if not state_file.exists():
-            return {"token": "", "get_updates_buf": "", "context_tokens": {}, "base_url": BASE_URL}
+            return {"token": "", "bot_id": "", "get_updates_buf": "", "context_tokens": {}, "base_url": BASE_URL}
         try:
             data = json.loads(state_file.read_text())
             ctx = data.get("context_tokens", {})
@@ -294,6 +306,7 @@ class WechatChannel(BaseChannel):
                 ctx = {}
             return {
                 "token": data.get("token", ""),
+                "bot_id": data.get("bot_id", ""),
                 "get_updates_buf": data.get("get_updates_buf", ""),
                 "context_tokens": {
                     str(k): str(v) for k, v in ctx.items()
@@ -303,23 +316,25 @@ class WechatChannel(BaseChannel):
             }
         except Exception:
             logger.opt(exception=True).warning("WechatChannel: failed to load account.json")
-            return {"token": "", "get_updates_buf": "", "context_tokens": {}, "base_url": BASE_URL}
+            return {"token": "", "bot_id": "", "get_updates_buf": "", "context_tokens": {}, "base_url": BASE_URL}
 
     @staticmethod
     def _save_state(
         state_dir: Path,
         *,
         token: str,
-        get_updates_buf: str,
-        context_tokens: dict[str, str],
-        base_url: str,
+        bot_id: str = "",
+        get_updates_buf: str = "",
+        context_tokens: dict[str, str] | None = None,
+        base_url: str = "",
     ) -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
         state_file = state_dir / "account.json"
         data = {
             "token": token,
+            "bot_id": bot_id,
             "get_updates_buf": get_updates_buf,
-            "context_tokens": context_tokens,
+            "context_tokens": context_tokens or {},
             "base_url": base_url,
         }
         try:
@@ -337,6 +352,7 @@ class WechatChannel(BaseChannel):
         self._save_state(
             self._state_dir,
             token=self._token,
+            bot_id=self._bot_id,
             get_updates_buf=self._get_updates_buf,
             context_tokens=self._context_tokens,
             base_url=BASE_URL,
@@ -467,6 +483,7 @@ class WechatChannel(BaseChannel):
                     user_id = status_data.get("ilink_user_id", "")
                     if token:
                         self._token = token
+                        self._bot_id = bot_id
                         self._persist_state(force=True)
                         logger.info(
                             "WechatChannel: login success bot_id={} user_id={}",
@@ -597,6 +614,111 @@ class WechatChannel(BaseChannel):
     # Inbound message processing
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Cross-process HITL bridge
+    # ------------------------------------------------------------------
+
+    async def _poll_cross_hitl(self) -> None:
+        """Poll the server's ``GET /hitl/pending`` for cross-process HITL requests.
+
+        When a scheduled task runs in the server process, its HITL service is
+        independent of the WeChat process.  This poller bridges the gap by
+        discovering server-side requests and relaying them as WeChat messages.
+        """
+        server_url = Config.hitl_server_url.rstrip("/")
+        poll_interval = 5.0
+
+        while self._stop_event is None or not self._stop_event.is_set():
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                    resp = await client.get(f"{server_url}/hitl/pending")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    pending = data.get("pending", [])
+
+                    for req_data in pending:
+                        rid = req_data.get("request_id", "")
+                        if not rid or rid in self._cross_hitl_seen:
+                            continue
+                        self._cross_hitl_seen.add(rid)
+
+                        tool_name = req_data.get("tool_name", "")
+                        session_key = req_data.get("session_key", "")
+
+                        # Only handle xiaohongshu_publish for now
+                        if tool_name != "xiaohongshu_publish":
+                            continue
+
+                        chat_id = self._chat_ids.get(
+                            session_key
+                        ) or Config.xiaohongshu_fallback_chat
+                        self._cross_pending_hitl[chat_id] = rid
+
+                        ctx_token = self._context_tokens.get(chat_id, "")
+                        if not ctx_token:
+                            await self._refresh_context_tokens()
+                            ctx_token = self._context_tokens.get(chat_id, "")
+
+                        if not ctx_token:
+                            logger.warning(
+                                "Cross HITL: no context_token for {}, cannot send", chat_id,
+                            )
+                            continue
+
+                        # Build a synthetic request object for formatting
+                        synth_req = type("_HitlReq", (), {
+                            "request_id": rid,
+                            "session_key": session_key,
+                            "tool_name": tool_name,
+                            "arguments": req_data.get("arguments", {}),
+                            "capabilities": req_data.get("capabilities", []),
+                        })()
+                        text = self._format_xiaohongshu_hitl(synth_req)
+
+                        try:
+                            await self._send_text(chat_id, text, ctx_token)
+                            logger.info(
+                                "Cross HITL: sent xiaohongshu confirm to {} req={}",
+                                chat_id, rid,
+                            )
+                        except Exception:
+                            logger.opt(exception=True).warning(
+                                "Cross HITL: failed to send confirm for {}", rid,
+                            )
+            except httpx.ConnectError:
+                logger.debug("Cross HITL poller: server not reachable")
+            except Exception:
+                logger.opt(exception=True).warning("Cross HITL poller: request failed")
+
+            # Prune seen set periodically to avoid unbounded growth
+            if len(self._cross_hitl_seen) > 1000:
+                self._cross_hitl_seen.clear()
+
+            await asyncio.sleep(poll_interval)
+
+    async def _respond_cross_hitl(self, request_id: str, decision: str) -> None:
+        """POST to the server's ``/hitl/respond`` for a cross-process HITL request."""
+        server_url = Config.hitl_server_url.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                resp = await client.post(
+                    f"{server_url}/hitl/respond",
+                    json={"request_id": request_id, "decision": decision},
+                )
+                if resp.status_code == 200:
+                    logger.info(
+                        "Cross HITL: responded {} for req={}", decision, request_id,
+                    )
+                else:
+                    logger.warning(
+                        "Cross HITL: respond returned {} for req={}",
+                        resp.status_code, request_id,
+                    )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Cross HITL: failed to respond for req={}", request_id,
+            )
+
     async def _on_message(self, raw_msg: dict) -> None:
         """Process a single raw message from getupdates."""
         msg = self._parse(raw_msg, allowed_from=None)
@@ -619,28 +741,55 @@ class WechatChannel(BaseChannel):
             self._context_tokens[msg.user_id] = ctx_token
             self._persist_state(force=True)
 
+        # Download attached files and images
+        local_paths: list[str] = []
+        for fi in msg.files:
+            path = await self._download_file(fi["url"], msg.user_id, fi["name"])
+            if path:
+                local_paths.append(path)
+                fi["path"] = path
+
+        # Convert image URLs to data URLs
+        from utils.images import file_to_data_url
+
+        image_data_urls: list[str] = []
+        for img_url in msg.images:
+            path = await self._download_file(img_url, msg.user_id, "image")
+            if path:
+                data_url = file_to_data_url(path)
+                if data_url:
+                    image_data_urls.append(data_url)
+
         logger.info(
-            "WechatChannel: inbound from={} bodyLen={}",
+            "WechatChannel: inbound from={} bodyLen={} files={} images={}",
             msg.user_id,
             len(msg.text),
+            len(local_paths),
+            len(image_data_urls),
         )
+
+        _text_lower = msg.text.strip().lower()
+        _decision: str | None = None
+        if _text_lower in ("y", "yes", "是", "同意", "允许"):
+            _decision = "approved"
+        elif _text_lower in ("n", "no", "否", "拒绝"):
+            _decision = "denied"
 
         # Check if this is a HITL response (y/n to pending confirmation)
         _pending_req_id = self._pending_hitl.get(msg.chat_id)
-        if _pending_req_id:
-            _text_lower = msg.text.strip().lower()
-            if _text_lower in ("y", "yes", "是", "同意", "允许"):
-                _hitl_svc = getattr(self._orchestrator, "hitl_service", None)
-                if _hitl_svc:
-                    _hitl_svc.respond(_pending_req_id, "approved")
-                self._pending_hitl.pop(msg.chat_id, None)
-                return
-            elif _text_lower in ("n", "no", "否", "拒绝"):
-                _hitl_svc = getattr(self._orchestrator, "hitl_service", None)
-                if _hitl_svc:
-                    _hitl_svc.respond(_pending_req_id, "denied")
-                self._pending_hitl.pop(msg.chat_id, None)
-                return
+        if _pending_req_id and _decision:
+            _hitl_svc = getattr(self._orchestrator, "hitl_service", None)
+            if _hitl_svc:
+                _hitl_svc.respond(_pending_req_id, _decision)
+            self._pending_hitl.pop(msg.chat_id, None)
+            return
+
+        # Check cross-process HITL response
+        _cross_req_id = self._cross_pending_hitl.get(msg.chat_id)
+        if _cross_req_id and _decision:
+            await self._respond_cross_hitl(_cross_req_id, _decision)
+            self._cross_pending_hitl.pop(msg.chat_id, None)
+            return
 
         self._chat_ids[msg.session_key] = msg.chat_id
         await self._bus.inbound(msg.session_key).put(InboundMessage(
@@ -648,6 +797,8 @@ class WechatChannel(BaseChannel):
             content=msg.text,
             source=_PLATFORM,
             correlation_id=msg.session_key,
+            files=local_paths,
+            images=image_data_urls,
         ))
 
         if msg.session_key not in self._serve_tasks:
@@ -765,10 +916,25 @@ class WechatChannel(BaseChannel):
 
         item_list: list[dict] = raw_msg.get("item_list") or []
         content_parts: list[str] = []
+        file_items: list[dict] = []
+        image_urls: list[str] = []
 
         for item in item_list:
             item_type = item.get("type", 0)
-            if item_type == ITEM_TEXT:
+            if item_type == ITEM_FILE:
+                fi = item.get("file_item") or {}
+                if fi.get("file_name") and fi.get("file_url"):
+                    file_items.append({
+                        "name": fi["file_name"],
+                        "url": fi["file_url"],
+                        "size": fi.get("file_size", 0),
+                    })
+            elif item_type == ITEM_IMAGE:
+                img = item.get("image_item") or item.get("file_item") or {}
+                img_url = img.get("file_url") or img.get("url") or ""
+                if img_url:
+                    image_urls.append(img_url)
+            elif item_type == ITEM_TEXT:
                 text = (item.get("text_item") or {}).get("text", "")
                 if not text:
                     continue
@@ -794,8 +960,17 @@ class WechatChannel(BaseChannel):
                 else:
                     content_parts.append(text)
 
+        # Append file hints to text
+        for fi in file_items:
+            content_parts.append(f"[用户发送了文件: {fi['name']}]")
+        # Image hints
+        for _ in image_urls:
+            content_parts.append("[用户发送了图片]")
+
         content = "\n".join(content_parts)
-        if not content:
+        files: list[dict] = file_items
+
+        if not content and not files and not image_urls:
             return None
 
         session_key = BaseChannel.build_session_key(_PLATFORM, "private", from_user_id)
@@ -807,6 +982,8 @@ class WechatChannel(BaseChannel):
             chat_type="private",
             platform=_PLATFORM,
             raw=raw_msg,
+            files=files,
+            images=image_urls,  # raw CDN URLs, converted to data URLs in _on_message
         )
 
     # ------------------------------------------------------------------
@@ -837,7 +1014,9 @@ class WechatChannel(BaseChannel):
 
             data = out.data or {}
             text = data.get("content", "")
-            if not text:
+            file_artifacts: list[str] = data.get("file_artifacts") or []
+
+            if not text and not file_artifacts:
                 continue
 
             ctx_token = self._context_tokens.get(chat_id, "")
@@ -850,14 +1029,200 @@ class WechatChannel(BaseChannel):
                 )
                 continue
 
-            chunks = _split_text(text, WEIXIN_MAX_MESSAGE_LEN)
-            for chunk in chunks:
-                try:
-                    await self._send_text(chat_id, chunk, ctx_token)
-                except Exception:
-                    logger.opt(exception=True).warning(
-                        "WechatChannel: failed to send to {}", chat_id
+            # Send text first, then files
+            if text:
+                chunks = _split_text(text, WEIXIN_MAX_MESSAGE_LEN)
+                for chunk in chunks:
+                    try:
+                        await self._send_text(chat_id, chunk, ctx_token)
+                    except Exception:
+                        logger.opt(exception=True).warning(
+                            "WechatChannel: failed to send to {}", chat_id
+                        )
+
+            for fp in file_artifacts:
+                p = Path(fp)
+                if p.is_file():
+                    try:
+                        await self._send_file(chat_id, str(p), p.name, ctx_token)
+                    except Exception:
+                        logger.opt(exception=True).warning(
+                            "WechatChannel: failed to send file {} to {}", fp, chat_id,
+                        )
+                else:
+                    logger.warning(
+                        "WechatChannel: skipping non-existent file artifact {}", fp,
                     )
+
+    # ------------------------------------------------------------------
+    # File download / sanitise
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sanitise_filename(filename: str) -> str:
+        """Strip path separators and null bytes from a filename."""
+        return filename.replace("/", "_").replace("\\", "_").replace("\0", "")
+
+    async def _download_file(
+        self, file_url: str, user_id: str, filename: str,
+    ) -> str | None:
+        """Download a file from an iLink CDN URL and save it locally.
+
+        Returns the local path on success, or ``None`` on failure.
+        """
+        safe_name = self._sanitise_filename(filename) or "untitled"
+        base = self._state_dir / "inbox" / user_id
+        base.mkdir(parents=True, exist_ok=True)
+
+        # Deduplicate filename
+        dest = base / safe_name
+        counter = 1
+        while dest.exists():
+            stem = Path(safe_name).stem
+            suffix = Path(safe_name).suffix
+            dest = base / f"{stem}_{counter}{suffix}"
+            counter += 1
+
+        try:
+            assert self._client is not None
+            resp = await self._client.get(file_url)
+            resp.raise_for_status()
+        except Exception:
+            logger.opt(exception=True).warning(
+                "WechatChannel: failed to download file from {}", file_url,
+            )
+            return None
+
+        try:
+            dest.write_bytes(resp.content)
+            logger.info(
+                "WechatChannel: downloaded file {} ({} bytes)",
+                dest.name, len(resp.content),
+            )
+            return str(dest)
+        except Exception:
+            logger.opt(exception=True).warning(
+                "WechatChannel: failed to save file to {}", dest,
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # File upload (iLink CDN)
+    # ------------------------------------------------------------------
+
+    async def _upload_file(self, local_path: str) -> str | None:
+        """Upload a local file to the iLink CDN.
+
+        Returns the remote file URL on success, or ``None`` on failure.
+        """
+        file_path = Path(local_path)
+        if not file_path.is_file():
+            logger.warning(
+                "WechatChannel: _upload_file called with non-existent file {}",
+                local_path,
+            )
+            return None
+
+        size = file_path.stat().st_size
+        if size > 20 * 1024 * 1024:
+            logger.warning(
+                "WechatChannel: file {} too large to upload ({} bytes)", local_path, size,
+            )
+            return None
+
+        assert self._client is not None
+        try:
+            with open(local_path, "rb") as fh:
+                resp = await self._client.post(
+                    f"{BASE_URL}/ilink/bot/uploadmedia",
+                    files={"media": (file_path.name, fh, "application/octet-stream")},
+                    headers=_make_headers(token=self._token),
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            file_url = data.get("media_url") or data.get("url") or ""
+            if not file_url:
+                logger.warning("WechatChannel: upload returned no URL: {}", data)
+                return None
+            logger.info(
+                "WechatChannel: uploaded {} → {}", file_path.name, file_url,
+            )
+            return file_url
+        except Exception:
+            logger.opt(exception=True).warning(
+                "WechatChannel: failed to upload file {}", local_path,
+            )
+            return None
+
+    async def _send_file(
+        self,
+        to_user_id: str,
+        file_path: str,
+        filename: str,
+        context_token: str,
+        *,
+        caption: str = "",
+    ) -> None:
+        """Upload and send a file to a WeChat user via iLink sendmessage."""
+        file_url = await self._upload_file(file_path)
+        if not file_url:
+            logger.warning(
+                "WechatChannel: cannot send file {} — upload failed", file_path,
+            )
+            return
+
+        client_id = f"mybot-{uuid.uuid4().hex[:12]}"
+        path = Path(file_path)
+        file_size = path.stat().st_size if path.is_file() else 0
+
+        item_list: list[dict] = [{
+            "type": ITEM_FILE,
+            "file_item": {
+                "file_name": filename or path.name,
+                "file_url": file_url,
+                "file_size": file_size,
+            },
+        }]
+        if caption:
+            item_list.insert(0, {"type": ITEM_TEXT, "text_item": {"text": caption}})
+
+        wechat_msg: dict[str, Any] = {
+            "from_user_id": self._bot_id,
+            "to_user_id": to_user_id,
+            "client_id": client_id,
+            "message_type": MESSAGE_TYPE_BOT,
+            "message_state": MESSAGE_STATE_FINISH,
+            "item_list": item_list,
+        }
+        if context_token:
+            wechat_msg["context_token"] = context_token
+
+        body: dict[str, Any] = {"msg": wechat_msg, "base_info": BASE_INFO}
+        data = await self._api_post("ilink/bot/sendmessage", body)
+        ret = data.get("ret", 0)
+        errcode = data.get("errcode", 0)
+        if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
+            raise RuntimeError(
+                f"WeChat send file error (ret={ret}, errcode={errcode}): {data.get('errmsg', '')}"
+            )
+
+    # ------------------------------------------------------------------
+    # Override BaseChannel.send_file
+    # ------------------------------------------------------------------
+
+    async def send_file(
+        self, file_path: str, filename: str, msg: ChannelMessage,
+    ) -> None:
+        ctx_token = self._context_tokens.get(msg.chat_id, "")
+        if not ctx_token:
+            await self._refresh_context_tokens()
+            ctx_token = self._context_tokens.get(msg.chat_id, "")
+        if not ctx_token:
+            logger.error(
+                "WechatChannel: no context_token for {}, cannot send file", msg.chat_id,
+            )
+            return
+        await self._send_file(msg.chat_id, file_path, filename, ctx_token)
 
     # ------------------------------------------------------------------
     # Send text via iLink API
@@ -877,7 +1242,7 @@ class WechatChannel(BaseChannel):
             item_list.append({"type": ITEM_TEXT, "text_item": {"text": text}})
 
         wechat_msg: dict[str, Any] = {
-            "from_user_id": "",
+            "from_user_id": self._bot_id,
             "to_user_id": to_user_id,
             "client_id": client_id,
             "message_type": MESSAGE_TYPE_BOT,

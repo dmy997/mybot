@@ -97,7 +97,7 @@ def outbound(self, channel: str = "default") -> asyncio.Queue[OutboundMessage]:
 ### 消息数据结构
 
 ```python
-# core/message_bus.py:51-67
+# core/message_bus.py:51-72
 @dataclass
 class InboundMessage:
     session_key: str          # 目标会话 → 路由到哪个 inbound 队列
@@ -109,15 +109,18 @@ class InboundMessage:
     max_tokens: int | None
     goal: str | None
     skills: list[str] | None
+    files: list[str]          # 本地文件路径
+    images: list[str]         # base64 图片数据 URL
     timestamp: float          # time.monotonic()
 
-# core/message_bus.py:71-96
+# core/message_bus.py:74-101
 @dataclass
 class OutboundMessage:
     session_key: str           # 来源 session（调试用）
     correlation_id: str        # 关联到具体请求，消费者按此过滤
     msg_type: str              # delta|thinking|thinking_done|tool_start|tool_end|
-                               #   tool_exec_start|tool_exec_end|final|error
+                               #   tool_exec_start|tool_exec_end|new_turn|hitl_confirm|
+                               #   final|error
     data: Any                  # 按 msg_type 不同
     timestamp: float
 ```
@@ -258,7 +261,7 @@ async def _ensure_serve_task(session_key: str) -> None:
 
 ### serve() 内部循环
 
-`core/orchestrator.py:541-656`
+`core/orchestrator.py:569-705`
 
 ```python
 async def serve(self, bus_msg: MessageBus, session_key: str):

@@ -67,6 +67,14 @@ class AgentInput:
     """Async callback invoked at the start of each new LLM turn (after the first)."""
     checkpoint: bool = False
     """Enable checkpointing for this run.  Also controlled by ``MYBOT_CHECKPOINT`` env var."""
+    reflect: bool = False
+    """Enable a post-generation reflection pass that reviews and improves the output."""
+    reflect_model: str | None = None
+    """Model override for the reflection call (None = same as primary model)."""
+    reflect_temperature: float | None = None
+    """Temperature override for the reflection call (None = use class default)."""
+    reflect_max_tokens: int | None = None
+    """Max-tokens override for the reflection call."""
 
 
 @dataclass
@@ -80,6 +88,10 @@ class AgentOutput:
     stop_reason: str = "completed"
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
+    reflected: bool = False
+    """Whether the output has been through a reflection pass."""
+    prereflect_content: str = ""
+    """Content before reflection (for comparison / debugging)."""
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +102,19 @@ _DEFAULT_MAX_ITERATIONS = 20
 _DEFAULT_MAX_TOOL_RESULT_CHARS = 6_000
 _STALL_WARNING_RATIO = 0.75  # fraction of max_iterations at which stall warning fires
 _CHECKPOINT_VERSION = 1
+
+_REFLECTION_PROMPT = (
+    "请仔细检查你上面的回答，从以下角度逐一审查：\n"
+    "1. **事实准确性** — 是否有事实错误或幻觉？引用的数据、日期、名称是否准确？\n"
+    "2. **逻辑完整性** — 推理链条是否有漏洞？结论是否由前面的分析自然推导而来？\n"
+    "3. **覆盖度** — 是否遗漏了用户问题中的要点？多角度/多实体是否都覆盖到了？\n"
+    "4. **表述清晰度** — 是否简洁明了、无歧义、无冗余？\n"
+    "\n"
+    "如果发现问题，请给出**修正后的完整回答**（不是补充，是完整替换）。\n"
+    "如果没有问题，请简要说明\"已核实无误\"后输出你原有的完整回答。"
+)
+_REFLECTION_TEMPERATURE = 0.3
+_REFLECTION_MAX_TOKENS = 4096
 
 # Lightweight compaction (fallback when CompactionService is not injected)
 _LW_COMPACT_TRIGGER_RATIO = 0.8
@@ -430,6 +455,15 @@ class AgentCore:
                     stop_reason=response.finish_reason,
                     tool_events=tool_events,
                 )
+
+                # --- optional reflection pass ---
+                if spec.reflect and final_content:
+                    reflected = await self._reflect(spec, messages, final_content)
+                    if reflected:
+                        output.prereflect_content = final_content
+                        output.content = reflected
+                        output.reflected = True
+
                 if mw:
                     await mw.run_agent_end(ctx, output)
                 await bus.publish(AgentCompleted(
@@ -1139,6 +1173,44 @@ class AgentCore:
             )
             if spec.on_tool_execute_end:
                 await spec.on_tool_execute_end(ev)
+
+    async def _reflect(
+        self,
+        spec: AgentInput,
+        messages: list[dict[str, Any]],
+        content_before: str,
+    ) -> str | None:
+        """Run a reflection pass and return improved content, or None on failure."""
+        from config import Config
+
+        reflect_model = spec.reflect_model or Config.reflect_model or spec.model
+        reflect_temp = (
+            spec.reflect_temperature
+            if spec.reflect_temperature is not None
+            else Config.reflect_temperature
+        )
+        reflect_max = spec.reflect_max_tokens or Config.reflect_max_tokens
+
+        reflect_prompt = Config.reflect_prompt
+        messages.append({"role": "user", "content": reflect_prompt})
+
+        try:
+            with tracer.span("agent.reflect", model=reflect_model):
+                response = await self.provider.chat_with_retry(
+                    messages=[dict(m) for m in messages],
+                    tools=[],
+                    model=reflect_model,
+                    max_tokens=reflect_max,
+                    temperature=reflect_temp,
+                )
+        except Exception:
+            logger.opt(exception=True).warning("Reflection call failed, returning original")
+            return None
+
+        if response.content:
+            messages.append({"role": "assistant", "content": response.content})
+            return response.content
+        return None
 
     @staticmethod
     def _build_assistant_tool_call_message(

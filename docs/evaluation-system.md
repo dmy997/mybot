@@ -102,14 +102,14 @@ compute_overall(scores) → EvalResult
 | `ToolSetScorer` | 1.0 | Jaccard 相似度（交集/并集），≥0.5 通过 |
 | `StepEfficiencyScorer` | 0.5 | 1 − steps/max_steps |
 
-`CompositeScorer` 组合多个评分器，按权重计算加权平均。默认所有评分器等权。
+`CompositeScorer` 组合多个评分器，按权重计算加权平均。默认评分器为 `CompletionScorer`、`KeywordScorer`、`ToolSetScorer`、`StepEfficiencyScorer`，权重分别为 [1.0, 1.0, 1.0, 0.5]。
 
 ### 1.4 pytest 集成
 
 `evals/conftest.py` 提供 `--live-eval` 选项。CI 模式（默认）不调用 LLM，只验证任务加载、数据结构、评分管线：
 
 ```bash
-pytest evals/ -v                          # CI 模式：38 个测试
+pytest evals/ -v                          # CI 模式：20 个测试
 pytest evals/ -v --live-eval              # 需要真实 LLM
 ```
 
@@ -172,9 +172,9 @@ GAIAMetrics
 
 **3 个难度级别**：Level 1（基础）、Level 2（中等）、Level 3（复杂），共 466 个真实问题。
 
-### 2.3 LLM Judge 评分器
+### 2.3 LLM Judge 评分器（可选）
 
-`LLMJudgeScorer` 使用廉价模型对答案质量做三维打分：
+`LLMJudgeScorer` 是独立的可选评分器，**不在默认 CompositeScorer 管线中**，需要在调用时显式传入。它使用廉价模型对答案质量做三维打分：
 
 | 维度 | 说明 | 分值 |
 |------|------|------|

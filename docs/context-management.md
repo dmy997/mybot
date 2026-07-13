@@ -32,6 +32,9 @@ async def build_messages(
     *,
     tools: ToolRegistry | None = None,
     skills: list[str] | None = None,
+    images: list[str] | None = None,           # 多模态图片 base64 data URL
+    context_window: int | None = None,          # 每模型上下文窗口覆盖
+    max_output_tokens: int | None = None,       # 每模型最大输出 token 覆盖
 ) -> list[dict[str, Any]]:
 ```
 
@@ -42,7 +45,9 @@ async def build_messages(
 3. **过滤系统消息** — 移除历史中的 system 角色消息
 4. **截断工具结果/参数** — 按 `TokenBudget` 配置限制长度
 5. **构建系统提示词** — 调用 `_build_system_prompt()` 组装提示词
-6. **多级 token 预算检查**：
+6. **组装用户消息** — 若 `images` 非空，构建 `content` 为包含文本 + 图片 data URL 的多模态 `content_parts` 数组；否则使用纯文本
+7. **语言提示注入** — 对用户消息内容调用 `_language_hint()` 注入语言指示（始终使用中文，除非用户指定其他语言）
+8. **多级 token 预算检查**：
    - `> block_threshold` → 强制压缩
    - `> auto_compact_threshold` → 自动压缩
    - `> warning_threshold` → 日志警告
@@ -194,6 +199,9 @@ class Consolidator:
 asyncio.create_task(
     self.ctx.consolidator.maybe_consolidate(session, build_messages_fn=_build_fn)
 )
+# 如果 consolidation 发生，随后清理已归档的消息
+if did:
+    SessionManager.prune_archived_messages()  # 删除 messages[:min(cursor, last_consolidated)]
 ```
 
 **与 CompactionService 的区别**：

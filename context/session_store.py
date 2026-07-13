@@ -41,8 +41,11 @@ class SessionStore:
         """Append a user+assistant exchange to the session log."""
         async with self.session.lock_session(session_key):
             session = self.session.get_session(session_key)
-            session.messages.append({"role": "user", "content": user_input})
+            ts = datetime.now().isoformat()
+            session.messages.append({"role": "user", "content": user_input, "timestamp": ts})
             for msg in assistant_messages:
+                if "timestamp" not in msg:
+                    msg["timestamp"] = datetime.now().isoformat()
                 session.messages.append(msg)
             session.updated_at = datetime.now()
             self.session.save_session(session)

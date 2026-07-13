@@ -33,7 +33,7 @@ from observability.metrics import REGISTRY
 from observability.persistence import store as _obs_store
 from observability.recent import recent
 
-from .message_bus import InboundMessage, MessageBus
+from .message_bus import InboundMessage, MessageBus, OutboundMessage
 from .orchestrator import Orchestrator
 
 # ---------------------------------------------------------------------------
@@ -164,6 +164,10 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                     {"request_id": req.request_id, "tool_name": req.tool_name,
                      "arguments": req.arguments, "capabilities": list(req.capabilities)},
                 ))
+                logger.info(
+                    "HITL listener pushed to http queue: request_id={!r} tool={!r}",
+                    req.request_id, req.tool_name,
+                )
             except asyncio.QueueFull:
                 logger.warning("HITL confirm event dropped — http queue full")
 
@@ -177,14 +181,12 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         """Merge recent in-memory log events with persisted session data."""
         items = recent.get_logs(min(limit, 500))
 
-        # If session specified and recent has few/zero matches, supplement from disk
-        if session_key:
+        if session_key and _obs_store is not None:
             recent_matches = sum(
                 1 for e in items if e.get("data", {}).get("session_key") == session_key  # type: ignore[union-attr]
             )
-            if recent_matches < limit and _obs_store is not None:
+            if recent_matches < limit:
                 persisted = _obs_store.load_events(session_key, limit)
-                # Deduplicate: skip events already in recent buffer (match by timestamp + event_type)
                 recent_keys = {
                     (e.get("timestamp"), e.get("event_type"))  # type: ignore[union-attr]
                     for e in items
@@ -194,27 +196,40 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                     if key not in recent_keys:
                         items.append(evt)
                         recent_keys.add(key)
-                # Sort by timestamp descending, cap at limit
-                items = sorted(items, key=lambda e: e.get("timestamp", 0), reverse=True)[:limit]  # type: ignore[arg-type,return-value]
+        elif not session_key and _obs_store is not None:
+            persisted = _obs_store.load_all_events(limit)
+            recent_keys = {
+                (e.get("timestamp"), e.get("event_type"))
+                for e in items
+            }
+            for evt in persisted:
+                key = (evt.get("timestamp"), evt.get("event_type"))
+                if key not in recent_keys:
+                    items.append(evt)
+
+        items = sorted(items, key=lambda e: e.get("timestamp", 0), reverse=True)[:limit]  # type: ignore[arg-type,return-value]
         return items
 
     def _get_traces(limit: int, session_key: str | None) -> list[dict[str, object]]:
         """Merge recent in-memory spans with persisted session data."""
-        spans = recent.get_spans(min(limit, 200))
+        spans: list[dict[str, object]] = list(recent.get_spans(min(limit, 200)))
 
         if session_key and _obs_store is not None:
-            # Collect trace_ids already in recent data
-            recent_trace_ids = {s.get("trace_id") for s in spans}
             recent_span_ids = {s.get("span_id") for s in spans}
-
             persisted = _obs_store.load_spans(session_key, limit)
             for s in persisted:
                 if s.get("span_id") not in recent_span_ids:
                     spans.append(s)
                     recent_span_ids.add(s.get("span_id"))
+        elif not session_key and _obs_store is not None:
+            recent_span_ids = {s.get("span_id") for s in spans}
+            persisted = _obs_store.load_all_spans(limit * 3)
+            for s in persisted:
+                if s.get("span_id") not in recent_span_ids:
+                    spans.append(s)
+                    recent_span_ids.add(s.get("span_id"))
 
-            # Sort by end_time descending, cap at limit
-            spans = sorted(spans, key=lambda s: s.get("end_time") or 0, reverse=True)[:limit]  # type: ignore[arg-type,return-value]
+        spans = sorted(spans, key=lambda s: s.get("end_time") or 0, reverse=True)[:limit]  # type: ignore[arg-type,return-value]
         return spans
 
     async def health(request: Request) -> JSONResponse:  # noqa: ARG001
@@ -258,7 +273,11 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         except Exception:
             body = {}
         message = (body.get("message") or "").strip()
-        if not message:
+        images = body.get("images") or []
+
+        logger.warning("chat_sse: message={!r}, images_count={}", message[:80] if message else "", len(images))
+
+        if not message and not images:
             return JSONResponse({"error": "message is required"}, status_code=400)
 
         model = body.get("model")
@@ -277,6 +296,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                 model=model,
                 temperature=temperature,
                 goal=goal,
+                images=images,
             ))
 
             try:
@@ -308,20 +328,33 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                     elif out.msg_type == "final":
                         data = out.data or {}
                         content = data.get("content", "")
+                        snap = REGISTRY.collect_all()
+                        metrics = {
+                            "counters": snap.counters,
+                            "gauges": snap.gauges,
+                            "histograms": snap.histograms,
+                        }
                         if data.get("error"):
-                            yield _sse_event("error", {"message": data["error"]})
+                            # Emit delta first so the Web UI renders the
+                            # friendly content, then close with done so it
+                            # finalises properly (the Web UI has no handler
+                            # for the "error" SSE event).
+                            if content:
+                                yield _sse_event("delta", {"token": content})
+                            yield _sse_event("done", {
+                                "content": content,
+                                "stop_reason": data.get("stop_reason", "error"),
+                                "paradigm": data.get("paradigm", "unknown"),
+                                "error": data["error"],
+                                "metrics": metrics,
+                            })
                         else:
-                            snap = REGISTRY.collect_all()
                             yield _sse_event("done", {
                                 "content": content,
                                 "stop_reason": data.get("stop_reason", "completed"),
                                 "paradigm": data.get("paradigm", "unknown"),
                                 "usage": data.get("usage", {}),
-                                "metrics": {
-                                    "counters": snap.counters,
-                                    "gauges": snap.gauges,
-                                    "histograms": snap.histograms,
-                                },
+                                "metrics": metrics,
                             })
                         break  # final — end stream
                     elif out.msg_type == "error":
@@ -392,20 +425,29 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                 elif out.msg_type == "final":
                     data = out.data or {}
                     content = data.get("content", "")
+                    snap = REGISTRY.collect_all()
+                    metrics = {
+                        "counters": snap.counters,
+                        "gauges": snap.gauges,
+                        "histograms": snap.histograms,
+                    }
                     if data.get("error"):
-                        yield _sse_event("error", {"message": data["error"]})
+                        if content:
+                            yield _sse_event("delta", {"token": content})
+                        yield _sse_event("done", {
+                            "content": content,
+                            "stop_reason": data.get("stop_reason", "error"),
+                            "paradigm": data.get("paradigm", "unknown"),
+                            "error": data["error"],
+                            "metrics": metrics,
+                        })
                     else:
-                        snap = REGISTRY.collect_all()
                         yield _sse_event("done", {
                             "content": content,
                             "stop_reason": data.get("stop_reason", "completed"),
                             "paradigm": data.get("paradigm", "unknown"),
                             "usage": data.get("usage", {}),
-                            "metrics": {
-                                "counters": snap.counters,
-                                "gauges": snap.gauges,
-                                "histograms": snap.histograms,
-                            },
+                            "metrics": metrics,
                         })
                     # Keep listening — more pushes may come later
                 elif out.msg_type == "error":
@@ -474,7 +516,8 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                 msg.update(data)
             await websocket.send_json(msg)
 
-        async def _run(message: str, model: str | None, temperature: float | None) -> None:
+        async def _run(message: str, model: str | None, temperature: float | None,
+                       images: list[str] | None = None) -> None:
             nonlocal _current_task
             cid = uuid.uuid4().hex
             try:
@@ -487,6 +530,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                     correlation_id=cid,
                     model=model,
                     temperature=temperature,
+                    images=images or [],
                 ))
 
                 while True:
@@ -513,20 +557,29 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                     elif out.msg_type == "final":
                         data = out.data or {}
                         content = data.get("content", "")
+                        snap = REGISTRY.collect_all()
+                        metrics = {
+                            "counters": snap.counters,
+                            "gauges": snap.gauges,
+                            "histograms": snap.histograms,
+                        }
                         if data.get("error"):
-                            await _send("error", {"message": data["error"]})
+                            if content:
+                                await _send("delta", {"token": content})
+                            await _send("done", {
+                                "content": content,
+                                "stop_reason": data.get("stop_reason", "error"),
+                                "paradigm": data.get("paradigm", "unknown"),
+                                "error": data["error"],
+                                "metrics": metrics,
+                            })
                         else:
-                            snap = REGISTRY.collect_all()
                             await _send("done", {
                                 "content": content,
                                 "stop_reason": data.get("stop_reason", "completed"),
                                 "paradigm": data.get("paradigm", "unknown"),
                                 "usage": data.get("usage", {}),
-                                "metrics": {
-                                    "counters": snap.counters,
-                                    "gauges": snap.gauges,
-                                    "histograms": snap.histograms,
-                                },
+                                "metrics": metrics,
                             })
                         break
                     elif out.msg_type == "error":
@@ -556,12 +609,13 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                             pass
 
                     message = (msg.get("message") or "").strip()
-                    if not message:
+                    images = msg.get("images") or []
+                    if not message and not images:
                         await _send("error", {"message": "message is required"})
                         continue
                     model = msg.get("model")
                     temperature = msg.get("temperature")
-                    _current_task = asyncio.create_task(_run(message, model, temperature))
+                    _current_task = asyncio.create_task(_run(message, model, temperature, images))
 
                 elif msg_type == "cancel":
                     if _current_task is not None and not _current_task.done():
@@ -590,6 +644,15 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
     # ------------------------------------------------------------------
 
     _ui_html: bytes | None = None
+
+    async def hitl_pending(request: Request) -> JSONResponse:
+        """List all pending HITL requests (for cross-process bridge polling)."""
+        if not _check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        hitl_svc = getattr(orchestrator, "hitl_service", None)
+        if hitl_svc is None:
+            return JSONResponse({"pending": []})
+        return JSONResponse({"pending": hitl_svc.get_pending_requests()})
 
     async def hitl_respond(request: Request) -> JSONResponse:
         """Resolve a pending HITL confirmation request.
@@ -640,6 +703,7 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         Route("/", index),
         Route("/health", health),
         Route("/hitl/respond", hitl_respond, methods=["POST"]),
+        Route("/hitl/pending", hitl_pending, methods=["GET"]),
         Route("/metrics", metrics),
         Route("/logs", logs_endpoint),
         Route("/traces", traces_endpoint),
@@ -702,7 +766,32 @@ def main() -> None:
         )
             server = uvicorn.Server(config)
             await orchestrator.start_services()
-            await server.serve()
+
+            # Startup: clean stale observability files
+            from observability.persistence import store as obs_store
+            if obs_store is not None:
+                removed = obs_store.cleanup_stale_files()
+                if removed:
+                    logger.info("Cleaned up {} stale observability files on startup", removed)
+
+            async def _periodic_obs_cleanup(interval: int = 3600) -> None:
+                while True:
+                    await asyncio.sleep(interval)
+                    if obs_store is not None:
+                        removed = obs_store.cleanup_stale_files()
+                        if removed:
+                            logger.debug("Periodic obs cleanup removed {} files", removed)
+
+            cleanup_task = asyncio.create_task(_periodic_obs_cleanup())
+
+            try:
+                await server.serve()
+            finally:
+                cleanup_task.cancel()
+                try:
+                    await cleanup_task
+                except asyncio.CancelledError:
+                    pass
 
         asyncio.run(_serve())
     except ImportError:

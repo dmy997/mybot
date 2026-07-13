@@ -539,6 +539,7 @@ class ContextManager:
         *,
         tools: ToolRegistry | None = None,
         skills: list[str] | None = None,
+        images: list[str] | None = None,
         context_window: int | None = None,
         max_output_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -583,12 +584,24 @@ class ContextManager:
 
         lang_hint = _language_hint(current_input)
 
+        # Build user content — plain string or multimodal content-part array
+        if images:
+            user_content: str | list[dict[str, Any]] = (
+                [{"type": "text", "text": current_input}]
+                + [
+                    {"type": "image_url", "image_url": {"url": url}}
+                    for url in images
+                ]
+            )
+        else:
+            user_content = current_input
+
         preliminary: list[dict[str, Any]] = [
             {"role": "system", "content": system_content},
         ] + history + ([
             {"role": "system", "content": lang_hint},
         ] if lang_hint else []) + [
-            {"role": "user", "content": current_input},
+            {"role": "user", "content": user_content},
         ]
 
         if budget.context_window <= 0:

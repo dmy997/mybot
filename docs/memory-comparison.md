@@ -1,5 +1,7 @@
 # 记忆系统对比分析
 
+> **注意**：本文档撰写时 mybot 尚无检索能力。此后已实现 HybridStore（SQLite + sqlite-vec + FTS5 BM25 混合搜索，30 天时间衰减），以下 mybot 相关条目中检索能力的描述部分已过时。
+
 nanobot、Claude Code、OpenClaw、mybot 四个项目的记忆系统，从存储、写入触发、召回到上下文三个维度对比。
 
 ## 一、文件系统存储
@@ -118,7 +120,7 @@ prompt_templates/
 |------|---------|-------------|----------|-------|
 | 核心记忆文件 | MEMORY.md（单文件） | 索引 MEMORY.md + 个体 .md | MEMORY.md（单文件） | MEMORY.md（单文件） |
 | 对话摘要存储 | history.jsonl（JSONL 追加） | 无（直接写个体 .md） | SQLite chunk（embedding + FTS） | history.jsonl（JSONL 追加） |
-| 全文搜索 | 无 | 无（Sonnet sideQuery 选文件） | SQLite FTS5 + sqlite-vec 混合 | 无 |
+| 全文搜索 | 无 | 无（Sonnet sideQuery 选文件） | SQLite FTS5 + sqlite-vec 混合 | 向量 + BM25 混合 + 时间衰减 |
 | 用户档案 | USER.md | USER.md（个体文件） | USER.md | USER.md |
 | Bot 人格 | SOUL.md | 无（CLAUDE.md 指令替代） | SOUL.md + IDENTITY.md | SOUL.md |
 | 会话笔记 | SessionMemory（结构化分段） | Session Memory（分段，12000 token） | 无独立系统 | Session（JSON 持久化） |
@@ -258,21 +260,21 @@ prompt_templates/
 |---------|---------|---------|------|
 | **System Prompt 注入** | 每次 `build_messages()` | SOUL.md + USER.md + MEMORY.md 全文（通过 `get_memory_context()`） | 模板内容被过滤 |
 | **Recent History 注入** | 每次 `build_messages()` | Dream 游标后的 history.jsonl 未处理条目 | 最近 20 条，16000 字符 |
-| ~~旧格式检索~~ | 已移除 | 所有记忆通过 MEMORY.md 全文注入；手动 recall 为关键词搜索 | — |
+| ~~旧格式检索~~ | 已移除 | 所有记忆通过 MEMORY.md 全文注入；手动 recall 为混合搜索（向量 + BM25） | — |
 
 **特点**：
 - **全文注入**：SOUL.md, USER.md, MEMORY.md 始终全部注入（同 nanobot）
 - **过渡层**：history.jsonl 未处理条目作为 "Recent History" 注入（同 nanobot）
-- **无智能检索**：没有混合搜索、向量搜索、相关性选择——全部注入或简单关键词匹配
+- **混合搜索**：HybridStore（SQLite + sqlite-vec 384 维向量 + FTS5 BM25），0.7 向量 / 0.3 BM25 分数融合，30 天半衰期时间衰减（MEMORY.md 豁免）；集成于 ContextManager.recall() / MemoryService.recall()
 - **无 Chunk 级召回**：返回完整文件内容，不支持文本块级检索
 
 ### 召回到上下文维度小结
 
 | 维度 | nanobot | Claude Code | OpenClaw | mybot |
 |------|---------|-------------|----------|-------|
-| **检索方式** | 全文注入 | Sonnet sideQuery 语义选择 | 向量 + BM25 混合 + MMR 重排 | 全文注入 |
+| **检索方式** | 全文注入 | Sonnet sideQuery 语义选择 | 向量 + BM25 混合 + MMR 重排 | 向量 + BM25 混合 + 时间衰减 |
 | **检索粒度** | 文件级 | 文件级（≤5 个，4KB each） | Chunk 级（SQLite 块） | 文件级 |
-| **时间衰减** | 无 | Staleness 排序（辅助） | 指数衰减（30d 半衰期） | 无 |
+| **时间衰减** | 无 | Staleness 排序（辅助） | 指数衰减（30d 半衰期） | 指数衰减（30d 半衰期） |
 | **去重** | 无 | 已展示记忆去重 | MMR 多样性 | 无 |
 | **过渡层** | history.jsonl 未处理条目 | 无（Extraction 每轮直接写文件） | Memory Flush + Dream 各阶段 | history.jsonl 未处理条目 |
 | **阻塞/异步** | 同步（提示词组装） | 异步 prefetch（非阻塞） | 同/异步混合（Active Memory 阻塞） | 同步（提示词组装） |
@@ -287,10 +289,10 @@ prompt_templates/
 |------|---------|-------------|----------|-------|
 | **记忆写入模型** | 两级：Consolidator（实时 → JSONL）→ Dream（周期 → MEMORY.md, SOUL.md, USER.md, skills） | Prompt-driven：LLM 直接读写文件 + 后台 Extraction/Dream 辅助 | 多级：Agent 写入（手动）→ Memory Flush（自动）→ Dreaming（晋级） | 两级：Consolidator（实时 → JSONL）→ Dream（周期 → MEMORY.md, SOUL.md, USER.md） |
 | **核心创新** | Dream 两阶段指令 + AgentRunner 文件编辑 | MEMORY.md 索引 + 个体文件 + 5 种记忆类型 | SQLite 混合搜索 + 三阶段 Dream + Chunk 级 | 参考 nanobot，简化 Phase 2 为程序化合并 |
-| **搜索能力** | 无（全文注入） | Sonnet sideQuery 语义选择（≤5 文件） | 向量 + BM25 混合 + MMR + 时间衰减 | 无（全文注入） |
+| **搜索能力** | 无（全文注入） | Sonnet sideQuery 语义选择（≤5 文件） | 向量 + BM25 混合 + MMR + 时间衰减 | 向量 + BM25 混合 + 时间衰减 |
 | **存储引擎** | 文件系统（Markdown/JSONL） | 文件系统（Markdown + frontmatter） | 文件系统 + SQLite（FTS5 + sqlite-vec） | 文件系统（Markdown/JSONL） |
 | **记忆类型数** | 4（USER/SOUL/MEMORY/SKILL） | 4（user/feedback/project/reference） | 多样化（MEMORY.md, daily notes, DREAMS.md, DREAMS, session transcripts） | 统一格式（MEMORY.md，旧 format 4 类型已移除） |
-| **可扩展性** | 中（skill 系统是独特创新） | 高（SideQuery 语义选择很实用） | 最高（SQLite 支持大规模，MMR 保证多样性） | 低（全文注入，无检索） |
+| **可扩展性** | 中（skill 系统是独特创新） | 高（SideQuery 语义选择很实用） | 最高（SQLite 支持大规模，MMR 保证多样性） | 中（已有混合搜索，chunk 级尚未实现） |
 | **复杂度** | 中 | 高（5 层 CLAUDE.md + Extraction + Dream + Session Memory） | 最高（SQLite 后端 + 嵌入 + FTS + cron 三阶段 Dream） | 低（简洁，易于理解） |
 
 ---
@@ -307,9 +309,9 @@ prompt_templates/
 
 ### P2 — 中期计划
 
-4. **混合搜索**：参考 OpenClaw 的 SQLite + sqlite-vec + FTS5 方案，为 MEMORY.md 和 history.jsonl 建立可搜索索引
+4. ~~**混合搜索**~~：已完成 — HybridStore（SQLite + sqlite-vec 384 维向量 + FTS5 BM25，0.7/0.3 分数融合）
 5. **相关性筛选**：参考 Claude Code 的 Sonnet sideQuery 方案，用便宜模型在注入前筛选相关记忆
-6. **时间衰减**：参考 OpenClaw 的指数衰减，让旧记忆在搜索中的权重自然下降
+6. ~~**时间衰减**~~：已完成 — 30 天半衰期指数衰减，MEMORY.md 豁免
 
 ### P3 — 长期愿景
 

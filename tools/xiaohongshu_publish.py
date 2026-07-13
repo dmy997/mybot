@@ -47,9 +47,17 @@ class XiaohongshuPublishTool(Tool):
             "content": {
                 "type": "string",
                 "description": (
-                    "Main content rendered onto the auto-generated cover "
-                    "image (e.g. the turtle-soup puzzle text). When no "
-                    "images are supplied this is drawn onto the card."
+                    "Main content rendered onto the first auto-generated "
+                    "image (e.g. turtle-soup puzzle / 汤面). "
+                ),
+            },
+            "content2": {
+                "type": "string",
+                "description": (
+                    "Optional second content rendered onto a second image "
+                    "(e.g. turtle-soup answer / 汤底). When provided, "
+                    "both images are uploaded as a multi-image post — "
+                    "first image shows 汤面, second image shows 汤底."
                 ),
             },
             "caption": {
@@ -57,7 +65,7 @@ class XiaohongshuPublishTool(Tool):
                 "description": (
                     "Optional text for the note's body box — call-to-action "
                     "lines and hashtags that should NOT appear on the image "
-                    "(e.g. '答案明天揭晓，评论区留下你的推理 #海龟汤 #推理'). "
+                    "(e.g. '左滑查看答案 #海龟汤 #推理'). "
                     "Falls back to content when omitted."
                 ),
             },
@@ -93,6 +101,7 @@ class XiaohongshuPublishTool(Tool):
         title = str(kwargs.get("title", "")).strip()
         content = str(kwargs.get("content", "")).strip()
         caption = str(kwargs.get("caption", "")).strip()
+        content2 = str(kwargs.get("content2", "")).strip()
         images = kwargs.get("images") or []
 
         if not title:
@@ -123,7 +132,8 @@ class XiaohongshuPublishTool(Tool):
             )
 
         payload = json.dumps(
-            {"title": title, "content": content, "caption": caption, "images": images}
+            {"title": title, "content": content, "caption": caption,
+             "images": images, "content2": content2}
         )
 
         try:

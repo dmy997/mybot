@@ -64,6 +64,10 @@ class InboundMessage:
     max_tokens: int | None = None
     goal: str | None = None
     skills: list[str] | None = None
+    files: list[str] = field(default_factory=list)
+    """Local file paths of attachments downloaded for this message."""
+    images: list[str] = field(default_factory=list)
+    """Base64 data URLs of images attached to this message."""
     timestamp: float = field(default_factory=_time.monotonic)
 
 

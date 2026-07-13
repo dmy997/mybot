@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -394,3 +395,260 @@ class TestDelegation:
         orchestrator.remember("bye-mem", "x", mem_type="feedback", description="d")
         assert orchestrator.forget("bye-mem") is True
         assert orchestrator.forget("gone") is False
+
+
+# ---------------------------------------------------------------------------
+# File artifact tracking in serve()
+# ---------------------------------------------------------------------------
+
+
+class TestFileArtifactTracking:
+    """serve() captures WriteTool file paths in the final OutboundMessage."""
+
+    @pytest.mark.asyncio
+    async def test_write_tool_creates_file_artifact(self, orchestrator, react_agent):
+        from core.message_bus import InboundMessage, MessageBus
+
+        bus = MessageBus()
+
+        async def run_with_write(spec: AgentInput):
+            if spec.on_tool_execute_end:
+                await spec.on_tool_execute_end({
+                    "name": "write",
+                    "status": "success",
+                    "detail": "Wrote 100 bytes to '/tmp/output.txt'",
+                })
+            return AgentOutput(
+                messages=list(spec.init_messages) + [
+                    {"role": "assistant", "content": "File written."}
+                ],
+                content="File written.",
+                usage={"total_tokens": 10},
+                stop_reason="stop",
+            )
+
+        react_agent.run = run_with_write
+
+        await bus.inbound("fa1").put(InboundMessage(
+            session_key="fa1", content="write a file", source="test",
+            correlation_id="cid1",
+        ))
+
+        serve_task = asyncio.create_task(orchestrator.serve(bus, "fa1"))
+        # Drain outbound until final, then stop
+        final_data = None
+        while serve_task.done() is False:
+            try:
+                msg = await asyncio.wait_for(bus.outbound("test").get(), timeout=0.5)
+                if msg is None:
+                    break
+                if msg.msg_type == "final":
+                    final_data = msg.data
+                    break
+            except asyncio.TimeoutError:
+                if final_data is not None:
+                    break
+        await bus.inbound("fa1").put(None)
+        await serve_task
+
+        assert final_data is not None
+        assert "file_artifacts" in final_data
+        assert "/tmp/output.txt" in final_data["file_artifacts"]
+
+    @pytest.mark.asyncio
+    async def test_non_write_tool_no_file_artifact(self, orchestrator, react_agent):
+        from core.message_bus import InboundMessage, MessageBus
+
+        bus = MessageBus()
+
+        async def run_with_bash(spec: AgentInput):
+            if spec.on_tool_execute_end:
+                await spec.on_tool_execute_end({
+                    "name": "bash",
+                    "status": "success",
+                    "detail": "Command completed",
+                })
+            return AgentOutput(
+                messages=list(spec.init_messages) + [
+                    {"role": "assistant", "content": "Done."}
+                ],
+                content="Done.",
+                usage={"total_tokens": 5},
+                stop_reason="stop",
+            )
+
+        react_agent.run = run_with_bash
+
+        await bus.inbound("fa2").put(InboundMessage(
+            session_key="fa2", content="run a command", source="test",
+            correlation_id="cid2",
+        ))
+
+        serve_task = asyncio.create_task(orchestrator.serve(bus, "fa2"))
+        final_data = None
+        while serve_task.done() is False:
+            try:
+                msg = await asyncio.wait_for(bus.outbound("test").get(), timeout=0.5)
+                if msg is None:
+                    break
+                if msg.msg_type == "final":
+                    final_data = msg.data
+                    break
+            except asyncio.TimeoutError:
+                if final_data is not None:
+                    break
+        await bus.inbound("fa2").put(None)
+        await serve_task
+
+        assert final_data is not None
+        assert final_data.get("file_artifacts", []) == []
+
+    @pytest.mark.asyncio
+    async def test_write_tool_failure_no_file_artifact(self, orchestrator, react_agent):
+        from core.message_bus import InboundMessage, MessageBus
+
+        bus = MessageBus()
+
+        async def run_with_failed_write(spec: AgentInput):
+            if spec.on_tool_execute_end:
+                await spec.on_tool_execute_end({
+                    "name": "write",
+                    "status": "error",
+                    "detail": "Permission denied",
+                })
+            return AgentOutput(
+                messages=list(spec.init_messages) + [
+                    {"role": "assistant", "content": "Failed."}
+                ],
+                content="Failed.",
+                usage={"total_tokens": 5},
+                stop_reason="stop",
+            )
+
+        react_agent.run = run_with_failed_write
+
+        await bus.inbound("fa3").put(InboundMessage(
+            session_key="fa3", content="write protected file", source="test",
+            correlation_id="cid3",
+        ))
+
+        serve_task = asyncio.create_task(orchestrator.serve(bus, "fa3"))
+        final_data = None
+        while serve_task.done() is False:
+            try:
+                msg = await asyncio.wait_for(bus.outbound("test").get(), timeout=0.5)
+                if msg is None:
+                    break
+                if msg.msg_type == "final":
+                    final_data = msg.data
+                    break
+            except asyncio.TimeoutError:
+                if final_data is not None:
+                    break
+        await bus.inbound("fa3").put(None)
+        await serve_task
+
+        assert final_data is not None
+        assert final_data.get("file_artifacts", []) == []
+
+    @pytest.mark.asyncio
+    async def test_multiple_file_artifacts_sorted(self, orchestrator, react_agent):
+        from core.message_bus import InboundMessage, MessageBus
+
+        bus = MessageBus()
+
+        async def run_with_multi_write(spec: AgentInput):
+            if spec.on_tool_execute_end:
+                await spec.on_tool_execute_end({
+                    "name": "write",
+                    "status": "success",
+                    "detail": "Wrote 200 bytes to '/tmp/zzz.txt'",
+                })
+                await spec.on_tool_execute_end({
+                    "name": "write",
+                    "status": "success",
+                    "detail": "Wrote 100 bytes to '/tmp/aaa.txt'",
+                })
+            return AgentOutput(
+                messages=list(spec.init_messages) + [
+                    {"role": "assistant", "content": "Files written."}
+                ],
+                content="Files written.",
+                usage={"total_tokens": 20},
+                stop_reason="stop",
+            )
+
+        react_agent.run = run_with_multi_write
+
+        await bus.inbound("fa4").put(InboundMessage(
+            session_key="fa4", content="write multiple files", source="test",
+            correlation_id="cid4",
+        ))
+
+        serve_task = asyncio.create_task(orchestrator.serve(bus, "fa4"))
+        final_data = None
+        while serve_task.done() is False:
+            try:
+                msg = await asyncio.wait_for(bus.outbound("test").get(), timeout=0.5)
+                if msg is None:
+                    break
+                if msg.msg_type == "final":
+                    final_data = msg.data
+                    break
+            except asyncio.TimeoutError:
+                if final_data is not None:
+                    break
+        await bus.inbound("fa4").put(None)
+        await serve_task
+
+        assert final_data is not None
+        artifacts = final_data.get("file_artifacts", [])
+        assert artifacts == ["/tmp/aaa.txt", "/tmp/zzz.txt"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_write_detail_no_crash(self, orchestrator, react_agent):
+        from core.message_bus import InboundMessage, MessageBus
+
+        bus = MessageBus()
+
+        async def run_with_bad_detail(spec: AgentInput):
+            if spec.on_tool_execute_end:
+                await spec.on_tool_execute_end({
+                    "name": "write",
+                    "status": "success",
+                    "detail": "something unexpected",
+                })
+            return AgentOutput(
+                messages=list(spec.init_messages) + [
+                    {"role": "assistant", "content": "OK."}
+                ],
+                content="OK.",
+                usage={"total_tokens": 5},
+                stop_reason="stop",
+            )
+
+        react_agent.run = run_with_bad_detail
+
+        await bus.inbound("fa5").put(InboundMessage(
+            session_key="fa5", content="write something", source="test",
+            correlation_id="cid5",
+        ))
+
+        serve_task = asyncio.create_task(orchestrator.serve(bus, "fa5"))
+        final_data = None
+        while serve_task.done() is False:
+            try:
+                msg = await asyncio.wait_for(bus.outbound("test").get(), timeout=0.5)
+                if msg is None:
+                    break
+                if msg.msg_type == "final":
+                    final_data = msg.data
+                    break
+            except asyncio.TimeoutError:
+                if final_data is not None:
+                    break
+        await bus.inbound("fa5").put(None)
+        await serve_task
+
+        assert final_data is not None
+        assert final_data.get("file_artifacts", []) == []

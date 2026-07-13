@@ -92,6 +92,20 @@ class HitlService:
         """Snapshot of all currently pending requests."""
         return dict(self._pending)
 
+    def get_pending_requests(self) -> list[dict[str, Any]]:
+        """Return all pending requests as serializable dicts for cross-process bridge."""
+        return [
+            {
+                "request_id": req.request_id,
+                "session_key": req.session_key,
+                "tool_name": req.tool_name,
+                "arguments": req.arguments,
+                "capabilities": list(req.capabilities),
+            }
+            for req in self._pending.values()
+            if not req.future.done()
+        ]
+
     async def request_confirmation(
         self,
         session_key: str,
@@ -130,7 +144,10 @@ class HitlService:
                 )
 
         try:
-            result = await asyncio.wait_for(req.future, timeout=self._timeout)
+            if self._timeout <= 0:
+                result = await req.future
+            else:
+                result = await asyncio.wait_for(req.future, timeout=self._timeout)
             return result
         except asyncio.TimeoutError:
             logger.warning("HITL request {!r} timed out after {}s", req.request_id, self._timeout)
