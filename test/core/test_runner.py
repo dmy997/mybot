@@ -331,7 +331,7 @@ class TestAgentCoreMaxIterations:
         ))
 
         assert result.stop_reason == "max_iterations"
-        assert "maximum iterations" in result.content
+        assert "最大执行轮次" in result.content
 
     @pytest.mark.asyncio
     async def test_stops_before_max_when_done(self, provider, tools):

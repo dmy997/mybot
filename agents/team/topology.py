@@ -111,7 +111,7 @@ class OrchestratorWorkers:
             if _p:
                 await _p(f"🔎 正在检查研究缺口（第 {rnd} 轮）...")
             gap_subtasks = await self._detect_gaps(
-                topic, full_report, blueprint, parent_tools
+                topic, full_report, all_subtasks, blueprint, parent_tools
             )
             if not gap_subtasks:
                 break
@@ -204,27 +204,41 @@ class OrchestratorWorkers:
         self,
         topic: str,
         report: str,
+        subtasks: list[str],
         blueprint: TeamBlueprint,
         parent_tools: ToolRegistry,
     ) -> list[str]:
         """Ask the lead to identify remaining coverage gaps from the report.
+
+        Now also receives the original subtask list so the lead can
+        check each subtask against the report for completeness.
 
         Returns a (possibly empty) list of gap-filling subtask strings.
         """
         from core.runner import AgentInput
 
         lead_tools = self._select_tools(parent_tools, ("websearch", "webfetch"))
+        subtask_checklist = "\n".join(
+            f"{i}. {s}" for i, s in enumerate(subtasks, start=1)
+        )
+
+        _GAP_DETECT_PROMPT = (
+            "你是研究质量审核员。你的任务是逐项核对原始子任务清单，"
+            "检查每项子任务在报告中是否得到了充分回答。"
+            "重点关注：是否遗漏了某个实体、某个维度、或缺少关键数据。"
+            "只输出确实存在信息缺口的补充子任务，最多 3 个。"
+        )
+
         messages = [
-            {"role": "system", "content": blueprint.lead_prompt},
+            {"role": "system", "content": _GAP_DETECT_PROMPT},
             {
                 "role": "user",
                 "content": (
                     f"研究主题：{topic}\n\n"
-                    f"以下是一份初步研究报告：\n\n{report[:3000]}\n\n"
-                    "请对照原始研究主题，检查报告中是否存在明显的信息缺口"
-                    "（如遗漏了某个实体、某个维度、或缺少关键数据）。"
-                    "如有缺口，请将其分解为最多 3 个补充研究子任务，"
-                    "输出一个 JSON 字符串数组。"
+                    f"原始子任务清单（共 {len(subtasks)} 项）：\n{subtask_checklist}\n\n"
+                    f"初步研究报告（前 5000 字）：\n\n{report[:5000]}\n\n"
+                    "请逐项核对以上子任务在报告中的覆盖情况。"
+                    "如有缺口，输出最多 3 个补充研究子任务的 JSON 字符串数组。"
                     "如果没有明显缺口，输出一个空数组 []。"
                 ),
             },
