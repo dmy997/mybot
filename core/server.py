@@ -30,7 +30,7 @@ from config import Config
 from loguru import logger
 
 from observability.metrics import REGISTRY
-from observability.persistence import store as _obs_store
+import observability.persistence as _obs_persistence
 from observability.recent import recent
 
 from .message_bus import InboundMessage, MessageBus, OutboundMessage
@@ -181,12 +181,12 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         """Merge recent in-memory log events with persisted session data."""
         items = recent.get_logs(min(limit, 500))
 
-        if session_key and _obs_store is not None:
+        if session_key and _obs_persistence.store is not None:
             recent_matches = sum(
                 1 for e in items if e.get("data", {}).get("session_key") == session_key  # type: ignore[union-attr]
             )
             if recent_matches < limit:
-                persisted = _obs_store.load_events(session_key, limit)
+                persisted = _obs_persistence.store.load_events(session_key, limit)
                 recent_keys = {
                     (e.get("timestamp"), e.get("event_type"))  # type: ignore[union-attr]
                     for e in items
@@ -196,8 +196,8 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                     if key not in recent_keys:
                         items.append(evt)
                         recent_keys.add(key)
-        elif not session_key and _obs_store is not None:
-            persisted = _obs_store.load_all_events(limit)
+        elif not session_key and _obs_persistence.store is not None:
+            persisted = _obs_persistence.store.load_all_events(limit)
             recent_keys = {
                 (e.get("timestamp"), e.get("event_type"))
                 for e in items
@@ -214,16 +214,16 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         """Merge recent in-memory spans with persisted session data."""
         spans: list[dict[str, object]] = list(recent.get_spans(min(limit, 200)))
 
-        if session_key and _obs_store is not None:
+        if session_key and _obs_persistence.store is not None:
             recent_span_ids = {s.get("span_id") for s in spans}
-            persisted = _obs_store.load_spans(session_key, limit)
+            persisted = _obs_persistence.store.load_spans(session_key, limit)
             for s in persisted:
                 if s.get("span_id") not in recent_span_ids:
                     spans.append(s)
                     recent_span_ids.add(s.get("span_id"))
-        elif not session_key and _obs_store is not None:
+        elif not session_key and _obs_persistence.store is not None:
             recent_span_ids = {s.get("span_id") for s in spans}
-            persisted = _obs_store.load_all_spans(limit * 3)
+            persisted = _obs_persistence.store.load_all_spans(limit * 3)
             for s in persisted:
                 if s.get("span_id") not in recent_span_ids:
                     spans.append(s)
@@ -258,9 +258,9 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
 
     async def sessions_obs_endpoint(request: Request) -> JSONResponse:  # noqa: ARG001
         """Return list of sessions that have observability data."""
-        if _obs_store is None:
+        if _obs_persistence.store is None:
             return JSONResponse([])
-        return JSONResponse(_obs_store.list_sessions())
+        return JSONResponse(_obs_persistence.store.list_sessions())
 
     async def chat_sse(request: Request) -> JSONResponse | StreamingResponse:
         if not _check_auth(request):
@@ -768,17 +768,16 @@ def main() -> None:
             await orchestrator.start_services()
 
             # Startup: clean stale observability files
-            from observability.persistence import store as obs_store
-            if obs_store is not None:
-                removed = obs_store.cleanup_stale_files()
+            if _obs_persistence.store is not None:
+                removed = _obs_persistence.store.cleanup_stale_files()
                 if removed:
                     logger.info("Cleaned up {} stale observability files on startup", removed)
 
             async def _periodic_obs_cleanup(interval: int = 3600) -> None:
                 while True:
                     await asyncio.sleep(interval)
-                    if obs_store is not None:
-                        removed = obs_store.cleanup_stale_files()
+                    if _obs_persistence.store is not None:
+                        removed = _obs_persistence.store.cleanup_stale_files()
                         if removed:
                             logger.debug("Periodic obs cleanup removed {} files", removed)
 
