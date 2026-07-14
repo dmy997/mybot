@@ -77,11 +77,10 @@ input { font-family: inherit; }
 #new-session-btn:hover { background: var(--accent-hover); }
 
 /* Main */
-#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 
-/* Chat view */
+/* Chat view — always rendered, never display:none (preserves streaming DOM) */
 #chat-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-#chat-view.hidden { display: none; }
 #chat-header {
   padding: 12px 20px; border-bottom: 1px solid var(--border);
   font-size: 14px; color: var(--text-muted);
@@ -187,8 +186,11 @@ input { font-family: inherit; }
 }
 #input-area.drop-active { outline: 2px dashed var(--accent); border-radius: 12px; }
 
-/* Observability view */
-#observability-view { flex: 1; display: none; flex-direction: column; min-height: 0; }
+/* Observability view — absolute overlay on top of chat, never toggles display */
+#observability-view {
+  position: absolute; inset: 0; z-index: 10; background: var(--bg);
+  display: none; flex-direction: column; min-height: 0;
+}
 #observability-view.active { display: flex; }
 #obs-header {
   padding: 12px 20px; border-bottom: 1px solid var(--border);
@@ -787,7 +789,6 @@ function setGoal(text) {
 // View switching
 // =========================================================================
 function switchView(view) {
-  const chatView = document.getElementById('chat-view');
   const obsView = document.getElementById('observability-view');
   const navBtns = document.querySelectorAll('#sidebar-nav button');
 
@@ -795,12 +796,10 @@ function switchView(view) {
 
   if (view === 'chat') {
     activeObsView = null;
-    chatView.classList.remove('hidden');
     obsView.classList.remove('active');
     navBtns.forEach(b => b.classList.remove('active'));
   } else {
     activeObsView = view;
-    chatView.classList.add('hidden');
     obsView.classList.add('active');
     document.getElementById('obs-title').textContent =
       (view === 'metrics' ? 'Metrics' : view === 'logs' ? 'Log' : 'Trace')

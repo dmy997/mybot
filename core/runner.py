@@ -377,6 +377,11 @@ class AgentCore:
                 # Compact context before LLM call (via CompactionService or lightweight fallback)
                 compacted = self._compact_for_llm(messages, tool_defs)
 
+                # Inject progress hint so the LLM can pace itself
+                _hint = self._progress_hint(step_count, self.max_iterations)
+                if _hint:
+                    compacted = list(compacted) + [{"role": "system", "content": _hint}]
+
                 # LLM call (wrapped by middleware when present)
                 if mw:
                     ctx.messages = compacted
@@ -477,15 +482,71 @@ class AgentCore:
                 return output
 
             # --- exhausted iteration budget ---
+            # Best-effort: ask the LLM to summarise what it already gathered
+            # so the user gets useful output instead of a dead-end error.
+            if tools_used:
+                try:
+                    with tracer.span("agent.summarize_on_max_iterations"):
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "你已达到最大执行轮次。请基于目前为止收集到的所有信息，"
+                                "生成一份尽可能完整的最终回答。不要提及迭代次数或执行限制"
+                                "——只需尽最大努力回答用户的原始请求。"
+                            ),
+                        })
+                        summary_resp = await self._call_llm(
+                            spec, messages, None,  # None → no tools
+                            recovery_attempt=False, step_count=step_count,
+                        )
+                        if summary_resp.content:
+                            messages.append({
+                                "role": "assistant",
+                                "content": summary_resp.content,
+                            })
+                            for k, v in (summary_resp.usage or {}).items():
+                                total_usage[k] = total_usage.get(k, 0) + v
+                            output = AgentOutput(
+                                messages=messages,
+                                tools_used=tools_used,
+                                content=summary_resp.content,
+                                usage=total_usage,
+                                stop_reason="max_iterations",
+                                tool_events=tool_events,
+                            )
+                            if mw:
+                                await mw.run_agent_end(ctx, output)
+                            await bus.publish(AgentCompleted(
+                                session_key=spec.session_key,
+                                paradigm=spec.paradigm, steps=step_count,
+                                stop_reason="max_iterations",
+                            ))
+                            if _cp_enabled:
+                                self._delete_checkpoint(spec)
+                            return output
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "Summarisation on max_iterations failed, falling back"
+                    )
+
             await bus.publish(AgentStallWarning(
                 session_key=spec.session_key, step_count=step_count,
             ))
             output = AgentOutput(
                 messages=messages,
                 tools_used=tools_used,
-                content="Agent stopped: maximum iterations reached.",
+                content=(
+                    "抱歉，Agent 已达到最大执行轮次限制。"
+                    if tools_used
+                    else "Agent stopped: maximum iterations reached."
+                ),
                 usage=total_usage,
                 stop_reason="max_iterations",
+                error=(
+                    "Agent 执行轮次过多，建议简化问题或分解为更小的子任务"
+                    if tools_used
+                    else None
+                ),
                 tool_events=tool_events,
             )
             if mw:
@@ -616,6 +677,37 @@ class AgentCore:
                 logger.debug("Deleted checkpoint {!s}", path)
         except OSError:
             logger.opt(exception=True).warning("Failed to delete checkpoint {!s}", path)
+
+    # -- progress hint ---------------------------------------------------------
+
+    @staticmethod
+    def _progress_hint(step: int, max_iterations: int) -> str | None:
+        """Return a system hint so the LLM can pace itself across iterations.
+
+        Early steps receive a lightweight counter; late steps receive urgency
+        nudges that escalate as the budget shrinks.
+        """
+        remaining = max_iterations - step
+        if remaining > 8:
+            return None  # plenty of room — no hint needed
+        if remaining > 5:
+            return f"[执行进度] 第 {step}/{max_iterations} 步，剩余 {remaining} 轮。"
+        if remaining > 3:
+            return (
+                f"[执行进度] 第 {step}/{max_iterations} 步，剩余 {remaining} 轮。"
+                f" 请开始整合已获取的信息，优先给出结论而非继续展开新搜索。"
+            )
+        if remaining > 1:
+            return (
+                f"[执行进度 ⚠️] 只剩余 {remaining} 轮！"
+                f" 请在下一轮或本轮给出最终回答，不要再发起新的工具调用，"
+                f" 除非当前信息完全不足以回答用户问题。"
+            )
+        return (
+            f"[执行进度 🚨 最后一轮] 本轮是最后一次执行机会。"
+            f" 必须立即整合所有已收集信息，生成完整的最终回答。"
+            f" 绝对不要发起任何工具调用。"
+        )
 
     # -- helpers ---------------------------------------------------------------
 

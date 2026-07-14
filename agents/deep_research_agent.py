@@ -64,9 +64,17 @@ class DeepResearchAgent(BaseAgent):
 
         logger.info("DeepResearch starting: topic={!r}", topic[:120])
 
+        async def _progress(msg: str) -> None:
+            if spec.on_content_delta:
+                await spec.on_content_delta(msg + "\n\n")
+
+        await _progress(f"🔬 **DeepResearch 启动**：{topic[:100]}")
+
         runner = SubAgentRunner(self.core.provider, workspace=self._workspace_root())
         topo = OrchestratorWorkers(self.core, runner)
-        team = await topo.execute(topic, DEEP_RESEARCH, spec.tools)
+        team = await topo.execute(
+            topic, DEEP_RESEARCH, spec.tools, on_progress=_progress,
+        )
 
         if team.error and not team.full_report:
             return self._fail(spec, team.error)

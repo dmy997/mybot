@@ -582,13 +582,9 @@ class OpenAICompatibleProvider(LLMProvider):
             llm_response = self._parse(response)
             llm_response.latency_s = time.time() - start
             return llm_response
-        except Exception as e:
-            logger.opt(exception=True).warning("chat() failed: {}", e)
-            return LLMResponse(
-                content=f"OpenAI API error: {e}",
-                finish_reason="error",
-                latency_s=time.time() - start
-            )
+        except Exception:
+            logger.opt(exception=True).warning("chat() failed in {:.2f}s", time.time() - start)
+            raise
 
 
     async def chat_stream(
@@ -668,13 +664,9 @@ class OpenAICompatibleProvider(LLMProvider):
             llm_response = self._parse_chunks(chunks)
             llm_response.latency_s = time.time() - start
             return llm_response
-        except Exception as e:
-            return LLMResponse(
-                content=f"OpenAI API streaming error: {e}",
-                # error=self._handle_error(e),
-                latency_s=time.time() - start,
-                finish_reason="error",
-            )
+        except Exception:
+            logger.opt(exception=True).warning("chat_stream() failed in {:.2f}s", time.time() - start)
+            raise
 
 
 if __name__ == "__main__":

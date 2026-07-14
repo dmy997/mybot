@@ -68,6 +68,8 @@ class OrchestratorWorkers:
         topic: str,
         blueprint: TeamBlueprint,
         parent_tools: ToolRegistry,
+        *,
+        on_progress: "Any | None" = None,
     ) -> TeamResult:
         """Run the full topology for *topic* under *blueprint*.
 
@@ -75,7 +77,11 @@ class OrchestratorWorkers:
         if the report identifies coverage gaps, the lead spawns a second
         (smaller) wave of workers to fill them, up to *max_rounds*.
         """
+        _p = on_progress
+
         # -- Round 1: decompose → fan-out → synthesize --------------------------
+        if _p:
+            await _p(f"🔍 正在分解研究主题：{topic[:80]}...")
         subtasks = await self._decompose(topic, blueprint, parent_tools)
         if not subtasks:
             return TeamResult(
@@ -83,6 +89,8 @@ class OrchestratorWorkers:
                 summary="",
                 error="lead 未能将主题分解为子任务",
             )
+        if _p:
+            await _p(f"✅ 已分解为 {len(subtasks)} 个子任务，开始并行调研...")
 
         worker_tools = self._select_tools(parent_tools, blueprint.worker.tool_names)
         all_results: list[SubAgentResult] = []
@@ -90,6 +98,9 @@ class OrchestratorWorkers:
 
         results = await self._run_fan_out(subtasks, blueprint, worker_tools)
         all_results.extend(results)
+        ok = sum(1 for r in results if r.success)
+        if _p:
+            await _p(f"📊 第一轮调研完成：{ok}/{len(results)} 个子任务成功，正在综合分析...")
 
         full_report, summary = await self._synthesize(
             topic, subtasks, results, blueprint
@@ -97,6 +108,8 @@ class OrchestratorWorkers:
 
         # -- Refinement round(s): gap detection → extra workers → re-synthesize --
         for rnd in range(2, blueprint.max_rounds + 1):
+            if _p:
+                await _p(f"🔎 正在检查研究缺口（第 {rnd} 轮）...")
             gap_subtasks = await self._detect_gaps(
                 topic, full_report, blueprint, parent_tools
             )
@@ -109,11 +122,15 @@ class OrchestratorWorkers:
                 "Team '{}' round {}: {} gap-filling subtasks",
                 blueprint.name, rnd, len(gap_subtasks),
             )
+            if _p:
+                await _p(f"📝 发现 {len(gap_subtasks)} 个缺口，启动补充调研...")
 
             extra = await self._run_fan_out(gap_subtasks, blueprint, worker_tools)
             all_results.extend(extra)
             all_subtasks.extend(gap_subtasks)
 
+            if _p:
+                await _p(f"📊 第 {rnd} 轮完成，正在重新综合...")
             full_report, summary = await self._synthesize(
                 topic, all_subtasks, all_results, blueprint
             )
@@ -238,16 +255,79 @@ class OrchestratorWorkers:
                 "content": f"研究主题：{topic}\n\n各子任务的调研发现：\n\n{findings}",
             },
         ]
-        out = await self.core.run(
-            AgentInput(
-                init_messages=messages,
-                tools=ToolRegistry(),
-                model=blueprint.synthesis_model,
+
+        # Attempt synthesis; retry once on failure
+        for attempt in range(2):
+            out = await self.core.run(
+                AgentInput(
+                    init_messages=messages,
+                    tools=ToolRegistry(),
+                    model=blueprint.synthesis_model,
+                )
             )
-        )
-        return self._split_report(out.content or "")
+            if not out.error and out.content:
+                report, summary = self._split_report(out.content)
+                if report and report != out.content:
+                    return report, summary
+                if len(out.content) > 200:
+                    return report, summary
+
+            if attempt == 0:
+                logger.warning(
+                    "Synthesis attempt {} failed ({}), retrying...",
+                    attempt + 1, out.error or "empty content",
+                )
+
+        # Both attempts failed — build a fallback report from raw findings
+        logger.warning("Synthesis failed after 2 attempts, building fallback report")
+        return self._fallback_report(topic, subtasks, results)
 
     # -- helpers --------------------------------------------------------------
+
+    @staticmethod
+    def _fallback_report(
+        topic: str,
+        subtasks: list[str],
+        results: list[SubAgentResult],
+    ) -> tuple[str, str]:
+        """Build a raw concatenated report when the synthesis LLM call fails.
+
+        Returns (full_report, summary) directly from worker outputs so no
+        research data is lost even when the synthesis model is unreachable.
+        """
+        ok_results = [r for r in results if r.success]
+        failed = len(results) - len(ok_results)
+
+        parts = [
+            f"# {topic}",
+            "",
+            f"> 综合阶段 LLM 调用失败，以下为各子任务的原始调研结果。",
+            f"> {len(ok_results)}/{len(results)} 个子任务成功"
+            + (f"，{failed} 个失败" if failed else "") + "。",
+            "",
+        ]
+
+        for i, (task, res) in enumerate(zip(subtasks, results), start=1):
+            status = "成功" if res.success else f"失败: {res.error}"
+            parts.append(f"## 子任务 {i}: {task}")
+            parts.append(f"*状态: {status}*")
+            parts.append("")
+            if res.content:
+                parts.append(res.content)
+            elif res.error:
+                parts.append(f"错误: {res.error}")
+            parts.append("")
+
+        report = "\n".join(parts)
+        # Summary: first 500 chars from successful workers
+        first_content = next(
+            (r.content for r in ok_results if len(r.content) > 100), ""
+        )
+        summary = (
+            f"[综合失败] {len(ok_results)}/{len(results)} 个子任务成功。"
+            + (f" 首个结果预览: {first_content[:300]}..." if first_content else "")
+        )
+        return report, summary
 
     @staticmethod
     def _select_tools(parent: ToolRegistry, names: tuple[str, ...]) -> ToolRegistry:

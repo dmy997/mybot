@@ -646,19 +646,17 @@ class TestChat:
 
     @pytest.mark.asyncio
     async def test_error_handling(self, provider):
+        """chat() propagates exceptions so the retry layer can classify and retry."""
         provider._build_chat_completion_body = MagicMock(return_value={"model": "gpt-4o", "messages": []})
         provider._build_client = MagicMock()
-        provider._handle_error = MagicMock(return_value={"code": 500})
         provider._client = MagicMock()
-        # Use MagicMock (not AsyncMock) — chat() does not await create()
         provider._client.chat.completions.create = MagicMock(side_effect=RuntimeError("API down"))
 
-        result = await provider.chat(
-            messages=[{"role": "user", "content": "hi"}],
-            tools=[],
-        )
-        assert "API down" in result.content
-        assert result.latency_s >= 0
+        with pytest.raises(RuntimeError, match="API down"):
+            await provider.chat(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -759,19 +757,17 @@ class TestChatStream:
 
     @pytest.mark.asyncio
     async def test_error_handling(self, provider):
+        """chat_stream() propagates exceptions so the retry layer can classify and retry."""
         provider._build_chat_completion_body = MagicMock(return_value={"model": "gpt-4o", "messages": []})
         provider._build_client = MagicMock()
-        provider._handle_error = MagicMock(return_value={"code": 500})
         provider._client = MagicMock()
         provider._client.chat.completions.create = AsyncMock(side_effect=RuntimeError("stream failed"))
 
-        result = await provider.chat_stream(
-            messages=[{"role": "user", "content": "hi"}],
-            tools=[],
-        )
-        assert "stream failed" in result.content
-        assert result.finish_reason == "error"
-        assert result.latency_s >= 0
+        with pytest.raises(RuntimeError, match="stream failed"):
+            await provider.chat_stream(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+            )
 
     @pytest.mark.asyncio
     async def test_stream_options_include_usage(self, provider):
