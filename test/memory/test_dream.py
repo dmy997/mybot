@@ -210,15 +210,17 @@ class TestBatchCap:
 class TestParseDirectives:
     def test_parse_file_add(self, dream):
         text = "[FILE] SOUL.md: Speak Chinese"
-        adds, removes = dream._parse_directives(text)
+        adds, removes, skills = dream._parse_directives(text)
         assert adds == [("SOUL", "Speak Chinese")]
         assert removes == []
+        assert skills == []
 
     def test_parse_file_remove(self, dream):
         text = "[FILE-REMOVE] MEMORY.md: Old database fact"
-        adds, removes = dream._parse_directives(text)
+        adds, removes, skills = dream._parse_directives(text)
         assert adds == []
         assert removes == [("MEMORY", "Old database fact")]
+        assert skills == []
 
     def test_parse_mixed(self, dream):
         text = (
@@ -226,36 +228,66 @@ class TestParseDirectives:
             "[FILE] MEMORY.md: Project uses Redis\n"
             "[FILE-REMOVE] USER.md: Lives in Beijing\n"
         )
-        adds, removes = dream._parse_directives(text)
+        adds, removes, skills = dream._parse_directives(text)
         assert len(adds) == 2
         assert len(removes) == 1
+        assert len(skills) == 0
         assert adds[0] == ("USER", "Lives in Shanghai")
         assert adds[1] == ("MEMORY", "Project uses Redis")
         assert removes[0] == ("USER", "Lives in Beijing")
 
     def test_parse_skip(self, dream):
-        adds, removes = dream._parse_directives("[SKIP]")
+        adds, removes, skills = dream._parse_directives("[SKIP]")
         assert adds == []
         assert removes == []
+        assert skills == []
 
     def test_parse_skip_with_newlines(self, dream):
-        adds, removes = dream._parse_directives("[SKIP]\n")
+        adds, removes, skills = dream._parse_directives("[SKIP]\n")
         assert adds == []
+        assert skills == []
 
     def test_parse_unparseable_skipped(self, dream):
         """Garbage lines are ignored without crashing."""
-        adds, removes = dream._parse_directives(
+        adds, removes, skills = dream._parse_directives(
             "Here is what I found:\n[FILE] USER.md: Real fact\nSome random text\n"
         )
         assert len(adds) == 1
         assert adds[0] == ("USER", "Real fact")
+        assert skills == []
 
     def test_normalize_filenames(self, dream):
         """SOUL.md / SOUL are both accepted."""
-        a1, _ = dream._parse_directives("[FILE] SOUL.md: fact a")
-        a2, _ = dream._parse_directives("[FILE] SOUL: fact b")
+        a1, _, _ = dream._parse_directives("[FILE] SOUL.md: fact a")
+        a2, _, _ = dream._parse_directives("[FILE] SOUL: fact b")
         assert a1[0][0] == "SOUL"
         assert a2[0][0] == "SOUL"
+
+    def test_parse_skill(self, dream):
+        """[SKILL] directive is parsed into the skills list."""
+        adds, removes, skills = dream._parse_directives(
+            "[SKILL] daily-standup: Generate a daily standup report"
+        )
+        assert adds == []
+        assert removes == []
+        assert skills == [("daily-standup", "Generate a daily standup report")]
+
+    def test_parse_skill_mixed_with_file(self, dream):
+        """[SKILL] works alongside FILE directives."""
+        adds, removes, skills = dream._parse_directives(
+            "[FILE] MEMORY.md: User runs standup every morning\n"
+            "[SKILL] daily-standup: Generate a daily standup report"
+        )
+        assert len(adds) == 1
+        assert adds[0] == ("MEMORY", "User runs standup every morning")
+        assert skills == [("daily-standup", "Generate a daily standup report")]
+
+    def test_parse_skill_bad_name_skipped(self, dream):
+        """Non-kebab-case skill names are ignored by the regex."""
+        adds, removes, skills = dream._parse_directives(
+            "[SKILL] Bad Name: description"
+        )
+        assert skills == []
 
 
 # ---------------------------------------------------------------------------

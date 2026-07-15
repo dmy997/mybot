@@ -37,6 +37,10 @@ _DIRECTIVE_RE = re.compile(
     r"\s+(SOUL\.md|USER\.md|MEMORY\.md)\s*:\s*(.+)$",
 )
 
+_SKILL_RE = re.compile(
+    r"^\[SKILL\]\s+([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\s*:\s*(.+)$",
+)
+
 
 class Dream:
     """Periodic LLM-driven memory consolidation for SOUL.md, USER.md, MEMORY.md.
@@ -106,9 +110,12 @@ class Dream:
             len(new_entries), dream_cursor,
         )
 
+        existing_skills = self._list_existing_skills()
+
         try:
             directives = await self._call_llm(
                 soul, user, current_memory, new_entries,
+                existing_skills=existing_skills,
             )
         except Exception:
             logger.exception("Dream Phase 1 LLM call failed")
@@ -120,8 +127,8 @@ class Dream:
             return False
 
         # 4. Phase 2 — apply directives
-        adds, removes = self._parse_directives(directives)
-        if not adds and not removes:
+        adds, removes, skills = self._parse_directives(directives)
+        if not adds and not removes and not skills:
             logger.debug("Dream: no valid directives parsed")
             self._advance_cursor(new_entries)
             return False
@@ -129,14 +136,15 @@ class Dream:
         changed = False
         changed |= self._apply_adds(adds)
         changed |= self._apply_removes(removes)
+        changed |= self._apply_skills(skills)
 
         # 5. Advance cursor and record dream date
         self.store.set_dream_date(today)
         if changed:
             self._advance_cursor(new_entries)
             logger.info(
-                "Dream: applied {} add(s), {} remove(s) across SOUL/USER/MEMORY",
-                len(adds), len(removes),
+                "Dream: applied {} add(s), {} remove(s), {} skill(s)",
+                len(adds), len(removes), len(skills),
             )
         else:
             self._advance_cursor(new_entries)
@@ -152,6 +160,7 @@ class Dream:
         user: str,
         current_memory: str,
         new_entries: list[dict],
+        existing_skills: str = "",
     ) -> str | None:
         """Call the LLM and return the raw directive text."""
         formatted_entries = self._format_entries(new_entries)
@@ -174,6 +183,7 @@ class Dream:
                         user=user or "(empty)",
                         current_memory=current_memory or "(empty — no long-term memories yet)",
                         new_entries=formatted_entries,
+                        existing_skills=existing_skills or "(none)",
                         strip=False,
                     ),
                 },
@@ -192,14 +202,16 @@ class Dream:
     # -- Phase 2 (parse + apply) ----------------------------------------------
 
     @staticmethod
-    def _parse_directives(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-        """Parse LLM output into (adds, removes).
+    def _parse_directives(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
+        """Parse LLM output into (adds, removes, skills).
 
-        Each directive is ``(file_key, content)`` where *file_key* is one
+        Each add/remove is ``(file_key, content)`` where *file_key* is one
         of ``"SOUL"``, ``"USER"``, ``"MEMORY"``.
+        Each skill is ``(skill_name, description)``.
         """
         adds: list[tuple[str, str]] = []
         removes: list[tuple[str, str]] = []
+        skills: list[tuple[str, str]] = []
 
         # Normalise file names: "SOUL.md" / "SOUL" → "SOUL"
         _file_key = {"SOUL.md": "SOUL", "USER.md": "USER", "MEMORY.md": "MEMORY"}
@@ -209,6 +221,17 @@ class Dream:
             if not line:
                 continue
             if line.upper() == "[SKIP]":
+                continue
+
+            # Try [SKILL] first — different format from FILE/FILE-REMOVE
+            skill_m = _SKILL_RE.match(line)
+            if skill_m:
+                skill_name = skill_m.group(1).strip()
+                skill_desc = skill_m.group(2).strip()
+                if skill_name and skill_desc:
+                    skills.append((skill_name, skill_desc))
+                else:
+                    logger.debug("Dream: unparseable SKILL directive: {!r}", line[:120])
                 continue
 
             m = _DIRECTIVE_RE.match(line)
@@ -244,7 +267,7 @@ class Dream:
             elif directive_kind == "FILE-REMOVE":
                 removes.append((file_key, content))
 
-        return adds, removes
+        return adds, removes, skills
 
     def _apply_adds(self, adds: list[tuple[str, str]]) -> bool:
         """Append facts to the target files.  Returns True if any file changed.
@@ -343,7 +366,69 @@ class Dream:
 
         return None
 
-    # -- age annotations -------------------------------------------------------
+    def _apply_skills(self, skills: list[tuple[str, str]]) -> bool:
+        """Create SKILL.md files for extracted workflow skills.
+
+        Returns True if any skill file was created.
+        """
+        if not skills:
+            return False
+
+        skills_dir = self.store.workspace / "skills"
+        changed = False
+
+        for skill_name, description in skills:
+            skill_dir = skills_dir / skill_name
+            skill_file = skill_dir / "SKILL.md"
+
+            if skill_file.exists():
+                logger.debug(
+                    "Dream: skill {!r} already exists, skipping", skill_name,
+                )
+                continue
+
+            skill_dir.mkdir(parents=True, exist_ok=True)
+
+            body = self._build_skill_body(skill_name, description)
+            tmp = skill_file.with_suffix(".md.tmp")
+            try:
+                tmp.write_text(body, encoding="utf-8")
+                tmp.replace(skill_file)
+                logger.info(
+                    "Dream: created skill {!r}: {!r}", skill_name, description,
+                )
+                changed = True
+            except Exception:
+                logger.exception("Dream: failed to write skill {!r}", skill_name)
+                tmp.unlink(missing_ok=True)
+
+        return changed
+
+    @staticmethod
+    def _build_skill_body(name: str, description: str) -> str:
+        """Build the SKILL.md body with YAML frontmatter."""
+        return f"""---
+name: {name}
+description: {description}
+---
+
+# {name}
+
+{description}
+
+## Workflow
+
+<!-- TODO: Refine the workflow steps based on repeated usage patterns. -->
+
+1. Identify the trigger or input for this task
+2. Execute the core steps specific to {name}
+3. Verify the output and report results
+
+## Notes
+
+This skill was auto-extracted by Dream from repeated conversation patterns.
+Review and refine the workflow steps before relying on it.
+"""
 
     @staticmethod
     def _update_age_annotations(text: str, last_date: str, today: str) -> str | None:
@@ -398,6 +483,24 @@ class Dream:
         self.store.set_dream_cursor(max_cursor)
 
     # -- formatting -----------------------------------------------------------
+
+    def _list_existing_skills(self) -> str:
+        """Return a formatted list of existing skill names for the LLM prompt."""
+        names: set[str] = set(self.store.list_skill_names())
+
+        # Also include builtin skill names so Dream doesn't propose duplicates
+        try:
+            from core.skills import BUILTIN_SKILLS_DIR
+            if BUILTIN_SKILLS_DIR.exists():
+                for skill_dir in BUILTIN_SKILLS_DIR.iterdir():
+                    if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                        names.add(skill_dir.name)
+        except Exception:
+            pass
+
+        if not names:
+            return "(none)"
+        return "\n".join(f"- {name}" for name in sorted(names))
 
     @staticmethod
     def _format_entries(entries: list[dict]) -> str:

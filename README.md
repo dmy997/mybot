@@ -231,7 +231,7 @@ python -m evals --benchmark gaia                                              # 
 - HTTP API + WebSocket + SSE 流式 + Web UI
 - 可插拔中间件链（Agent / LLM / Tool 钩子）
 - EventBus（异步发布/订阅）+ MessageBus（每通道独立出站队列）
-- 13 个内置 Skill
+- 22 个内置 Skill
 - 上下文管理子系统（压缩、修复、空闲自动压缩）
 - 基于文件的长期记忆系统（MemoryStore + Consolidator + Dream 两级管道）
 - 会话历史持久化（基于游标的增量加载）
@@ -242,20 +242,23 @@ python -m evals --benchmark gaia                                              # 
 - 混合搜索 + 时间衰减 — SQLite + sqlite-vec + FTS5，30 天半衰期指数衰减
 - 可扩展频道架构 + 微信 iLink 机器人频道 — BaseChannel ABC，MessageBus 每通道路由
 - 混合搜索可观测性 — 终端和 Web UI 日志视图显示搜索模式
+- 多模态图像输入 — content-part 数组 + Web UI 拖拽粘贴 + 微信 ITEM_IMAGE
+- Chunk 级检索 — 记忆按行/条目分块索引，向量 + FTS5 混合搜索
 
 ### P2 — 质量与可靠性
 
 - ~~**Agent 性能评估系统（第一阶段）**~~ — 9 个自定义 YAML 任务 + 4 个规则评分器 + pytest CI 集成 ✅
 - ~~**Agent 性能评估系统（第二阶段）**~~ — BFCL/GAIA 社区基准、LLM Judge 评分器、CLI 入口 ✅
+- ~~**相关性筛选**~~ — 注入 MEMORY.md 前用混合搜索按当前 query 召回 top_k 相关条目 ✅
 
 ### P3 — 扩展能力
 
-- **多模态输入** — 支持图片、音频等非文本输入，通过 Provider 多模态 API 传入 LLM
+- ~~**多模态输入**~~ — 支持图片等非文本输入 ✅
 - **更多 LLM Provider** — Anthropic 直连、Ollama 本地模型
 - **更多消息频道** — QQ、Telegram、飞书等外部频道接入
-- **Heartbeat 服务** — 周期任务检查，按 HEARTBEAT.md 清单定时执行（参考 nanobot）
-- **Skill 系统增强** — Dream 自动提取重复工作流为可复用 SKILL.md
-- **Chunk 级检索** — 大文件分块存储和检索，减少上下文浪费
+- ~~**Heartbeat 服务**~~ — 周期任务检查，按 HEARTBEAT.md 清单定时执行（参考 nanobot）✅
+- ~~**Skill 系统增强**~~ — Dream 自动提取重复工作流为可复用 SKILL.md ✅
+- ~~**Chunk 级检索**~~ — 大文件分块存储和检索 ✅
 
 ## License
 

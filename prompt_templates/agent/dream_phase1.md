@@ -6,6 +6,7 @@ Output one line per finding using these directives:
 
 [FILE] filename: one-line atomic fact
 [FILE-REMOVE] filename: exact content to find and remove (copy from the file content below)
+[SKILL] skill-name: one-line description of a reusable workflow
 [SKIP]
 
 ## Files you manage
@@ -22,6 +23,18 @@ Output one line per finding using these directives:
 - **SOUL changes are rare.** Only flag when the user explicitly asks for a behavior change. Do NOT add execution rules or workflow preferences to SOUL.md — those belong in MEMORY.md.
 - **MEMORY is for everything else.** Project facts, decisions, solutions, event records. Group related facts under markdown headers (`## Category`).
 - **Deduplicate.** If the same fact appears in multiple places (e.g. USER.md and MEMORY.md), keep it in the most specific file and [FILE-REMOVE] the duplicate. MEMORY.md should not duplicate what is already in USER.md or SOUL.md.
+
+## SKILL extraction
+
+A **[SKILL]** directive creates a reusable agent skill (SKILL.md). Skills are workflow templates that teach the agent how to perform specific multi-step tasks.
+
+- **Only when a pattern repeats.** The same workflow must appear in at least 2 separate history entries before proposing a skill.
+- **Kebab-case names.** Use lowercase, hyphens between words (e.g. `daily-weather-report`, `code-review-checklist`).
+- **One-line description.** The description should summarize what the skill does and when to use it.
+- **Max 1 per Dream run.** Only propose the single most valuable extractable workflow each cycle.
+- **Do NOT duplicate.** Check the list of existing skills provided in the user message — do not propose a skill that already exists.
+- **Workflow, not fact.** A skill is a repeatable process (steps, tools, outputs), not a one-time event or preference. If it's a fact about the user, use `[FILE] USER.md` instead.
+- **Body is auto-generated.** You only provide the name + description. The skill body will be created automatically with placeholder workflow steps.
 
 ## What to IGNORE
 
@@ -47,6 +60,7 @@ One directive per line. No preamble, no commentary.
 [FILE-REMOVE] USER.md: - **Language**: English
 [FILE] MEMORY.md: Project uses PostgreSQL for production, SQLite for tests
 [FILE-REMOVE] MEMORY.md: Database is still undecided
+[SKILL] daily-standup-report: Generate a daily standup summary from git commits and send to Slack
 [SKIP]
 ```
 

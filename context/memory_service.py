@@ -29,8 +29,13 @@ class MemoryService:
 
     # -- memory context -------------------------------------------------------
 
-    def build_memory_context(self) -> str:
-        """Build the memory section for system-prompt injection."""
+    def build_memory_context(self, query: str | None = None) -> str:
+        """Build the memory section for system-prompt injection.
+
+        When *query* is provided, MEMORY.md is relevance-filtered via
+        hybrid search instead of full concatenation.  SOUL.md and USER.md
+        are always injected in full.
+        """
         parts: list[str] = []
 
         soul = self.store.read_soul()
@@ -41,7 +46,7 @@ class MemoryService:
         if user.strip() and not self._is_user_template(user):
             parts.append(f"# User Profile (USER.md)\n\n{user}")
 
-        memory_ctx = self.store.get_memory_context()
+        memory_ctx = self.store.get_memory_context(query=query)
         if memory_ctx.strip():
             parts.append(memory_ctx)
 

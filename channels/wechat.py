@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import json
 import os
 import signal
@@ -146,6 +147,7 @@ class WechatChannel(BaseChannel):
         self._consumer_task: asyncio.Task | None = None
         self._next_poll_timeout_s: int = DEFAULT_LONG_POLL_TIMEOUT_S
         self._session_pause_until: float = 0.0
+        self._session_expired_count: int = 0
 
         # Cursor + dedup
         self._get_updates_buf: str = ""
@@ -155,6 +157,11 @@ class WechatChannel(BaseChannel):
         self._context_tokens: dict[str, str] = {}
         self._chat_ids: dict[str, str] = {}
         self._serve_tasks: dict[str, asyncio.Task] = {}
+
+        def _on_serve_done(session_key: str, _task: asyncio.Task) -> None:
+            self._serve_tasks.pop(session_key, None)
+
+        self._on_serve_done = _on_serve_done
 
         # HITL: pending confirmation chat_id → request_id
         self._pending_hitl: dict[str, str] = {}
@@ -554,6 +561,7 @@ class WechatChannel(BaseChannel):
 
                 await self._poll_once()
                 consecutive_failures = 0
+                self._session_expired_count = 0
             except httpx.TimeoutException:
                 continue
             except Exception:
@@ -582,6 +590,20 @@ class WechatChannel(BaseChannel):
 
         if is_error:
             if errcode == ERRCODE_SESSION_EXPIRED or ret == ERRCODE_SESSION_EXPIRED:
+                self._session_expired_count += 1
+                if self._session_expired_count >= 2:
+                    logger.warning(
+                        "WechatChannel: session expired again after pause — "
+                        "token permanently invalid, triggering re-login"
+                    )
+                    self._token = ""
+                    self._session_expired_count = 0
+                    self._session_pause_until = 0.0
+                    try:
+                        await self._qr_login()
+                    except Exception:
+                        logger.exception("WechatChannel: re-login after token expiry failed")
+                    return
                 self._pause_session()
                 remaining = self._session_pause_remaining_s()
                 logger.warning(
@@ -802,8 +824,12 @@ class WechatChannel(BaseChannel):
         ))
 
         if msg.session_key not in self._serve_tasks:
-            self._serve_tasks[msg.session_key] = asyncio.create_task(
+            task = asyncio.create_task(
                 self._orchestrator.serve(self._bus, msg.session_key)
+            )
+            self._serve_tasks[msg.session_key] = task
+            task.add_done_callback(
+                functools.partial(self._on_serve_done, msg.session_key)
             )
 
     async def _on_hitl_request(self, req: Any) -> None:
@@ -887,8 +913,12 @@ class WechatChannel(BaseChannel):
             correlation_id=task.session_key,
         ))
         if task.session_key not in self._serve_tasks:
-            self._serve_tasks[task.session_key] = asyncio.create_task(
+            stask = asyncio.create_task(
                 self._orchestrator.serve(self._bus, task.session_key)
+            )
+            self._serve_tasks[task.session_key] = stask
+            stask.add_done_callback(
+                functools.partial(self._on_serve_done, task.session_key)
             )
 
     # ------------------------------------------------------------------

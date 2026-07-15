@@ -253,9 +253,9 @@ class ContextManager:
     # Delegation — memory operations (→ MemoryService)
     # ========================================================================
 
-    def _build_memory_context(self) -> str:
+    def _build_memory_context(self, query: str | None = None) -> str:
         """Build the memory section for system-prompt injection."""
-        return self.memory.build_memory_context()
+        return self.memory.build_memory_context(query=query)
 
     def remember(
         self,
@@ -303,7 +303,7 @@ class ContextManager:
 
         mem_key = f"{session_key or 'default'}:{hash(query or '') % 20}"
         if mem_key not in self._memory_cache:
-            self._memory_cache[mem_key] = self._build_memory_context()
+            self._memory_cache[mem_key] = self._build_memory_context(query)
             if len(self._memory_cache) > self._memory_cache_max:
                 oldest = next(iter(self._memory_cache))
                 self._memory_cache.pop(oldest)

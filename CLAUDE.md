@@ -43,7 +43,7 @@ mybot-server           # HTTP/WS server (core.server:main), then open http://127
 - `config/` — `.env` auto-loading, typed `Config` class
 - `utils/` — Jinja2 template rendering (`render_template()`)
 - `prompt_templates/` — 14 agent prompt templates (Jinja2 `.md`)
-- `skills/` — Empty (only `__init__.py`). SkillsLoader works but has no skill directories to load
+- `skills/` — 22 pre-built skill directories (art, pdf, xlsx, xiaohongshu, frontend-design, etc.). SkillsLoader auto-discovers and loads them
 - `server_web/` — Single `index.html` for the browser chat UI
 
 ## Request Flow
@@ -188,8 +188,8 @@ Per-model context window configuration (JSON, follows Claude Code's `~/.claude/s
 
 ## Known Gaps (from README.md roadmap)
 
-- **P2**: ~~Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay~~ (done)
-- **P3**: Multimodal input, more providers (Anthropic direct, Ollama), external chat channels, Heartbeat service, Skill system enhancement, chunk-level retrieval
+- **P2**: ~~Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay, relevance filtering for MEMORY.md injection~~ (done)
+- **P3**: More providers (Anthropic direct, Ollama), external chat channels, ~~Heartbeat service~~ (done), ~~Skill system enhancement~~ (done)
 - See `README.md` Roadmap for the full prioritized list with status markers
 
 ## Memory System Improvement Roadmap
@@ -198,4 +198,4 @@ See `docs/memory-comparison.md` for the full cross-project analysis. Summary:
 
 - **P1 (short-term)**: ~~Dream dedup~~, ~~age annotations (`<- Nd`)~~, ~~session source tracking in history.jsonl~~
 - **P2 (medium-term)**: ~~Hybrid search (SQLite + sqlite-vec + FTS5), temporal decay~~ (done)
-- **P3 (long-term)**: Heartbeat service, Skill system, chunk-level retrieval granularity
+- **P3 (long-term)**: ~~Heartbeat service~~ (done), ~~Skill system auto-extraction from Dream~~ (done)

@@ -18,6 +18,10 @@
 {{ current_memory }}
 ```
 
+## Existing skills (do NOT propose duplicates)
+
+{{ existing_skills }}
+
 ## New conversation summaries since last consolidation
 
 {{ new_entries }}

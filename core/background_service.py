@@ -11,11 +11,13 @@ from pathlib import Path
 
 from memory.dream import Dream
 from services.cron import CronScheduler
+from services.heartbeat import HeartbeatService
 from services.scheduled_tasks import ScheduledTaskService
 
 
 class BackgroundService:
-    """Owns :class:`CronScheduler`, :class:`ScheduledTaskService`, and :class:`Dream`.
+    """Owns :class:`CronScheduler`, :class:`ScheduledTaskService`, :class:`Dream`,
+    and :class:`HeartbeatService`.
 
     Parameters
     ----------
@@ -57,10 +59,19 @@ class BackgroundService:
             run_agent=on_run_agent or _noop,
         )
 
+        self._heartbeat = HeartbeatService(
+            workspace=workspace,
+            run_agent=on_run_agent,
+        )
+        self._heartbeat.ensure_file()
+        self.cron.register_job("heartbeat", interval_hours=0.5)
+
     async def _on_cron_job(self, name: str) -> None:
         """Route cron job *name* to the appropriate handler."""
         if name == "dream":
             await self._dream.run()
+        elif name == "heartbeat":
+            await self._heartbeat.run()
         else:
             await self._scheduled.fire(name)
 

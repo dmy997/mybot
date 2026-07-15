@@ -88,6 +88,18 @@ class MemoryStore:
     def write_user(self, content: str) -> None:
         self._write_file(self._user_file, content)
 
+    # -- skills ---------------------------------------------------------------
+
+    def list_skill_names(self) -> list[str]:
+        """Return skill names from the workspace skills directory."""
+        names: list[str] = []
+        skills_dir = self.workspace / "skills"
+        if skills_dir.exists():
+            for skill_dir in skills_dir.iterdir():
+                if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                    names.append(skill_dir.name)
+        return names
+
     # ==========================================================================
     # MEMORY.md — long-term knowledge file (full-text, edited by Dream)
     # ==========================================================================
@@ -111,14 +123,26 @@ class MemoryStore:
             except Exception:
                 logger.debug("Hybrid store index_memory failed", exc_info=True)
 
-    def get_memory_context(self) -> str:
+    def get_memory_context(self, query: str | None = None, top_k: int = 15) -> str:
         """Return MEMORY.md content formatted for system-prompt injection.
 
-        Returns empty string if the file is still a template placeholder.
+        When *query* is provided and hybrid search is available, only injects
+        the top *top_k* chunks relevant to the query.  Falls back to full
+        concatenation when hybrid search is unavailable.
         """
         content = self.read_memory_file()
         if not content.strip() or self._is_template_content(content):
             return ""
+
+        if query and self._hybrid_store is not None:
+            try:
+                results = self._hybrid_store.search(query, top_k=top_k)
+                if results:
+                    lines = [f"- {r.content}" for r in results]
+                    return "## Relevant Memories\n\n" + "\n".join(lines)
+            except Exception:
+                logger.debug("Hybrid search for memory context failed, falling back to full", exc_info=True)
+
         return f"## Long-term Memory\n\n{content}"
 
     def _is_template_content(self, content: str) -> bool:
