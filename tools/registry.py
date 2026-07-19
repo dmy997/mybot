@@ -44,6 +44,37 @@ class ToolRegistry:
         """Return tool definitions for tools available in *scope*."""
         return [t.to_openai_schema() for t in self.for_scope(scope)]
 
+    # -- semantic filtering ----------------------------------------------------
+
+    def filter_by_similarity(
+        self, query: str, *, top_k: int | None = None,
+    ) -> ToolRegistry:
+        """Return a new ToolRegistry with tools ranked by semantic similarity.
+
+        Tools whose descriptions are semantically closest to *query* are
+        kept.  When *top_k* is ``None``, returns ``self`` unchanged (no
+        filtering).  When the embedding model is unavailable or *query*
+        is empty, also returns ``self`` unchanged.
+
+        Always retains the ``delegate`` tool (sub-agent) regardless of
+        similarity score — it is the escape hatch for complex tasks.
+        """
+        if top_k is None or not query:
+            return self
+
+        from context.semantic_filter import rank_by_similarity
+
+        items = [(tool.name, tool.description) for tool in self._tools.values()]
+        ranked = rank_by_similarity(query, items, top_k=top_k)
+        keep_names = {name for name, _, _ in ranked}
+        keep_names.add("delegate")  # always keep sub-agent escape hatch
+
+        filtered = ToolRegistry(guard=self.guard)
+        for name, tool in self._tools.items():
+            if name in keep_names:
+                filtered.register(tool)
+        return filtered
+
     # -- schema export ---------------------------------------------------------
 
     def get_definitions(self) -> list[dict[str, Any]]:

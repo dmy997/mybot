@@ -44,10 +44,13 @@ class GrepTool(Tool):
     _parallel = True
     capabilities = {Capability.FILE_READ}
     description = (
-        "Search for a regex pattern in workspace files. "
+        "Search for a regex pattern across workspace files. "
+        "Use for: finding where a function/class/variable is defined or used, "
+        "locating error messages in logs, discovering relevant code patterns. "
+        "NOT for: reading a single known file (use read), exploring directory "
+        "structure (use ls), or full-text web search (use websearch). "
         "Returns matching lines with file paths and line numbers. "
-        "Binary files and common VCS/build directories are skipped. "
-        "Use this to find code, text, or patterns across the project."
+        "Binary files and common VCS/build directories are automatically skipped."
     )
     parameters: dict[str, Any] = {
         "type": "object",

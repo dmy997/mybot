@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, HTTP/WS API, and extensible chat channels (WeChat). Designed to work with any OpenAI-compatible API endpoint. 961 tests, all passing.
+mybot is a multi-provider AI agent framework with plugin-style agents, streaming output, long-term memory, HTTP/WS API, and extensible chat channels (WeChat). Designed to work with any OpenAI-compatible API endpoint. 1037 tests, 1033 passing.
 
 ## Development Setup
 
@@ -17,7 +17,7 @@ cp .env.example .env   # then fill in your keys
 
 ```bash
 ruff check .           # lint
-pytest                 # all 961 tests (pytest-asyncio, asyncio_mode = "auto")
+pytest                 # all 1037 tests (pytest-asyncio, asyncio_mode = "auto")
 pytest test/core/test_middleware.py -v   # single file
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 ```
@@ -35,13 +35,13 @@ mybot-server           # HTTP/WS server (core.server:main), then open http://127
 - `core/` — Orchestrator (composed from 4 mixins: MCPServices, ToolRegistry, SessionLifecycle, IdleCompression), Dispatcher, AgentCore (runner), Agent base class, Middleware chain, SkillsLoader, HTTP/WS server
 - `agents/` — ReAct Agent (single-pass) + PlanSolve Agent (two-phase). Auto-discovered via `discover_agents()`
 - `evals/` — Agent evaluation system (custom YAML tasks + BFCL/GAIA benchmarks)
-- `context/` — ContextManager composed from 4 mixins: CoreContextMixin (build_messages, compress), PromptBuilderMixin (system prompt, repair), MemoryOperationsMixin (remember/forget/recall), SessionPersistenceMixin (save/list/delete/expire). + SessionManager (JSON persistence with hard-cap pruning + TTL expiry)
+- `context/` — ContextManager (unified, no mixins): build_messages, compress, semantic filter for tools/skills. SessionManager (JSON persistence with hard-cap pruning + TTL expiry), CompactionService, MemoryService, SemanticFilter (embedding-based cosine similarity ranking)
 - `tools/` — bash, file R/W, grep, webfetch, websearch, memory CRUD, subagent, `schedule_task` (create/list/cancel periodic tasks), ToolRegistry, ToolGuard security
 - `services/` — `CronScheduler` (self-driven timer, cron-expression + interval jobs) + `ScheduledTaskService` (chat-created push tasks + system side-effect tasks like Xiaohongshu) + `HitlService` / `HitlMiddleware` (human-in-the-loop confirmation). See `docs/scheduled-tasks.md` and `docs/hitl.md`
 - `memory/` — Long-term file-based memory (MemoryStore, Consolidator + Dream pipeline)
 - `observability/` — Structured logging (loguru), Prometheus-style metrics, span tracing, rich CLI display
 - `config/` — `.env` auto-loading, typed `Config` class
-- `utils/` — Jinja2 template rendering (`render_template()`)
+- `utils/` — Jinja2 template rendering (`render_template()`), shared embedding model (`EmbeddingModel` singleton for semantic similarity)
 - `prompt_templates/` — 14 agent prompt templates (Jinja2 `.md`)
 - `skills/` — 22 pre-built skill directories (art, pdf, xlsx, xiaohongshu, frontend-design, etc.). SkillsLoader auto-discovers and loads them
 - `server_web/` — Single `index.html` for the browser chat UI
@@ -51,7 +51,7 @@ mybot-server           # HTTP/WS server (core.server:main), then open http://127
 ```
 HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
                                    ├─ repair interrupted session
-                                   ├─ assemble system prompt (base + memory + skills + tools + history summaries)
+                                   ├─ assemble system prompt (base + memory + skills (triggered+semantic) + tools (similarity-ranked) + history summaries)
                                    ├─ load session history (cursor-based, 100-msg cap)
                                    └─ token-budget check → compress if needed
                 → Dispatcher.resolve()
@@ -89,18 +89,32 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 
 **`Dispatcher`** (`core/dispatcher.py`): Four-layer routing (regex commands → keyword heuristics → optional LLM classification → default). The LLM classifier is instantiated internally when `provider` is given — uses a cheap model for <10 token responses.
 
-**`ContextManager`** (`context/context_manager.py` + `context/context_manager_mixins.py`): Unified context assembly via 4 mixins. Key behaviors:
+**`ContextManager`** (`context/context_manager.py`): Unified context assembly. Key behaviors:
 - Compression is **non-destructive**: `session.messages` is never modified. `CompactionService` advances `consolidated_cursor` to skip old messages; `Consolidator` appends LLM summaries to `memory/history.jsonl`
-- System prompt assembly: base prompt → skills → tools → memory context (SOUL.md, USER.md, MEMORY.md) → file context → recent history
+- System prompt assembly: base prompt → skills (keyword-triggered + semantic top-k) → tools (similarity-ranked) → memory context (SOUL.md, USER.md, MEMORY.md) → file context → recent history
 - Session repair on load: detects unmatched tool calls, missing assistant responses (3 interruption patterns)
 - Idle compression + token-budget compression share the same `compress()` method
 - Session hard cap (`prune_by_count`, default 2000 msgs) decoupled from consolidation
 - Session TTL expiry (`purge_expired_sessions`, default 30 days) runs hourly in serve loop
 
+**Semantic filtering** (`context/semantic_filter.py`, `utils/embedding.py`):
+- Shared `EmbeddingModel` singleton (lazy `sentence-transformers`, graceful fallback)
+- `rank_by_similarity(query, items, top_k)` — cosine similarity on embeddings, falls back to all items
+- Skills: keyword triggers (YAML frontmatter `triggers` field) + semantic top-k = 8 by default
+- Tools: `ToolRegistry.filter_by_similarity()` — keeps `delegate` always, others filtered by relevance
+- `_build_static_prompt` bypasses cache when semantic filtering is active
+
 **`Tool` / `ToolRegistry` / `ToolGuard`** (`tools/`):
 - Every tool extends `Tool` ABC: set `name`, `description`, `parameters` (JSON Schema), `capabilities`, `_scopes`, `_parallel`
 - `ToolGuard` maps capabilities to security checks: SHELL → injection detection, NETWORK → SSRF check, FILE_READ/WRITE → sensitive path blocklist
 - Tools are auto-discovered by `discover_tools()`, scanning for `Tool` subclasses
+- `ToolRegistry.filter_by_similarity(query, top_k)` — semantic ranking, always keeps `delegate`
+
+**`SkillsLoader`** (`core/skills.py`):
+- Auto-discovers skills from `skills/` and workspace `skills/` directories (YAML frontmatter)
+- `get_triggered_skills(query)` — case-insensitive keyword matching from `triggers` field
+- `get_always_skills()` — skills with `always: true`, loaded unconditionally
+- `build_skills_summary(exclude)` / `load_skills_for_context(names)` — progressive disclosure
 
 **Orchestrator mixins** (`core/orchestrator_mixins.py`): Decomposed into MCPServicesMixin (MCP + cron + scheduled tasks), ToolRegistryMixin (tool discovery/registration), SessionLifecycleMixin (session CRUD + memory + dispatcher), and IdleCompressionMixin (idle compression + session expiry).
 

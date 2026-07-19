@@ -270,7 +270,7 @@ class TestParseDirectives:
         )
         assert adds == []
         assert removes == []
-        assert skills == [("daily-standup", "Generate a daily standup report")]
+        assert skills == [("daily-standup", "Generate a daily standup report", [])]
 
     def test_parse_skill_mixed_with_file(self, dream):
         """[SKILL] works alongside FILE directives."""
@@ -280,7 +280,7 @@ class TestParseDirectives:
         )
         assert len(adds) == 1
         assert adds[0] == ("MEMORY", "User runs standup every morning")
-        assert skills == [("daily-standup", "Generate a daily standup report")]
+        assert skills == [("daily-standup", "Generate a daily standup report", [])]
 
     def test_parse_skill_bad_name_skipped(self, dream):
         """Non-kebab-case skill names are ignored by the regex."""
@@ -288,6 +288,60 @@ class TestParseDirectives:
             "[SKILL] Bad Name: description"
         )
         assert skills == []
+
+    def test_parse_skill_with_workflow_steps(self, dream):
+        """Indented lines after [SKILL] become workflow steps."""
+        adds, removes, skills = dream._parse_directives(
+            "[SKILL] code-review: Review code changes\n"
+            "  - Run `git diff` to see changes\n"
+            "  - Check for security issues\n"
+            "  - Output findings as a report\n"
+        )
+        assert adds == []
+        assert removes == []
+        assert skills == [(
+            "code-review",
+            "Review code changes",
+            [
+                "Run `git diff` to see changes",
+                "Check for security issues",
+                "Output findings as a report",
+            ],
+        )]
+
+    def test_parse_skill_no_steps(self, dream):
+        """SKILL without indented lines has empty steps list."""
+        _, _, skills = dream._parse_directives(
+            "[SKILL] simple-skill: A simple skill description"
+        )
+        assert len(skills) == 1
+        assert skills[0][0] == "simple-skill"
+        assert skills[0][1] == "A simple skill description"
+        assert skills[0][2] == []
+
+
+# ---------------------------------------------------------------------------
+# _build_skill_body
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSkillBody:
+    def test_with_workflow_steps(self, dream):
+        """When steps are provided, they become numbered workflow items."""
+        body = dream._build_skill_body(
+            "code-review", "Review code changes",
+            steps=["Run git diff", "Check security", "Output report"],
+        )
+        assert "1. Run git diff" in body
+        assert "2. Check security" in body
+        assert "3. Output report" in body
+        assert "<!-- TODO:" not in body
+
+    def test_without_steps_falls_back_to_placeholder(self, dream):
+        """Without steps, a minimal placeholder workflow is used."""
+        body = dream._build_skill_body("test-skill", "A test")
+        assert "Identify the trigger" in body
+        assert "Verify the output" in body
 
 
 # ---------------------------------------------------------------------------

@@ -417,9 +417,10 @@ class Orchestrator:
                     if _on_new_turn:
                         await _on_new_turn()
 
+                filtered_tools = self._tools.filter_by_similarity(user_input)
                 spec = AgentInput(
                     init_messages=messages,
-                    tools=self._tools,
+                    tools=filtered_tools,
                     model=model,
                     max_tokens=max_tokens,
                     temperature=temperature,

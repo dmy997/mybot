@@ -81,13 +81,12 @@ class MemoryRecallTool(Tool):
     capabilities = set()
     description = (
         "Search the persistent long-term memory store by keyword. "
-        "Returns matching memory entries with their content. "
-        "IMPORTANT: Recent conversation history and system-level memories "
-        "(MEMORY.md, user preferences, project context) are already loaded "
-        "in the system prompt — do NOT call this to retrieve information "
-        "already visible in context. Only use this to search for memories "
-        "that were explicitly saved via memory_remember in past sessions "
-        "and may not be currently loaded."
+        "Use for: recalling user preferences, past decisions, or project "
+        "context saved via memory_remember in previous sessions. "
+        "NOT for: retrieving information already loaded in the system prompt "
+        "(MEMORY.md, SOUL.md, USER.md are pre-loaded), recent conversation "
+        "history, or code-level searches (use grep instead). "
+        "Returns matching memory entries with their content."
     )
     parameters: dict[str, Any] = {
         "type": "object",
@@ -138,7 +137,10 @@ class MemoryForgetTool(Tool):
     capabilities = set()
     description = (
         "Delete a long-term memory entry by name. "
-        "Use this when information is outdated, incorrect, or the user asks to forget something."
+        "Use when: information is outdated, incorrect, or the user explicitly "
+        "asks to forget something. "
+        "NOT for: temporary hiding of information or modifying existing "
+        "memories (delete then recreate with memory_remember)."
     )
     parameters: dict[str, Any] = {
         "type": "object",

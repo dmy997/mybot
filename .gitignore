@@ -78,3 +78,9 @@ memory/.dream_date
 memory/history.jsonl
 memory/MEMORY.md
 /xiaohongshu/
+
+# Research notes (personal, not for version control)
+docs/2026-07-13_调研claude-code-openclaw-hermes三个开源项目的记忆系统.md
+docs/2026-07-13_调研主流agent开源项目或产品的记忆系统设计方案-涵盖记忆系统的存储方式-文件.md
+docs/memory-quality-control.md
+docs/qa.md

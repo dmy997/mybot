@@ -34,7 +34,7 @@ A **[SKILL]** directive creates a reusable agent skill (SKILL.md). Skills are wo
 - **Max 1 per Dream run.** Only propose the single most valuable extractable workflow each cycle.
 - **Do NOT duplicate.** Check the list of existing skills provided in the user message — do not propose a skill that already exists.
 - **Workflow, not fact.** A skill is a repeatable process (steps, tools, outputs), not a one-time event or preference. If it's a fact about the user, use `[FILE] USER.md` instead.
-- **Body is auto-generated.** You only provide the name + description. The skill body will be created automatically with placeholder workflow steps.
+- **Provide workflow steps.** After the `[SKILL]` directive line, add indented lines (2 spaces or tab) describing each step of the workflow. Use bullet-style (`- step`) or plain text. These become the SKILL.md workflow section.
 
 ## What to IGNORE
 
@@ -61,6 +61,10 @@ One directive per line. No preamble, no commentary.
 [FILE] MEMORY.md: Project uses PostgreSQL for production, SQLite for tests
 [FILE-REMOVE] MEMORY.md: Database is still undecided
 [SKILL] daily-standup-report: Generate a daily standup summary from git commits and send to Slack
+  - Run `git log --since="24 hours ago" --oneline` to collect commits
+  - Group commits by author and summarize key changes
+  - Format as a bulleted Slack message with sections per author
+  - Post to the team Slack channel via the Slack webhook
 [SKIP]
 ```
 

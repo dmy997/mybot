@@ -76,9 +76,13 @@ class WebFetchTool(Tool):
     capabilities = {Capability.NETWORK}
     description = (
         "Fetch content from a URL and return as plain text. "
+        "Use for: reading documentation, API references, checking a specific "
+        "web page's content. "
+        "NOT for: broad information discovery (use websearch), local file "
+        "reading (use read), or API calls that require authentication. "
         "HTML pages are converted to readable text (scripts/styles removed). "
         "JSON and plain-text responses are returned as-is. "
-        "Use this to look up documentation, API references, or any web content."
+        "Non-http/https URLs are rejected."
     )
     parameters: dict[str, Any] = {
         "type": "object",

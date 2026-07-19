@@ -228,6 +228,7 @@ CronScheduler._on_timer → _on_cron_job("user:a1b2")
 
 ## 相关文档
 
+- [心跳机制](heartbeat.md) — 文件驱动的 HeartbeatService（拉模型，与 push 模型互补）
 - [Dream 定时调度机制](dream-scheduler.md) — 底层 `CronScheduler` 自驱动定时器
 - [小红书海龟汤自动运营](xiaohongshu-turtle-soup.md) — 系统任务的完整案例
 - [流式输出与路由](streaming-and-routing.md) — MessageBus / serve / outbound 管道

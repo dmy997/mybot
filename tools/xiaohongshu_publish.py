@@ -31,11 +31,12 @@ class XiaohongshuPublishTool(Tool):
 
     name = "xiaohongshu_publish"
     description = (
-        "Publish a note to Xiaohongshu (RED). "
-        "Provide a title, the content rendered onto the cover image, "
-        "an optional caption for the note's text body, "
-        "and optionally a list of local image file paths. "
-        "Returns the note ID on success."
+        "Publish a note to Xiaohongshu (RED/小红书). "
+        "Use for: posting content to Xiaohongshu, creating RED notes with images. "
+        "NOT for: general social media posting, reading Xiaohongshu content, "
+        "or platforms other than Xiaohongshu. "
+        "Provide a title, cover image content, optional caption, "
+        "and optional local image paths. Returns the note ID on success."
     )
     parameters = {
         "type": "object",

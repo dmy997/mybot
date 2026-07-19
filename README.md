@@ -5,7 +5,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-961%20passed-green)](.)
+[![Tests](https://img.shields.io/badge/tests-1037%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 受 **Claude Code**、**nanobot**、**OpenClaw** 启发，通过 Claude Code vibe coding 开发的个人 AI 助手框架。可读性强，高度模块化，轻量无冗余。
@@ -20,10 +20,11 @@
 - **可插拔中间件** — 责任链模式，拦截 LLM 调用、工具执行、Agent 生命周期
 - **长期记忆** — 基于文件的类型化记忆（用户/反馈/项目/参考），支持混合搜索（向量+FTS5）
 - **上下文管理** — 非破坏性压缩、会话中断修复、空闲自动压缩
+- **语义过滤** — 基于 embedding 的工具/技能余弦相似度排序，按查询动态筛选 top-k（P1）
 - **可观测性** — 结构化日志（loguru）、自定义指标/追踪，以及可选的 OpenTelemetry → Jaeger 桥接
 - **断点恢复** — 长任务崩溃后可从检查点续跑，避免重新推理
 - **多频道接入** — 可扩展频道架构（BaseChannel ABC），支持 CLI、Web UI、微信 iLink 机器人；MessageBus 每通道独立出站队列，消息不丢失
-- **13 个内置 Skill** — docx、pptx、pdf、xlsx、canvas-design、frontend-design、algorithmic-art、brand-guidelines、internal-comms、mcp-builder、skill-creator、slack-gif-creator、theme-factory、web-artifacts-builder、webapp-testing
+- **17 个内置 Skill** — 含关键词触发器（YAML `triggers`）+ 语义相似度自动注入；docx、pptx、pdf、xlsx、xiaohongshu、canvas-design、frontend-design 等
 
 ## 架构
 
@@ -55,11 +56,11 @@ HTTP/WS/WeChat 或 CLI → Orchestrator → ContextManager.build_messages()
 | Middleware | `core/middleware.py` | 可插拔中间件链——拦截 LLM 调用、工具执行、Agent 生命周期 |
 | EventBus | `core/events.py` | 异步发布/订阅事件总线——Agent/LLM/Tool 生命周期事件 |
 | MessageBus | `core/message_bus.py` | 每会话入站 + 每通道出站队列——不同频道消息完全隔离 |
-| ContextManager | `context/context_manager.py` | 会话持久化、空闲压缩、token 预算压缩、中断修复 |
+| ContextManager | `context/context_manager.py` | 会话持久化、空闲压缩、token 预算压缩、中断修复、语义过滤 |
 | MemoryStore | `memory/store.py` | 类型化长期记忆的文件 I/O |
 | BaseChannel | `channels/base.py` | 频道抽象——ChannelMessage、send_reply、build_session_key |
 | WechatChannel | `channels/wechat.py` | 微信 iLink 机器人频道——iLink API → MessageBus → Orchestrator |
-| SkillsLoader | `core/skills.py` | 基于文件的 Skill 发现（YAML），自动注入 system prompt |
+| SkillsLoader | `core/skills.py` | 基于文件的 Skill 发现（YAML），关键词触发器 + 语义相似度注入 |
 
 ### Agent 范式
 
@@ -183,7 +184,7 @@ MYBOT_OTEL_ENABLED=1 mybot
 
 ```bash
 ruff check .                               # lint
-pytest                                     # 全部 961 个测试
+pytest                                     # 全部 1037 个测试
 pytest test/core/test_middleware.py -v     # 单个测试文件
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 bash scripts/loc.sh                        # 按模块统计代码行数

@@ -89,6 +89,23 @@ def get_definitions_for_scope(self, scope: str) -> list[dict]:
     return [t.to_openai_schema() for t in self.for_scope(scope)]
 ```
 
+### 语义过滤（P1）
+
+```python
+def filter_by_similarity(
+    self, query: str, *, top_k: int | None = None,
+) -> ToolRegistry:
+    """返回新的 ToolRegistry，其中工具按语义相似度排序筛选。
+
+    将工具描述与 *query* 的 embedding 做余弦相似度排序，保留 top_k 个。
+    top_k=None 时返回 self 不变（不过滤）。
+    query 为空或 embedding 模型不可用时也返回 self。
+    始终保留 delegate 工具（子 Agent 委托），作为复杂任务的逃生出口。
+    """
+```
+
+基于 `context/semantic_filter.py` 的 `rank_by_similarity()` 函数，通过共享的 `EmbeddingModel` 单例（`utils/embedding.py`）将工具描述与用户 query 做语义匹配。结果返回过滤后的新 `ToolRegistry` 副本——不修改原始注册表。默认 `_SEMANTIC_TOOL_TOP_K = None`（不过滤，所有工具可用）。
+
 ### 执行调度与安全
 
 ```python
@@ -385,5 +402,6 @@ ToolGuard.pre_check(tool_name, capabilities, arguments)   # tools/guard.py
 
 - **零知识新增**: 添加不需要能力的工具只需设置 name/description/parameters + 实现 execute
 - **能力即策略**: ToolGuard 不维护工具白名单，而是根据声明的能力选择检查策略
+- **语义过滤**: `filter_by_similarity()` 按 query 动态筛选 top-k 工具（默认关闭），始终保留 delegate
 - **错误隔离**: 单个工具执行失败不影响 Agent 运行循环，LLM 接收到错误后可自行纠正
 - **动态参数注入**: 自动发现时根据 `__init__` 签名决定传哪些参数，工具无需知道调用上下文

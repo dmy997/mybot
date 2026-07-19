@@ -45,10 +45,13 @@ class SubAgentTool(Tool):
     _parallel = True    # independent sub-agents can run concurrently
     capabilities = {Capability.DELEGATE}
     description = (
-        "Delegate a sub-task to an independent sub-agent for execution. "
-        "The sub-agent has its own execution context and a restricted tool set. "
-        "Use for: cross-file searches, project structure analysis, or independent "
-        "research sub-tasks. NOT for simple single-step operations."
+        "Delegate a complex sub-task to an independent sub-agent. "
+        "Use for: cross-file codebase analysis, independent research tasks, "
+        "multi-step operations that benefit from dedicated context. "
+        "NOT for: single-step operations (read/write/ls/grep directly), "
+        "or simple questions that can be answered in one turn. "
+        "The sub-agent has a restricted tool set and returns its results "
+        "when complete."
     )
     parameters: dict[str, Any] = {
         "type": "object",

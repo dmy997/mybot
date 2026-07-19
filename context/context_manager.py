@@ -40,6 +40,13 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
+# Semantic filtering defaults (P1 — dynamic tool/skill selection)
+# ---------------------------------------------------------------------------
+
+_SEMANTIC_SKILL_TOP_K = 8
+_SEMANTIC_TOOL_TOP_K: int | None = None  # None = all tools (rank only)
+
+# ---------------------------------------------------------------------------
 # Default base system prompt — always included unless overridden by caller
 # ---------------------------------------------------------------------------
 
@@ -164,6 +171,11 @@ class ContextManager:
         self._provider = provider
         self._compress_model = compress_model
 
+        # Semantic filtering (P1)
+        self._semantic_enabled: bool = True
+        self._semantic_skill_top_k: int | None = _SEMANTIC_SKILL_TOP_K
+        self._semantic_tool_top_k: int | None = _SEMANTIC_TOOL_TOP_K
+
     # -- properties (sync with token_budget) --------------------------------
 
     @property
@@ -286,6 +298,31 @@ class ContextManager:
     # System prompt assembly (inlined from PromptBuilderMixin)
     # ========================================================================
 
+    def _get_semantic_skills(self, query: str | None) -> list[str]:
+        """Return skill names ranked by semantic similarity to *query*.
+
+        Always-skills and keyword-triggered skills are excluded (they are
+        already added unconditionally / by keyword match respectively).
+        """
+        if not query or not self._semantic_enabled:
+            return []
+        from context.semantic_filter import rank_by_similarity
+
+        all_skills = self.skills_loader.list_skills(filter_unavailable=True)
+        always = set(self.skills_loader.get_always_skills())
+        triggered = set(self.skills_loader.get_triggered_skills(query))
+        excluded = always | triggered
+
+        items = [
+            (s["name"], self.skills_loader._get_skill_description(s["name"]))
+            for s in all_skills
+            if s["name"] not in excluded
+        ]
+        if not items:
+            return []
+        ranked = rank_by_similarity(query, items, top_k=self._semantic_skill_top_k)
+        return [name for name, _, _ in ranked]
+
     async def _build_system_prompt(
         self,
         session_key: str = "",
@@ -297,7 +334,12 @@ class ContextManager:
         """Assemble the full system prompt from cached + dynamic layers."""
         parts: list[str] = []
 
-        static = await self._build_static_prompt(tools, skills)
+        # Merge skills: explicit + keyword-triggered + semantic (P1)
+        triggered = self.skills_loader.get_triggered_skills(query)
+        semantic = self._get_semantic_skills(query)
+        all_skills = list(dict.fromkeys((skills or []) + triggered + semantic))
+
+        static = await self._build_static_prompt(tools, all_skills, query=query)
         if static:
             parts.append(static)
 
@@ -356,10 +398,29 @@ class ContextManager:
         self,
         tools: ToolRegistry | None = None,
         skills: list[str] | None = None,
+        query: str | None = None,
     ) -> str:
-        """Build the static portion of the system prompt (base + skills + tools)."""
-        if self._static_prompt is not None:
-            return self._static_prompt
+        """Build the static portion of the system prompt (base + skills + tools).
+
+        Only the base prompt + skills-summary + tool-defs are cached
+        across requests.  Explicit skill contents (from *skills*) vary
+        per request and are appended after the cache hit.
+
+        When *query* is provided and semantic filtering is enabled, tools
+        are filtered by relevance and the static cache is bypassed (since
+        the filtered result varies per query).
+        """
+        # Semantic filtering active — bypass static cache, rebuild per query
+        if query and self._semantic_enabled and tools is not None:
+            tools = tools.filter_by_similarity(
+                query, top_k=self._semantic_tool_top_k,
+            )
+
+        if self._static_prompt is not None and not (query and self._semantic_enabled):
+            explicit = self.skills_loader.load_skills_for_context(skills or [])
+            if not explicit:
+                return self._static_prompt
+            return self._static_prompt + "\n\n" + explicit
 
         parts: list[str] = []
 
@@ -368,13 +429,30 @@ class ContextManager:
         else:
             parts.append(_DEFAULT_SYSTEM_PROMPT)
 
-        autoload_skills = self.skills_loader.build_skills_summary()
+        # When semantic filtering is active, only show relevant skills
+        if query and self._semantic_enabled and skills:
+            always = set(self.skills_loader.get_always_skills())
+            relevant = set(skills) | always
+            all_skill_names = {
+                s["name"] for s in self.skills_loader.list_skills(filter_unavailable=False)
+            }
+            skill_exclude = all_skill_names - relevant
+        else:
+            skill_exclude = None
+        autoload_skills = self.skills_loader.build_skills_summary(exclude=skill_exclude)
         explicit_skills = self.skills_loader.load_skills_for_context(
             skills or [],
         )
-        if not explicit_skills and skills:
+        missing = [
+            name for name in (skills or [])
+            if self.skills_loader.load_skill(name) is None
+        ]
+        if missing:
+            missing_text = "\n\n".join(
+                f"### Skill: {name}\n\n(no skill file found)" for name in missing
+            )
             explicit_skills = "\n\n".join(
-                f"### Skill: {name}\n\n(no skill file found)" for name in skills
+                s for s in (explicit_skills, missing_text) if s
             )
         skills_content = "\n\n".join(
             s for s in (autoload_skills, explicit_skills) if s

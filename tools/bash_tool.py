@@ -133,11 +133,13 @@ class BashTool(Tool):
     }
     description = (
         "Execute a bash shell command and return stdout/stderr. "
+        "Use for: build commands (npm/pip/cargo), linting/testing, git operations, "
+        "package management. "
+        "NOT for: listing files (use ls), reading files (use read), "
+        "searching text (use grep), writing files (use write). "
         "The command runs in a sandboxed environment with a timeout and "
         "output length limits. DANGEROUS commands (rm -rf /, sudo, curl|sh, "
-        "chmod 777 /, etc.) are blocked. "
-        "Use this to run build commands, linting, tests, and git operations. "
-        "For listing files or exploring directories, use the 'ls' tool instead."
+        "chmod 777 /, etc.) are blocked."
     )
     parameters: dict[str, Any] = {
         "type": "object",

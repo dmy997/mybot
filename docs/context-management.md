@@ -4,6 +4,8 @@
 
 mybot 的上下文管理系统负责"LLM 看到什么"的完整生命周期：系统提示词组装、会话历史加载、token 预算检查、多级上下文压缩、记忆注入，以及会话中断修复。核心入口是 `ContextManager`。
 
+> 压缩机制的详细设计理由见 [context-compression.md](context-compression.md)。
+
 ## 架构总览
 
 ```
@@ -15,7 +17,8 @@ ContextManager
 ├── CompactionService    — 光标推进压缩（无 LLM，两层）
 │   ├── Layer 1: micro_compact  (规则, 无 LLM)
 │   └── Layer 2: auto_compact   (推进 consolidated_cursor；idle 路径调用 LLM 摘要)
-└── SkillsLoader         — Skill 发现与注入
+├── SkillsLoader         — Skill 发现与注入（关键词触发器 + 语义相似度）
+└── SemanticFilter       — embedding 余弦相似度排序（→ utils/embedding.py）
 ```
 
 ## 核心流程: build_messages()
@@ -54,14 +57,19 @@ async def build_messages(
 
 ## 系统提示词组装
 
-采用 **两层缓存 + 动态注入** 结构：
+采用 **两层缓存 + 动态注入 + 语义过滤** 结构：
 
 ```
 Layer 1: Static（base prompt + skills + tools）
     └─ 缓存，仅在工具变更时失效
+    └─ 当语义过滤开启时绕过缓存（输出随 query 变化）
 
 Layer 2: Memory context（SOUL.md + USER.md + MEMORY.md 长期记忆）
     └─ 按 (session, query_bucket) 缓存，remember/forget 时失效
+
+Semantic filtering（P1，嵌入 Layer 1 和 Dynamic）:
+    ├─ Skill 三级合并: explicit + keyword-triggered + semantic top-k (余弦相似度)
+    └─ Tool 筛选: filter_by_similarity(query, top_k)，始终保留 delegate
 
 Dynamic（永不缓存）:
     ├─ File context — 从最近消息中提取文件路径引用
@@ -279,12 +287,20 @@ ContextManager.build_messages()
   │
   ├── 5. _build_system_prompt(session_key, tools, skills, query, messages)
   │     │
-  │     ├── Layer 1: _build_static_prompt(tools, skills)
+  │     ├── Skill 合并: explicit + keyword-triggered + semantic top-k（去重）
+  │     │     triggered = SkillsLoader.get_triggered_skills(query)
+  │     │     semantic  = _get_semantic_skills(query)   # embedding 余弦相似度
+  │     │     all_skills = dict.fromkeys((skills or []) + triggered + semantic)
+  │     │
+  │     ├── 工具过滤: tools.filter_by_similarity(query, top_k)
+  │     │     # 始终保留 delegate；默认 top_k=None 不过滤
+  │     │
+  │     ├── Layer 1: _build_static_prompt(tools, all_skills, query=query)
   │     │     ├── 基础 system prompt 模板
-  │     │     ├── SkillsLoader.build_skills_summary()
+  │     │     ├── SkillsLoader.build_skills_summary(exclude=...)
   │     │     ├── SkillsLoader.load_skills_for_context()
   │     │     └── 工具列表（name + description）
-  │     │     # 无限期缓存，仅 _invalidate_static() 时重建
+  │     │     # 语义过滤开启时绕过缓存；否则无限期缓存
   │     │
   │     ├── Layer 2: _build_memory_context()
   │     │     ├── store.read_soul()      → "Identity" 段落
@@ -391,6 +407,7 @@ ContextManager(token_budget=TokenBudget(...))
 
 - **双系统并存**: CompactionService（游标推进，无 LLM）+ Consolidator（LLM 摘要 → history.jsonl），职责清晰
 - **非破坏性压缩**: 原始消息永不修改，通过游标推进实现渐进压缩
-- **分区缓存**: 提示词静态层 + 记忆层独立缓存，不同频率的失效互不干扰
+- **分区缓存**: 提示词静态层 + 记忆层独立缓存，不同频率的失效互不干扰；语义过滤开启时绕过静态缓存
+- **语义过滤**: Skill 三级合并（explicit + keyword-triggered + semantic top-k）+ Tool 余弦相似度排序，按 query 动态筛选
 - **记忆可见性**: Consolidator 写入的摘要立即可见（Recent History），Dream 合并后转为长期记忆
 - **废止**: SessionMemory 已移除（587 行），Path B 质量评分逻辑同步删除；breaker 逻辑已移除（CompactionService 不再调用 LLM）

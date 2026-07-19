@@ -51,6 +51,48 @@ class LogConfig:
     _initialized: bool = field(default=False, repr=False)
 
 
+def _loguru_to_recent_sink(message: Any) -> None:
+    """Loguru sink that forwards WARNING+ records to the recent ring buffer.
+
+    This makes plain ``logger.warning()`` / ``logger.error()`` calls
+    visible in the Web UI Log panel alongside structured events.
+
+    Note: structured events emitted via :func:`emit` already call
+    ``recent.add_log()`` themselves, so we skip those here to
+    avoid duplicates.  We detect them by checking whether ``event_type``
+    was bound via :func:`emit` (it will be set and not start with ``Log.``).
+    """
+    record = message.record
+    level_name = record["level"].name
+    level_no = record["level"].no
+    if level_no < logger.level("WARNING").no:
+        return
+
+    extra = dict(record.get("extra", {}))
+    bound_event_type = extra.pop("event_type", "")
+
+    if bound_event_type and not bound_event_type.startswith("Log."):
+        # This record came from :func:`emit`, which already handled recent.add_log()`.
+        return
+
+    event_type = bound_event_type or f"Log.{level_name}"
+    data: dict[str, Any] = {
+        "level": level_name,
+        "message": record.get("message", ""),
+        "module": record.get("module", ""),
+        "function": record.get("function", ""),
+        "line": record.get("line", 0),
+    }
+    if extra:
+        data["extra"] = extra
+    if record.get("exception"):
+        exc = record["exception"]
+        data["exception"] = str(exc) if exc else ""
+
+    from observability.recent import recent
+    recent.add_log(event_type, data)
+
+
 def init_logging(config: LogConfig | None = None) -> None:
     """Configure loguru handlers once at application startup.
 
@@ -60,6 +102,7 @@ def init_logging(config: LogConfig | None = None) -> None:
     Adds:
     - A coloured stderr handler for human-readable output.
     - A rotating JSON file handler when ``config.log_dir`` is set.
+    - An in-memory sink that forwards WARNING+ records to the Web UI.
     """
     if config is None:
         config = LogConfig()
@@ -101,6 +144,12 @@ def init_logging(config: LogConfig | None = None) -> None:
             serialize=True,  # JSON lines
             format="{extra}",
         )
+
+    # -- recent ring buffer (WARNING+ only, for Web UI) ------------------------
+    logger.add(
+        _loguru_to_recent_sink,
+        level="WARNING",
+    )
 
     config._initialized = True
     logger.info("Observability logging configured (console={}, file={}, dir={})",

@@ -202,36 +202,57 @@ class Dream:
     # -- Phase 2 (parse + apply) ----------------------------------------------
 
     @staticmethod
-    def _parse_directives(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
+    def _parse_directives(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str, list[str]]]]:
         """Parse LLM output into (adds, removes, skills).
 
         Each add/remove is ``(file_key, content)`` where *file_key* is one
         of ``"SOUL"``, ``"USER"``, ``"MEMORY"``.
-        Each skill is ``(skill_name, description)``.
+        Each skill is ``(skill_name, description, workflow_steps)`` where
+        *workflow_steps* is a list of step descriptions from indented
+        lines following the ``[SKILL]`` directive.
         """
         adds: list[tuple[str, str]] = []
         removes: list[tuple[str, str]] = []
-        skills: list[tuple[str, str]] = []
+        skills: list[tuple[str, str, list[str]]] = []
 
         # Normalise file names: "SOUL.md" / "SOUL" → "SOUL"
         _file_key = {"SOUL.md": "SOUL", "USER.md": "USER", "MEMORY.md": "MEMORY"}
 
-        for line in text.splitlines():
-            line = line.strip()
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
             if not line:
+                i += 1
                 continue
             if line.upper() == "[SKIP]":
+                i += 1
                 continue
 
-            # Try [SKILL] first — different format from FILE/FILE-REMOVE
+            # Try [SKILL] first — may consume following indented lines as workflow steps
             skill_m = _SKILL_RE.match(line)
             if skill_m:
                 skill_name = skill_m.group(1).strip()
                 skill_desc = skill_m.group(2).strip()
                 if skill_name and skill_desc:
-                    skills.append((skill_name, skill_desc))
+                    steps: list[str] = []
+                    i += 1
+                    while i < len(lines):
+                        next_line = lines[i]
+                        if not next_line.strip():
+                            i += 1
+                            continue
+                        if next_line.startswith(("  ", "\t")):
+                            step = next_line.strip().lstrip("- ").strip()
+                            if step:
+                                steps.append(step)
+                            i += 1
+                        else:
+                            break
+                    skills.append((skill_name, skill_desc, steps))
                 else:
                     logger.debug("Dream: unparseable SKILL directive: {!r}", line[:120])
+                    i += 1
                 continue
 
             m = _DIRECTIVE_RE.match(line)
@@ -242,6 +263,7 @@ class Dream:
                 m = _DIRECTIVE_RE_UNQUOTED.match(line)
                 if not m:
                     logger.debug("Dream: unparseable directive: {!r}", line[:120])
+                    i += 1
                     continue
                 directive_kind = m.group(1)
                 file_part = m.group(2).strip()
@@ -253,12 +275,14 @@ class Dream:
                     file_key = _alt.get(file_part.upper())
                 if file_key is None:
                     logger.debug("Dream: unknown file in directive: {!r}", line[:120])
+                    i += 1
                     continue
             else:
                 directive_kind = m.group(1)
                 file_key = _file_key.get(m.group(2))
                 if file_key is None:
                     logger.debug("Dream: unknown file: {!r}", m.group(2))
+                    i += 1
                     continue
                 content = m.group(3).strip()
 
@@ -266,6 +290,7 @@ class Dream:
                 adds.append((file_key, content))
             elif directive_kind == "FILE-REMOVE":
                 removes.append((file_key, content))
+            i += 1
 
         return adds, removes, skills
 
@@ -366,7 +391,7 @@ class Dream:
 
         return None
 
-    def _apply_skills(self, skills: list[tuple[str, str]]) -> bool:
+    def _apply_skills(self, skills: list[tuple[str, str, list[str]]]) -> bool:
         """Create SKILL.md files for extracted workflow skills.
 
         Returns True if any skill file was created.
@@ -377,7 +402,7 @@ class Dream:
         skills_dir = self.store.workspace / "skills"
         changed = False
 
-        for skill_name, description in skills:
+        for skill_name, description, steps in skills:
             skill_dir = skills_dir / skill_name
             skill_file = skill_dir / "SKILL.md"
 
@@ -389,13 +414,14 @@ class Dream:
 
             skill_dir.mkdir(parents=True, exist_ok=True)
 
-            body = self._build_skill_body(skill_name, description)
+            body = self._build_skill_body(skill_name, description, steps)
             tmp = skill_file.with_suffix(".md.tmp")
             try:
                 tmp.write_text(body, encoding="utf-8")
                 tmp.replace(skill_file)
                 logger.info(
-                    "Dream: created skill {!r}: {!r}", skill_name, description,
+                    "Dream: created skill {!r}: {!r} ({} steps)",
+                    skill_name, description, len(steps),
                 )
                 changed = True
             except Exception:
@@ -405,8 +431,22 @@ class Dream:
         return changed
 
     @staticmethod
-    def _build_skill_body(name: str, description: str) -> str:
-        """Build the SKILL.md body with YAML frontmatter."""
+    def _build_skill_body(name: str, description: str, steps: list[str] | None = None) -> str:
+        """Build the SKILL.md body with YAML frontmatter.
+
+        When *steps* are provided (extracted by the LLM from repeated
+        usage patterns), they become the numbered workflow.  Otherwise a
+        minimal placeholder is used.
+        """
+        if steps:
+            workflow = "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1))
+        else:
+            workflow = (
+                f"1. Identify the trigger or input for this task\n"
+                f"2. Execute the core steps specific to {name}\n"
+                f"3. Verify the output and report results"
+            )
+
         return f"""---
 name: {name}
 description: {description}
@@ -418,11 +458,7 @@ description: {description}
 
 ## Workflow
 
-<!-- TODO: Refine the workflow steps based on repeated usage patterns. -->
-
-1. Identify the trigger or input for this task
-2. Execute the core steps specific to {name}
-3. Verify the output and report results
+{workflow}
 
 ## Notes
 

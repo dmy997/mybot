@@ -1,6 +1,7 @@
 ---
 name: canvas-design
 description: Create beautiful visual art in .png and .pdf documents using design philosophy. You should use this skill when the user asks to create a poster, piece of art, design, or other static piece. Create original visual designs, never copying existing artists' work to avoid copyright violations.
+triggers: [poster, 海报, design, 设计, 静态设计, 视觉艺术, visual art, 创意设计, 艺术创作, 图形设计, 平面设计]
 license: Complete terms in LICENSE.txt
 ---
 

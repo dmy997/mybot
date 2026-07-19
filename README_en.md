@@ -1,7 +1,7 @@
 # mybot
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-711%20passed-green)](.)
+[![Tests](https://img.shields.io/badge/tests-1037%20passed-green)](.)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 A personal AI assistant framework inspired by **Claude Code**, **nanobot**, and **OpenClaw**, built with Claude Code vibe coding. Highly readable, modular, and lightweight.
@@ -18,7 +18,8 @@ A personal AI assistant framework inspired by **Claude Code**, **nanobot**, and 
 - **Context management** — non-destructive compression, session repair, idle auto-compaction
 - **Observability** — structured logging (loguru), custom metrics/tracing, and optional OpenTelemetry → Jaeger bridge
 - **Checkpoint/resume** — crash recovery for long-running agent tasks
-- **13 built-in skills** — docx, pptx, pdf, xlsx, canvas-design, frontend-design, algorithmic-art, brand-guidelines, internal-comms, mcp-builder, skill-creator, slack-gif-creator, theme-factory, web-artifacts-builder, webapp-testing
+- **Semantic filtering** — embedding-based tool/skill ranking via cosine similarity, top-k dynamic selection per query to reduce context clutter (P1)
+- **17 built-in skills** — docx, pptx, pdf, xlsx, canvas-design, frontend-design, algorithmic-art, brand-guidelines, internal-comms, mcp-builder, skill-creator, slack-gif-creator, theme-factory, web-artifacts-builder, webapp-testing, xiaohongshu, heartbeat
 
 ## Architecture
 
@@ -50,10 +51,10 @@ HTTP/WS or CLI → Orchestrator → ContextManager.build_messages()
 | Middleware | `core/middleware.py` | Pluggable chain — intercepts LLM calls, tool exec, agent lifecycle |
 | EventBus | `core/events.py` | Async pub/sub — Agent/LLM/Tool lifecycle events |
 | MessageBus | `core/message_bus.py` | Dual-queue bus — decouples input sources from output consumers |
-| ContextManager | `context/context_manager.py` | Session persistence, idle compaction, token-budget compression, interruption repair |
+| ContextManager | `context/context_manager.py` | Session persistence, idle compaction, token-budget compression, interruption repair, semantic filtering |
 | MemoryStore | `memory/store.py` | File I/O for typed long-term memories |
 | StreamRenderer | `observability/stream_renderer.py` | Rich Live terminal streaming with Markdown + ThinkingSpinner |
-| SkillsLoader | `core/skills.py` | File-based skill discovery (YAML), auto-injected into system prompt |
+| SkillsLoader | `core/skills.py` | File-based skill discovery (YAML), keyword triggers + semantic similarity injection |
 
 ### Agent Paradigms
 
@@ -173,7 +174,7 @@ Each trace shows the full call tree (`agent.run → llm.chat → tool.execute`) 
 
 ```bash
 ruff check .                               # lint
-pytest                                     # all 711 tests
+pytest                                     # all 1037 tests
 pytest test/core/test_middleware.py -v     # single file
 pytest test/providers/test_openai_compatible_provider.py::TestParseDict::test_dict_with_choices -v
 bash scripts/loc.sh                        # line count by module 
@@ -191,7 +192,7 @@ bash scripts/loc.sh                        # line count by module
 - HTTP API + WebSocket + SSE streaming + Web UI
 - Pluggable middleware chain (agent / LLM / tool hooks)
 - EventBus (async pub/sub) + MessageBus (dual-queue I/O)
-- 13 built-in skills
+- 17 built-in skills
 - Context management subsystem (compression, repair, idle auto-compaction)
 - Long-term file-based memory system (store–manager–service, typed entries)
 - Session history persistence with cursor-based loading

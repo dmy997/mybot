@@ -222,9 +222,30 @@ input { font-family: inherit; }
   padding: 8px 12px; margin-bottom: 4px; border-radius: 6px;
   background: var(--surface); border: 1px solid var(--border);
   font-size: 12px; line-height: 1.5;
+  border-left-width: 3px;
 }
+.log-entry.log-WARNING { border-left-color: #f0a040; background: rgba(240,160,64,.06); }
+.log-entry.log-ERROR { border-left-color: var(--danger); background: rgba(229,62,62,.08); }
+.log-entry.log-CRITICAL { border-left-color: #991b1b; background: rgba(153,27,27,.12); }
 .log-entry .ts { color: var(--text-muted); margin-right: 8px; }
 .log-entry .type { color: var(--accent); font-weight: 600; margin-right: 8px; }
+.log-entry .level-badge {
+  display: inline-block; padding: 1px 6px; border-radius: 3px;
+  font-size: 10px; font-weight: 700; margin-right: 6px; text-transform: uppercase;
+}
+.log-entry .level-WARNING { background: rgba(240,160,64,.25); color: #f0a040; }
+.log-entry .level-ERROR { background: rgba(229,62,62,.25); color: #f87171; }
+.log-entry .level-CRITICAL { background: rgba(153,27,27,.35); color: #fca5a5; }
+.log-entry .log-message { color: #fbbf24; font-weight: 500; }
+.log-entry.log-ERROR .log-message { color: #f87171; }
+.log-entry.log-CRITICAL .log-message { color: #fca5a5; }
+.log-entry .log-loc { color: var(--text-muted); font-size: 11px; margin-left: 6px; }
+.log-entry .log-exception {
+  display: block; margin-top: 4px; padding: 6px 8px;
+  background: rgba(0,0,0,.3); border-radius: 4px;
+  font-family: monospace; font-size: 11px; color: #f87171;
+  white-space: pre-wrap; word-break: break-all;
+}
 .log-entry .data { color: var(--text); word-break: break-all; }
 
 /* Trace cards (Jaeger-style waterfall) */
@@ -900,14 +921,49 @@ async function showLogs() {
     el.innerHTML = logs.reverse().map(e => {
       const ago = Math.round(now - e.timestamp);
       const ts = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.round(ago/60)}m ago` : `${Math.round(ago/3600)}h ago`;
-      const dataStr = Object.entries(e.data).map(([k,v]) => {
-        const sv = typeof v === 'number' ? (v > 1000 ? fmtNum(v) : v) : String(v).substring(0, 80);
-        return `<span style="color:var(--text-muted)">${esc(k)}</span>=<span style="color:var(--text)">${esc(String(sv))}</span>`;
-      }).join(' ');
-      return `<div class="log-entry">
+      const data = e.data || {};
+      const level = data.level || '';
+      const isPlainLog = !!level;
+
+      let entryClass = 'log-entry';
+      if (level) entryClass += ' log-' + level;
+
+      let levelBadge = '';
+      if (level) {
+        levelBadge = `<span class="level-badge level-${level}">${esc(level)}</span>`;
+      }
+
+      let mainContent = '';
+      if (isPlainLog) {
+        const msg = data.message || '';
+        const mod = data.module || '';
+        const fn = data.function || '';
+        const line = data.line || 0;
+        const loc = (mod || fn) ? `<span class="log-loc">${esc(mod)}${mod && fn ? '.' : ''}${esc(fn)}${line ? ':' + line : ''}</span>` : '';
+        mainContent = `<span class="log-message">${esc(msg.substring(0, 300))}</span>${loc}`;
+        if (data.exception) {
+          mainContent += `<span class="log-exception">${esc(String(data.exception).substring(0, 1000))}</span>`;
+        }
+        if (data.extra && Object.keys(data.extra).length) {
+          const extraStr = Object.entries(data.extra).map(([k,v]) => {
+            const sv = typeof v === 'number' ? (v > 1000 ? fmtNum(v) : v) : String(v).substring(0, 80);
+            return `<span style="color:var(--text-muted)">${esc(k)}</span>=<span style="color:var(--text)">${esc(String(sv))}</span>`;
+          }).join(' ');
+          if (extraStr) mainContent += `<div style="margin-top:4px">${extraStr}</div>`;
+        }
+      } else {
+        const dataStr = Object.entries(data).map(([k,v]) => {
+          const sv = typeof v === 'number' ? (v > 1000 ? fmtNum(v) : v) : String(v).substring(0, 80);
+          return `<span style="color:var(--text-muted)">${esc(k)}</span>=<span style="color:var(--text)">${esc(String(sv))}</span>`;
+        }).join(' ');
+        mainContent = `<span class="data">${dataStr}</span>`;
+      }
+
+      return `<div class="${entryClass}">
         <span class="ts">${ts}</span>
+        ${levelBadge}
         <span class="type">${esc(e.event_type)}</span>
-        <span class="data">${dataStr}</span>
+        ${mainContent}
       </div>`;
     }).join('');
   } catch (e) {

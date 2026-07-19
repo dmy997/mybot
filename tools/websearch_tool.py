@@ -336,8 +336,11 @@ class WebSearchTool(Tool):
     capabilities = {Capability.NETWORK}
     description = (
         "Search the web and return results with titles, URLs, and snippets. "
-        "Use this to find information, documentation, or answers to questions "
-        "that require up-to-date web knowledge."
+        "Use for: finding current information, documentation lookup, fact-checking, "
+        "researching topics beyond training data. "
+        "NOT for: fetching a specific URL's full content (use webfetch), "
+        "local file search (use grep), or searching memories (use memory_recall). "
+        "Supports multiple search backends (duckduckgo, google, bing, tavily)."
     )
     parameters: dict[str, Any] = {
         "type": "object",

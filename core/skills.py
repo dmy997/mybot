@@ -212,6 +212,37 @@ class SkillsLoader:
             )
         ]
 
+    def get_triggered_skills(self, query: str | None) -> list[str]:
+        """Return skill names whose ``triggers`` keywords match *query*.
+
+        Each SKILL.md can declare a ``triggers`` field in its YAML
+        frontmatter (a list of keyword strings).  If *query* contains any
+        of those keywords (case-insensitive), the skill is returned.
+
+        Skills marked ``always: true`` are excluded — they are already
+        loaded unconditionally.
+        """
+        if not query:
+            return []
+        query_lower = query.lower()
+        always = set(self.get_always_skills())
+        matched: list[str] = []
+        for entry in self.list_skills(filter_unavailable=True):
+            name = entry["name"]
+            if name in always:
+                continue
+            meta = self.get_skill_metadata(name) or {}
+            triggers: list[str] = meta.get("triggers", [])
+            if isinstance(triggers, str):
+                triggers = [triggers]
+            if not isinstance(triggers, list):
+                continue
+            for kw in triggers:
+                if str(kw).lower() in query_lower:
+                    matched.append(name)
+                    break
+        return matched
+
     def get_skill_metadata(self, name: str) -> dict | None:
         """
         Get metadata from a skill's frontmatter.

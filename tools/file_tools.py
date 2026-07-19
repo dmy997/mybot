@@ -107,8 +107,11 @@ class ReadTool(Tool):
     capabilities = {Capability.FILE_READ}
     description = (
         "Read a file or list a directory within the workspace. "
+        "Use for: inspecting file contents, checking configuration, reading source code. "
+        "NOT for: searching across multiple files (use grep), listing recursive "
+        "directory trees (use ls), fetching web URLs (use webfetch). "
         "If path is a directory, entries are listed (dirs first, sorted by name). "
-        "If path is a file, returns content with line numbers like 'cat -n'. "
+        "If path is a file, returns content with line numbers. "
         "Binary files and files larger than 1 MB are rejected."
     )
     parameters: dict[str, Any] = {
@@ -262,9 +265,12 @@ class WriteTool(Tool):
     _parallel = False
     capabilities = {Capability.FILE_WRITE}
     description = (
-        "Write content to a file in the workspace. Creates parent directories "
-        "as needed. Overwrites existing files. Directories and symlinks are "
-        "rejected. Content is capped at 500 KB."
+        "Write content to a file in the workspace. "
+        "Use for: creating new files, updating source code, saving generated output. "
+        "NOT for: reading files (use read), executing commands (use bash), "
+        "or creating directories (use bash mkdir). "
+        "Creates parent directories as needed. Overwrites existing files. "
+        "Directories and symlinks are rejected. Content is capped at 500 KB."
     )
     parameters: dict[str, Any] = {
         "type": "object",
@@ -348,12 +354,14 @@ class ListDirTool(Tool):
     _parallel = True
     capabilities = {Capability.FILE_READ}
     description = (
-        "List files and subdirectories in a directory — use this instead of "
-        "running 'find' or 'ls' via bash. "
-        "Returns entries sorted with directories first, then alphabetically. "
-        "Set recursive=true to list subdirectories recursively (depth limit 3). "
-        "Capped at 200 entries. "
-        "Use this whenever you need to explore a directory or find files by name pattern."
+        "List files and subdirectories in a directory. "
+        "Use for: exploring project structure, finding files by name pattern, "
+        "checking what exists in a directory. "
+        "NOT for: reading file contents (use read), searching file contents "
+        "(use grep), or complex file operations (use bash). "
+        "Returns entries sorted directories-first, then alphabetically. "
+        "With recursive=true, lists subdirectories up to depth 3. "
+        "Capped at 200 entries. Prefer this over 'ls' or 'find' via bash."
     )
     parameters: dict[str, Any] = {
         "type": "object",
