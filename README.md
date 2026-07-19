@@ -22,7 +22,9 @@
 - **上下文管理** — 非破坏性压缩、会话中断修复、空闲自动压缩
 - **语义过滤** — 基于 embedding 的工具/技能余弦相似度排序，按查询动态筛选 top-k（P1）
 - **可观测性** — 结构化日志（loguru）、自定义指标/追踪，以及可选的 OpenTelemetry → Jaeger 桥接
+- **反思模式** — 主回答后附加无工具反思调用，从事实准确性、逻辑完整性、覆盖度、表述清晰度四个维度自我审查
 - **断点恢复** — 长任务崩溃后可从检查点续跑，避免重新推理
+- **HITL 人机交互** — 高风险工具（SHELL/FILE_WRITE/NETWORK/DELEGATE）执行前需用户确认
 - **多频道接入** — 可扩展频道架构（BaseChannel ABC），支持 CLI、Web UI、微信 iLink 机器人；MessageBus 每通道独立出站队列，消息不丢失
 - **17 个内置 Skill** — 含关键词触发器（YAML `triggers`）+ 语义相似度自动注入；docx、pptx、pdf、xlsx、xiaohongshu、canvas-design、frontend-design 等
 
@@ -37,12 +39,13 @@ HTTP/WS/WeChat 或 CLI → Orchestrator → ContextManager.build_messages()
                                    ├─ 加载会话历史
                                    └─ token 预算检查 → 超出则压缩
                 → Dispatcher.resolve()
-                    ├─ 第一层：显式命令（/react、/plan）
+                    ├─ 第一层：显式命令（/react、/plan、/research）
                     ├─ 第二层：关键词启发式匹配
                     ├─ 第三层：LLM 分类（可选）
                     └─ 第四层：默认路由（react）
                 → Agent.run(AgentInput) → AgentCore.run()
                     └─ 循环：LLM 调用 → 工具调用（并行+串行）→ 结果喂回
+                    └─ 可选：反思模式（/reflect 前缀或 REFLECT_ENABLED）
                 → ContextManager.save_exchange() → 持久化到磁盘
 ```
 
@@ -68,6 +71,7 @@ HTTP/WS/WeChat 或 CLI → Orchestrator → ContextManager.build_messages()
 |------|------|
 | `react` | 单轮推理+行动循环 |
 | `plan_solve` | 先规划再执行，两阶段 |
+| `deep_research` | orchestrator-workers：分解 → 并行搜索 → 综合报告 |
 
 ## 安装
 
@@ -145,6 +149,12 @@ await orche.run("default")
 | `MYBOT_HOST` | `127.0.0.1` | 服务绑定地址 |
 | `MYBOT_PORT` | `8080` | 服务端口 |
 | `MYBOT_CHECKPOINT` | — | 启用长任务断点恢复 |
+| `REFLECT_ENABLED` | `false` | 全局启用反思模式 |
+| `REFLECT_MODEL` | — | 反思用模型（空=使用主模型） |
+| `REFLECT_PROMPT` | — | 自定义反思审查 prompt |
+| `HITL_MODE` | `bypass` | 人机交互模式：`bypass`（自动执行）或 `confirm`（需确认） |
+| `HYBRID_SEARCH_ENABLED` | `true` | 启用 SQLite FTS5 + sqlite-vec 混合搜索 |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers 嵌入模型 |
 | `MYBOT_OTEL_ENABLED` | — | 启用 OpenTelemetry 桥接 |
 | `MYBOT_OTEL_ENDPOINT` | `http://localhost:4318/v1/traces` | OTLP HTTP 端点 |
 
@@ -232,7 +242,7 @@ python -m evals --benchmark gaia                                              # 
 - HTTP API + WebSocket + SSE 流式 + Web UI
 - 可插拔中间件链（Agent / LLM / Tool 钩子）
 - EventBus（异步发布/订阅）+ MessageBus（每通道独立出站队列）
-- 22 个内置 Skill
+- 17 个内置 Skill
 - 上下文管理子系统（压缩、修复、空闲自动压缩）
 - 基于文件的长期记忆系统（MemoryStore + Consolidator + Dream 两级管道）
 - 会话历史持久化（基于游标的增量加载）
@@ -245,21 +255,22 @@ python -m evals --benchmark gaia                                              # 
 - 混合搜索可观测性 — 终端和 Web UI 日志视图显示搜索模式
 - 多模态图像输入 — content-part 数组 + Web UI 拖拽粘贴 + 微信 ITEM_IMAGE
 - Chunk 级检索 — 记忆按行/条目分块索引，向量 + FTS5 混合搜索
+- 反思模式 — 主回答后无工具自我审查（/reflect 前缀或 REFLECT_ENABLED）
+- HITL 人机交互 — 高风险工具执行前需用户确认（HITL_MODE=confirm）
+- DeepResearch Agent — orchestrator-workers：分解 → 并行搜索 → 综合报告
+- Agent 性能评估系统 — 9 个自定义 YAML 任务 + 4 个规则评分器 + BFCL/GAIA 社区基准
+- Heartbeat 服务 — 周期任务检查，按 HEARTBEAT.md 清单定时执行
+- Skill 系统增强 — Dream 自动提取重复工作流为可复用 SKILL.md
 
 ### P2 — 质量与可靠性
 
-- ~~**Agent 性能评估系统（第一阶段）**~~ — 9 个自定义 YAML 任务 + 4 个规则评分器 + pytest CI 集成 ✅
-- ~~**Agent 性能评估系统（第二阶段）**~~ — BFCL/GAIA 社区基准、LLM Judge 评分器、CLI 入口 ✅
-- ~~**相关性筛选**~~ — 注入 MEMORY.md 前用混合搜索按当前 query 召回 top_k 相关条目 ✅
+- **语义过滤动态开启** — 工具过滤默认 `top_k=None`（关闭），需评估最佳 top_k 后默认开启
+- **反思模式改进** — Web UI 反思前后对比展示，反思结果质量评估
 
 ### P3 — 扩展能力
 
-- ~~**多模态输入**~~ — 支持图片等非文本输入 ✅
 - **更多 LLM Provider** — Anthropic 直连、Ollama 本地模型
 - **更多消息频道** — QQ、Telegram、飞书等外部频道接入
-- ~~**Heartbeat 服务**~~ — 周期任务检查，按 HEARTBEAT.md 清单定时执行（参考 nanobot）✅
-- ~~**Skill 系统增强**~~ — Dream 自动提取重复工作流为可复用 SKILL.md ✅
-- ~~**Chunk 级检索**~~ — 大文件分块存储和检索 ✅
 
 ## License
 
