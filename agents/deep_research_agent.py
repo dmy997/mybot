@@ -73,13 +73,15 @@ class DeepResearchAgent(BaseAgent):
         runner = SubAgentRunner(self.core.provider, workspace=self._workspace_root())
         topo = OrchestratorWorkers(self.core, runner)
         team = await topo.execute(
-            topic, DEEP_RESEARCH, spec.tools, on_progress=_progress,
+            topic, DEEP_RESEARCH, spec.tools,
+            on_progress=_progress,
+            on_plan_ready=spec.on_plan_ready,
         )
 
         if team.error and not team.full_report:
             return self._fail(spec, team.error)
 
-        report_path = self._save_report(topic, team.full_report)
+        report_path = self._save_report(topic, team.full_report, team.sources)
         content = self._format_output(topic, team.summary, report_path, team)
 
         if spec.on_content_delta:
@@ -113,12 +115,17 @@ class DeepResearchAgent(BaseAgent):
     def _workspace_root(self) -> Path:
         return Path(Config.workspace).expanduser().resolve()
 
-    def _save_report(self, topic: str, report: str) -> Path:
+    def _save_report(self, topic: str, report: str, sources: list[str] | None = None) -> Path:
         research_dir = self._workspace_root() / "research"
         research_dir.mkdir(parents=True, exist_ok=True)
         slug = _SLUG_RE.sub("-", topic).strip("-")[:40] or "report"
         path = research_dir / f"{date.today().isoformat()}_{slug}.md"
-        path.write_text(report, encoding="utf-8")
+        text = report
+        if sources:
+            text += "\n\n---\n\n## 引用来源\n\n"
+            for u in sources:
+                text += f"- {u}\n"
+        path.write_text(text, encoding="utf-8")
         logger.info("DeepResearch report saved: {}", path)
         return path
 
@@ -136,6 +143,14 @@ class DeepResearchAgent(BaseAgent):
             f"📄 完整报告已保存：`{path}`",
             f"👥 {ok}/{total} 个子任务成功",
         ]
+        sources = getattr(team, "sources", None)
+        if sources:
+            lines.append("")
+            lines.append("📚 **引用来源**：")
+            for u in sources[:20]:
+                lines.append(f"- {u}")
+            if len(sources) > 20:
+                lines.append(f"- ... 还有 {len(sources) - 20} 个来源，详见完整报告")
         return "\n".join(lines)
 
     @staticmethod

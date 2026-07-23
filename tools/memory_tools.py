@@ -53,7 +53,13 @@ class MemoryRememberTool(Tool):
     }
 
     def __init__(self, ctx: Any = None) -> None:
-        self._ctx = ctx
+        from memory.manager import MemoryManager as _MM
+        if isinstance(ctx, _MM):
+            self._memory_manager = ctx
+            self._ctx = None
+        else:
+            self._ctx = ctx
+            self._memory_manager = None
 
     async def execute(
         self,
@@ -63,6 +69,15 @@ class MemoryRememberTool(Tool):
         description: str = "",
         **_: Any,
     ) -> ToolResult:
+        if self._memory_manager is not None:
+            try:
+                result = await self._memory_manager.handle_tool_call(
+                    "memory_remember",
+                    {"name": name, "content": content, "mem_type": mem_type, "description": description},
+                )
+                return ToolResult(success=True, content=result["content"])
+            except Exception as exc:
+                return ToolResult(success=False, content="", error=f"Failed to save memory: {exc}")
         if self._ctx is None:
             return ToolResult(success=False, content="", error="Memory system not available")
         try:
@@ -105,9 +120,34 @@ class MemoryRecallTool(Tool):
     }
 
     def __init__(self, ctx: Any = None) -> None:
-        self._ctx = ctx
+        from memory.manager import MemoryManager as _MM
+        if isinstance(ctx, _MM):
+            self._memory_manager = ctx
+            self._ctx = None
+        else:
+            self._ctx = ctx
+            self._memory_manager = None
 
     async def execute(self, query: str, top_n: int = 10, **_: Any) -> ToolResult:
+        if self._memory_manager is not None:
+            try:
+                result = await self._memory_manager.handle_tool_call(
+                    "memory_recall", {"query": query, "top_n": top_n},
+                )
+                content = result.get("content", [])
+                if not content:
+                    return ToolResult(success=True, content="No matching memories found.")
+                if isinstance(content, list):
+                    lines = [f"--- {len(content)} result(s) for '{query}' ---"]
+                    for r in content:
+                        name = r.get("name", "?")
+                        c = r.get("content", str(r))
+                        mem_type = r.get("mem_type", "?")
+                        lines.append(f"[{mem_type}] {name}: {c}")
+                    return ToolResult(success=True, content="\n".join(lines))
+                return ToolResult(success=True, content=str(content))
+            except Exception as exc:
+                return ToolResult(success=False, content="", error=f"Failed to recall: {exc}")
         if self._ctx is None:
             return ToolResult(success=False, content="", error="Memory system not available")
         try:
@@ -155,9 +195,23 @@ class MemoryForgetTool(Tool):
     }
 
     def __init__(self, ctx: Any = None) -> None:
-        self._ctx = ctx
+        from memory.manager import MemoryManager as _MM
+        if isinstance(ctx, _MM):
+            self._memory_manager = ctx
+            self._ctx = None
+        else:
+            self._ctx = ctx
+            self._memory_manager = None
 
     async def execute(self, name: str, **_: Any) -> ToolResult:
+        if self._memory_manager is not None:
+            try:
+                result = await self._memory_manager.handle_tool_call(
+                    "memory_forget", {"name": name},
+                )
+                return ToolResult(success=True, content=result["content"])
+            except Exception as exc:
+                return ToolResult(success=False, content="", error=f"Failed to forget: {exc}")
         if self._ctx is None:
             return ToolResult(success=False, content="", error="Memory system not available")
         try:

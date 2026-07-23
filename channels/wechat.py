@@ -170,6 +170,16 @@ class WechatChannel(BaseChannel):
         self._cross_hitl_seen: set[str] = set()
         self._cross_hitl_poller_task: asyncio.Task | None = None
 
+        # Plan approval: pending approval chat_id → request_id
+        self._pending_plan: dict[str, str] = {}
+        # Plan approval edit mode: chat_id → request_id (next message = edited plan)
+        self._plan_edit_mode: dict[str, str] = {}
+        # Cross-process plan approval
+        self._cross_pending_plan: dict[str, str] = {}
+        self._cross_plan_edit_mode: dict[str, str] = {}
+        self._cross_plan_seen: set[str] = set()
+        self._cross_plan_poller_task: asyncio.Task | None = None
+
         # Persistent state directory (set in start())
         self._state_dir: Path | None = None
         self._last_persist_time: float = 0.0
@@ -214,6 +224,11 @@ class WechatChannel(BaseChannel):
         if _hitl_svc:
             _hitl_svc.add_listener(self._on_hitl_request)
 
+        # Register Plan Approval listener
+        _plan_svc = getattr(self._orchestrator, "plan_approval_service", None)
+        if _plan_svc:
+            _plan_svc.add_listener(self._on_plan_approval_request)
+
         ws_root = Path(self._orchestrator.workspace)
         self._state_dir = ws_root / "wechat"
         self._state_dir.mkdir(parents=True, exist_ok=True)
@@ -255,6 +270,7 @@ class WechatChannel(BaseChannel):
 
         # Start cross-process HITL bridge poller (after full initialization)
         self._cross_hitl_poller_task = asyncio.create_task(self._poll_cross_hitl())
+        self._cross_plan_poller_task = asyncio.create_task(self._poll_cross_plan())
 
         await self._stop_event.wait()
 
@@ -262,7 +278,7 @@ class WechatChannel(BaseChannel):
         logger.info("WechatChannel: shutting down")
         if self._stop_event is not None and not self._stop_event.is_set():
             self._stop_event.set()
-        for task in [self._poll_task, self._consumer_task, self._cross_hitl_poller_task]:
+        for task in [self._poll_task, self._consumer_task, self._cross_hitl_poller_task, self._cross_plan_poller_task]:
             if task and not task.done():
                 task.cancel()
         for task in self._serve_tasks.values():
@@ -741,6 +757,143 @@ class WechatChannel(BaseChannel):
                 "Cross HITL: failed to respond for req={}", request_id,
             )
 
+    # ------------------------------------------------------------------
+    # Plan approval (local + cross-process)
+    # ------------------------------------------------------------------
+
+    async def _on_plan_approval_request(self, req: Any) -> None:
+        """Send a WeChat message asking the user to review a plan."""
+
+        chat_id = self._chat_ids.get(req.session_key)
+        if chat_id is None:
+            logger.warning(
+                "WechatChannel: no chat_id for plan approval session {!r}", req.session_key,
+            )
+            return
+
+        self._pending_plan[chat_id] = req.request_id
+
+        ctx_token = self._context_tokens.get(chat_id, "")
+        if not ctx_token:
+            await self._refresh_context_tokens()
+            ctx_token = self._context_tokens.get(chat_id, "")
+
+        if not ctx_token:
+            logger.error("WechatChannel: no context_token for plan approval message")
+            return
+
+        text = self._format_plan_approval(req)
+        try:
+            await self._send_text(chat_id, text, ctx_token)
+        except Exception:
+            logger.opt(exception=True).warning(
+                "WechatChannel: failed to send plan approval for {!r}", req.request_id,
+            )
+
+    @staticmethod
+    def _format_plan_approval(req: Any) -> str:
+        plan_type_label = "Plan-and-Solve" if req.plan_type == "plan_solve" else "Deep Research"
+        content = req.plan_content
+        if len(content) > 3000:
+            content = content[:3000] + "\n... (内容已截断)"
+        return (
+            f"📋 执行计划审批 [{plan_type_label}]\n\n"
+            f"{content}\n\n"
+            f"回复 y 批准，回复 n 拒绝，回复 e 编辑计划"
+        )
+
+    async def _poll_cross_plan(self) -> None:
+        """Poll the server's ``GET /plan/pending`` for cross-process plan approval requests."""
+        server_url = Config.hitl_server_url.rstrip("/")
+        poll_interval = 5.0
+
+        while self._stop_event is None or not self._stop_event.is_set():
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                    resp = await client.get(f"{server_url}/plan/pending")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    pending = data.get("pending", [])
+
+                    for req_data in pending:
+                        rid = req_data.get("request_id", "")
+                        if not rid or rid in self._cross_plan_seen:
+                            continue
+                        self._cross_plan_seen.add(rid)
+
+                        session_key = req_data.get("session_key", "")
+                        plan_type = req_data.get("plan_type", "")
+
+                        chat_id = self._chat_ids.get(session_key)
+                        if chat_id is None:
+                            logger.warning(
+                                "Cross Plan: no chat_id for session {!r}", session_key,
+                            )
+                            continue
+                        self._cross_pending_plan[chat_id] = rid
+
+                        ctx_token = self._context_tokens.get(chat_id, "")
+                        if not ctx_token:
+                            await self._refresh_context_tokens()
+                            ctx_token = self._context_tokens.get(chat_id, "")
+
+                        if not ctx_token:
+                            logger.warning(
+                                "Cross Plan: no context_token for {}, cannot send", chat_id,
+                            )
+                            continue
+
+                        synth_req = type("_PlanReq", (), {
+                            "request_id": rid,
+                            "session_key": session_key,
+                            "plan_type": plan_type,
+                            "plan_content": req_data.get("plan_content", ""),
+                        })()
+                        text = self._format_plan_approval(synth_req)
+
+                        try:
+                            await self._send_text(chat_id, text, ctx_token)
+                            logger.info(
+                                "Cross Plan: sent approval request to {} req={}",
+                                chat_id, rid,
+                            )
+                        except Exception:
+                            logger.opt(exception=True).warning(
+                                "Cross Plan: failed to send for {}", rid,
+                            )
+            except httpx.ConnectError:
+                logger.debug("Cross Plan poller: server not reachable")
+            except Exception:
+                logger.opt(exception=True).warning("Cross Plan poller: request failed")
+
+            if len(self._cross_plan_seen) > 1000:
+                self._cross_plan_seen.clear()
+
+            await asyncio.sleep(poll_interval)
+
+    async def _respond_cross_plan(self, request_id: str, decision: str) -> None:
+        """POST to the server's ``/plan/respond`` for a cross-process plan approval."""
+        server_url = Config.hitl_server_url.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                resp = await client.post(
+                    f"{server_url}/plan/respond",
+                    json={"request_id": request_id, "decision": decision},
+                )
+                if resp.status_code == 200:
+                    logger.info(
+                        "Cross Plan: responded {} for req={}", decision, request_id,
+                    )
+                else:
+                    logger.warning(
+                        "Cross Plan: respond returned {} for req={}",
+                        resp.status_code, request_id,
+                    )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Cross Plan: failed to respond for req={}", request_id,
+            )
+
     async def _on_message(self, raw_msg: dict) -> None:
         """Process a single raw message from getupdates."""
         msg = self._parse(raw_msg, allowed_from=None)
@@ -812,6 +965,68 @@ class WechatChannel(BaseChannel):
             await self._respond_cross_hitl(_cross_req_id, _decision)
             self._cross_pending_hitl.pop(msg.chat_id, None)
             return
+
+        # Plan approval: check if user is in edit mode (next message = edited plan)
+        _plan_edit_req_id = self._plan_edit_mode.pop(msg.chat_id, None)
+        if _plan_edit_req_id:
+            _plan_svc = getattr(self._orchestrator, "plan_approval_service", None)
+            if _plan_svc:
+                _plan_svc.respond(_plan_edit_req_id, msg.text)
+            return
+
+        _cross_plan_edit_req_id = self._cross_plan_edit_mode.pop(msg.chat_id, None)
+        if _cross_plan_edit_req_id:
+            await self._respond_cross_plan(_cross_plan_edit_req_id, msg.text)
+            return
+
+        # Plan approval: check for y/n/e response
+        _plan_req_id = self._pending_plan.get(msg.chat_id)
+        if _plan_req_id:
+            _plan_svc = getattr(self._orchestrator, "plan_approval_service", None)
+            if _plan_svc:
+                if _text_lower in ("e", "edit", "编辑", "修改"):
+                    # Enter edit mode — ask user to send the edited plan
+                    self._plan_edit_mode[msg.chat_id] = _plan_req_id
+                    self._pending_plan.pop(msg.chat_id, None)
+                    ctx_token = self._context_tokens.get(msg.chat_id, "")
+                    if ctx_token:
+                        try:
+                            await self._send_text(
+                                msg.chat_id,
+                                "请发送编辑后的执行计划：",
+                                ctx_token,
+                            )
+                        except Exception:
+                            logger.opt(exception=True).warning(
+                                "WechatChannel: failed to send plan edit prompt",
+                            )
+                    return
+                if _decision:
+                    _plan_svc.respond(_plan_req_id, _decision)
+                    self._pending_plan.pop(msg.chat_id, None)
+                    return
+
+        # Cross-process plan approval response
+        _cross_plan_req_id = self._cross_pending_plan.get(msg.chat_id)
+        if _cross_plan_req_id:
+            if _text_lower in ("e", "edit", "编辑", "修改"):
+                self._cross_plan_edit_mode[msg.chat_id] = _cross_plan_req_id
+                self._cross_pending_plan.pop(msg.chat_id, None)
+                ctx_token = self._context_tokens.get(msg.chat_id, "")
+                if ctx_token:
+                    try:
+                        await self._send_text(
+                            msg.chat_id,
+                            "请发送编辑后的执行计划：",
+                            ctx_token,
+                        )
+                    except Exception:
+                        pass
+                return
+            if _decision:
+                    await self._respond_cross_plan(_cross_plan_req_id, _decision)
+                    self._cross_pending_plan.pop(msg.chat_id, None)
+                    return
 
         self._chat_ids[msg.session_key] = msg.chat_id
         await self._bus.inbound(msg.session_key).put(InboundMessage(

@@ -96,6 +96,24 @@ def _summarize_tool_args(args_json: str) -> str:
         return (s[:77] + "...") if len(s) > 80 else s
 
 
+def _make_on_plan_ready(
+    session_key: str, plan_approval_service: Any,
+) -> Any:
+    """Build the ``on_plan_ready`` callback for :class:`AgentInput`.
+
+    Returns an async function that delegates to :class:`PlanApprovalService`
+    to pause execution and wait for user review of a generated plan.
+    """
+    async def _on_plan_ready(plan_type: str, plan_content: str) -> str:
+        return await plan_approval_service.request_plan_approval(
+            session_key=session_key,
+            plan_type=plan_type,
+            plan_content=plan_content,
+        )
+
+    return _on_plan_ready
+
+
 # ---------------------------------------------------------------------------
 # Result
 # ---------------------------------------------------------------------------
@@ -215,6 +233,7 @@ class Orchestrator:
             hybrid_store=hybrid_store,
             max_session_messages=max_session_messages,
             session_ttl_days=session_ttl_days,
+            memory_manager=None,  # auto-created inside ContextManager
         )
 
         # HITL (Human-in-the-loop) — must be initialized before agents
@@ -224,6 +243,12 @@ class Orchestrator:
         if middleware is None:
             middleware = MiddlewareChain()
         middleware.add(_hitl_mw)
+
+        # Plan approval service — cross-channel plan review gate
+        from services.plan_approval import PlanApprovalService
+        self.plan_approval_service = PlanApprovalService(
+            timeout_seconds=Config.plan_approval_timeout_seconds,
+        )
 
         # Dispatcher (accept pre-built or auto-discover agents)
         if dispatcher is not None:
@@ -434,6 +459,9 @@ class Orchestrator:
                     on_tool_execute_end=on_tool_execute_end,
                     on_new_turn=_on_new_turn_wrapper,
                     reflect=reflect or Config.reflect_enabled,
+                    on_plan_ready=_make_on_plan_ready(
+                        session_key, self.plan_approval_service
+                    ),
                 )
 
                 # 5. Run agent (interruptible)
@@ -761,6 +789,7 @@ class Orchestrator:
         """Delete a session and its on-disk data."""
         ok: bool = self.ctx.delete_session(key)
         if ok:
+            self.ctx.memory.invalidate_snapshot(key)
             try:
                 loop = asyncio.get_running_loop()
                 from core.events import SessionDeleted, bus

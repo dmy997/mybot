@@ -30,6 +30,7 @@ from .blueprint import TeamBlueprint
 from .runner import SubAgentResult, SubAgentRunner, SubAgentSpec
 
 _TAG_RE = "<{tag}>(.*?)</{tag}>"
+_URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
 
 
 @dataclass
@@ -41,6 +42,7 @@ class TeamResult:
     subtasks: list[str] = field(default_factory=list)
     worker_results: list[SubAgentResult] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
+    sources: list[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -70,6 +72,7 @@ class OrchestratorWorkers:
         parent_tools: ToolRegistry,
         *,
         on_progress: "Any | None" = None,
+        on_plan_ready: "Any | None" = None,
     ) -> TeamResult:
         """Run the full topology for *topic* under *blueprint*.
 
@@ -92,6 +95,26 @@ class OrchestratorWorkers:
         if _p:
             await _p(f"✅ 已分解为 {len(subtasks)} 个子任务，开始并行调研...")
 
+        # --- HITL plan approval gate ---
+        if on_plan_ready is not None:
+            subtask_text = "\n".join(subtasks)
+            decision = await on_plan_ready("deep_research", subtask_text)
+            if decision == "denied" or decision == "timeout":
+                return TeamResult(
+                    full_report="",
+                    summary="",
+                    subtasks=subtasks,
+                    error="Subtask decomposition rejected by user"
+                    if decision == "denied"
+                    else "Plan approval timed out",
+                )
+            if decision not in ("approved", "denied", "timeout"):
+                edited = self._parse_subtasks(decision, blueprint.max_workers)
+                if edited:
+                    subtasks = edited
+                    if _p:
+                        await _p(f"📝 用户已编辑子任务，共 {len(subtasks)} 项")
+
         worker_tools = self._select_tools(parent_tools, blueprint.worker.tool_names)
         all_results: list[SubAgentResult] = []
         all_subtasks: list[str] = list(subtasks)
@@ -102,7 +125,7 @@ class OrchestratorWorkers:
         if _p:
             await _p(f"📊 第一轮调研完成：{ok}/{len(results)} 个子任务成功，正在综合分析...")
 
-        full_report, summary = await self._synthesize(
+        full_report, summary, sources = await self._synthesize(
             topic, subtasks, results, blueprint
         )
 
@@ -131,7 +154,7 @@ class OrchestratorWorkers:
 
             if _p:
                 await _p(f"📊 第 {rnd} 轮完成，正在重新综合...")
-            full_report, summary = await self._synthesize(
+            full_report, summary, sources = await self._synthesize(
                 topic, all_subtasks, all_results, blueprint
             )
 
@@ -141,6 +164,7 @@ class OrchestratorWorkers:
             subtasks=all_subtasks,
             worker_results=all_results,
             usage=self._sum_usage(all_results),
+            sources=sources,
         )
 
     # -- phases ---------------------------------------------------------------
@@ -258,15 +282,22 @@ class OrchestratorWorkers:
         subtasks: list[str],
         results: list[SubAgentResult],
         blueprint: TeamBlueprint,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list[str]]:
         from core.runner import AgentInput
 
         findings = self._format_findings(subtasks, results)
+        sources = self._extract_urls(results)
+        sources_text = "\n".join(f"- {u}" for u in sources) if sources else "（无）"
+
         messages = [
             {"role": "system", "content": blueprint.synthesis_prompt},
             {
                 "role": "user",
-                "content": f"研究主题：{topic}\n\n各子任务的调研发现：\n\n{findings}",
+                "content": (
+                    f"研究主题：{topic}\n\n"
+                    f"各子任务的调研发现：\n\n{findings}\n\n"
+                    f"调研中访问过的 URL 来源（请在报告中适当引用）：\n\n{sources_text}"
+                ),
             },
         ]
 
@@ -280,11 +311,13 @@ class OrchestratorWorkers:
                 )
             )
             if not out.error and out.content:
-                report, summary = self._split_report(out.content)
+                report, summary, extracted_sources = self._split_report(out.content)
+                if not extracted_sources:
+                    extracted_sources = sources
                 if report and report != out.content:
-                    return report, summary
+                    return report, summary, extracted_sources
                 if len(out.content) > 200:
-                    return report, summary
+                    return report, summary, extracted_sources
 
             if attempt == 0:
                 logger.warning(
@@ -294,7 +327,8 @@ class OrchestratorWorkers:
 
         # Both attempts failed — build a fallback report from raw findings
         logger.warning("Synthesis failed after 2 attempts, building fallback report")
-        return self._fallback_report(topic, subtasks, results)
+        report, summary = self._fallback_report(topic, subtasks, results)
+        return report, summary, self._extract_urls(results)
 
     # -- helpers --------------------------------------------------------------
 
@@ -399,19 +433,41 @@ class OrchestratorWorkers:
         return "\n".join(parts)
 
     @staticmethod
-    def _split_report(content: str) -> tuple[str, str]:
-        """Split synthesis output into (full_report, summary) by tags.
+    def _split_report(content: str) -> tuple[str, str, list[str]]:
+        """Split synthesis output into (full_report, summary, sources).
 
-        Expects ``<summary>…</summary>`` and ``<report>…</report>``; falls
-        back to using the whole text as the report and its head as summary.
+        Expects ``<summary>…</summary>``, ``<sources>…</sources>``, and
+        ``<report>…</report>``; falls back to using the whole text as the
+        report and its head as summary.
         """
         summary = _extract_tag(content, "summary")
         report = _extract_tag(content, "report")
+        sources_text = _extract_tag(content, "sources")
+        sources: list[str] = []
+        if sources_text:
+            sources = [
+                u.strip() for u in _URL_RE.findall(sources_text) if u.strip()
+            ]
         if not report:
             report = content.strip()
         if not summary:
             summary = report[:400]
-        return report, summary
+        return report, summary, sources
+
+    @staticmethod
+    def _extract_urls(results: list[SubAgentResult]) -> list[str]:
+        """Extract unique URLs from worker result content."""
+        seen: set[str] = set()
+        urls: list[str] = []
+        for res in results:
+            if not res.success or not res.content:
+                continue
+            for m in _URL_RE.finditer(res.content):
+                url = m.group(0).rstrip(".,;:!")
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+        return urls
 
     @staticmethod
     def _sum_usage(results: list[SubAgentResult]) -> dict[str, int]:

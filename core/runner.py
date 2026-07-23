@@ -75,6 +75,10 @@ class AgentInput:
     """Temperature override for the reflection call (None = use class default)."""
     reflect_max_tokens: int | None = None
     """Max-tokens override for the reflection call."""
+    on_plan_ready: Callable[[str, str], Awaitable[str]] | None = None
+    """Async callback invoked when a plan is ready for user review.
+    Receives (plan_type, plan_content).  Returns ``"approved"``, ``"denied"``,
+    or edited plan text.  When ``None`` the plan proceeds without review."""
 
 
 @dataclass

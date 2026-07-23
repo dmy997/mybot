@@ -185,16 +185,18 @@ class TestParseSubtasks:
 
 class TestSplitReport:
     def test_tags(self):
-        report, summary = OrchestratorWorkers._split_report(
+        report, summary, sources = OrchestratorWorkers._split_report(
             "<summary>sum</summary>\n<report>rep</report>"
         )
         assert report == "rep"
         assert summary == "sum"
+        assert sources == []
 
     def test_no_tags_fallback(self):
-        report, summary = OrchestratorWorkers._split_report("just plain text")
+        report, summary, sources = OrchestratorWorkers._split_report("just plain text")
         assert report == "just plain text"
         assert summary.startswith("just plain text")
+        assert sources == []
 
 
 class TestSelectTools:

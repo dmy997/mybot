@@ -23,12 +23,14 @@ from loguru import logger
 from context.compaction import CompactionService, _estimate_message_tokens
 from context.token_budget import TokenBudget
 from memory.consolidator import Consolidator
+from memory.scrubber import build_memory_context_block
 from utils import render_template
 
 from .memory_service import MemoryService
 from .session_store import SessionStore
 
 if TYPE_CHECKING:
+    from memory.manager import MemoryManager
     from tools import ToolRegistry
 
 # Re-export for backward compatibility (used by core/runner.py)
@@ -117,6 +119,7 @@ class ContextManager:
         hybrid_store: object | None = None,
         max_session_messages: int = 2000,
         session_ttl_days: int = 30,
+        memory_manager: MemoryManager | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.system_prompt = system_prompt
@@ -163,10 +166,16 @@ class ContextManager:
             session_manager=self.session,
         )
 
-        # Three-layer partitioned prompt cache
+        # Auto-create MemoryManager with builtin provider if none given
+        if memory_manager is None:
+            from memory.builtin_provider import BuiltinMemoryProvider
+            from memory.manager import MemoryManager as _MM
+            memory_manager = _MM()
+            memory_manager.add_provider(BuiltinMemoryProvider(self.memory))
+        self._memory_manager = memory_manager
+
+        # Two-layer partitioned prompt cache (static + frozen snapshot)
         self._static_prompt: str | None = None
-        self._memory_cache: dict[str, str] = {}
-        self._memory_cache_max = 50
 
         self._provider = provider
         self._compress_model = compress_model
@@ -265,9 +274,11 @@ class ContextManager:
     # Delegation — memory operations (→ MemoryService)
     # ========================================================================
 
-    def _build_memory_context(self, query: str | None = None) -> str:
+    def _build_memory_context(
+        self, session_key: str = "", query: str | None = None,
+    ) -> str:
         """Build the memory section for system-prompt injection."""
-        return self.memory.build_memory_context(query=query)
+        return self.memory.build_memory_context(session_key=session_key, query=query)
 
     def remember(
         self,
@@ -279,13 +290,28 @@ class ContextManager:
     ) -> None:
         """Append a fact to MEMORY.md (dedup by content)."""
         self.memory.remember(name, content, mem_type=mem_type, description=description)
-        self._invalidate_memory_cache()
+
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._memory_manager.on_memory_write("add", "memory", content)
+            )
+        except RuntimeError:
+            pass
 
     def forget(self, name: str) -> bool:
         """Remove a fact from MEMORY.md by name match."""
         result = self.memory.forget(name)
         if result:
-            self._invalidate_memory_cache()
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self._memory_manager.on_memory_write("remove", "memory", name)
+                )
+            except RuntimeError:
+                pass
         return result
 
     def recall(
@@ -343,15 +369,24 @@ class ContextManager:
         if static:
             parts.append(static)
 
-        mem_key = f"{session_key or 'default'}:{hash(query or '') % 20}"
-        if mem_key not in self._memory_cache:
-            self._memory_cache[mem_key] = self._build_memory_context(query)
-            if len(self._memory_cache) > self._memory_cache_max:
-                oldest = next(iter(self._memory_cache))
-                self._memory_cache.pop(oldest)
-        memory_ctx = self._memory_cache[mem_key]
+        # External provider instructions (one-off per provider, not per-turn)
+        ext_block = await self._memory_manager.build_system_prompt()
+        if ext_block.strip():
+            parts.append(ext_block)
+
+        # Frozen memory snapshot (SOUL + USER + MEMORY) — stable across turns
+        memory_ctx = build_memory_context_block(
+            self._build_memory_context(session_key, query=query)
+        )
         if memory_ctx.strip():
             parts.append(memory_ctx)
+
+        # External provider recall context (dynamic per-turn)
+        prefetch_ctx = await self._memory_manager.prefetch_all(
+            query or "", session_id=session_key,
+        )
+        if prefetch_ctx.strip():
+            parts.append(build_memory_context_block(prefetch_ctx))
 
         if messages:
             file_ctx = self._extract_file_context(messages)
@@ -597,14 +632,11 @@ class ContextManager:
         self._static_prompt = None
 
     def _invalidate_memory_cache(self, session_key: str | None = None) -> None:
-        """Invalidate the memory-context cache layer."""
+        """Invalidate the frozen memory snapshot for *session_key* (or all)."""
         if session_key is None:
-            self._memory_cache.clear()
+            self.memory._snapshots.clear()
         else:
-            prefix = f"{session_key}:"
-            keys = [k for k in self._memory_cache if k.startswith(prefix)]
-            for k in keys:
-                self._memory_cache.pop(k, None)
+            self.memory.invalidate_snapshot(session_key)
 
     # ========================================================================
     # Core context assembly (inlined from CoreContextMixin)

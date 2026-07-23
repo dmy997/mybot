@@ -2,10 +2,16 @@
 
 Extracted from ContextManager so memory CRUD and context building can be
 tested and reasoned about independently of session persistence and compression.
+
+Supports a **frozen snapshot** pattern: on the first call with a *session_key*,
+SOUL.md + USER.md + MEMORY.md are captured and cached.  Subsequent calls return
+the frozen copy unchanged — keeping the system prompt prefix stable for LLM
+prefix caching.  Mid-session writes update the live files but not the snapshot.
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from loguru import logger
@@ -26,16 +32,35 @@ class MemoryService:
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.store = MemoryStore(self.workspace, hybrid_store=hybrid_store)
+        self._snapshots: dict[str, tuple[str, float]] = {}
 
     # -- memory context -------------------------------------------------------
 
-    def build_memory_context(self, query: str | None = None) -> str:
+    def build_memory_context(
+        self, session_key: str = "", query: str | None = None,
+    ) -> str:
         """Build the memory section for system-prompt injection.
+
+        When *session_key* is provided, the first call freezes a snapshot
+        and subsequent calls return the frozen copy unchanged (prefix-cache
+        stable).  When *session_key* is empty, reads fresh from disk every
+        time (backward-compatible behaviour).
 
         When *query* is provided, MEMORY.md is relevance-filtered via
         hybrid search instead of full concatenation.  SOUL.md and USER.md
         are always injected in full.
         """
+        if session_key:
+            if session_key not in self._snapshots:
+                self._snapshots[session_key] = (
+                    self._build_fresh(query=query), time.time(),
+                )
+            snapshot, _ = self._snapshots[session_key]
+            return snapshot
+        return self._build_fresh(query=query)
+
+    def _build_fresh(self, query: str | None = None) -> str:
+        """Read SOUL.md + USER.md + MEMORY.md fresh from disk."""
         parts: list[str] = []
 
         soul = self.store.read_soul()
@@ -51,6 +76,14 @@ class MemoryService:
             parts.append(memory_ctx)
 
         return "\n\n---\n\n".join(parts) if parts else ""
+
+    def invalidate_snapshot(self, session_key: str) -> None:
+        """Clear the frozen snapshot for *session_key*.
+
+        The next call to :meth:`build_memory_context` will re-freeze from
+        the current disk state.  Call this on session switch / reset.
+        """
+        self._snapshots.pop(session_key, None)
 
     def remember(
         self,

@@ -69,4 +69,5 @@ class BaseAgent(ABC):
             on_tool_execute_end=overrides.get("on_tool_execute_end", spec.on_tool_execute_end),
             on_new_turn=overrides.get("on_new_turn", spec.on_new_turn),
             checkpoint=overrides.get("checkpoint", spec.checkpoint),
+            on_plan_ready=overrides.get("on_plan_ready", spec.on_plan_ready),
         )

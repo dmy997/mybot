@@ -57,15 +57,20 @@ async def build_messages(
 
 ## 系统提示词组装
 
-采用 **两层缓存 + 动态注入 + 语义过滤** 结构：
+采用 **两层缓存 + 动态注入 + 语义过滤 + 双层记忆** 结构：
 
 ```
 Layer 1: Static（base prompt + skills + tools）
     └─ 缓存，仅在工具变更时失效
     └─ 当语义过滤开启时绕过缓存（输出随 query 变化）
 
-Layer 2: Memory context（SOUL.md + USER.md + MEMORY.md 长期记忆）
-    └─ 按 (session, query_bucket) 缓存，remember/forget 时失效
+Layer 2: Memory context（冻结快照 + 外部提供者）
+    ├─ MemoryManager.build_system_prompt()  ← 外部提供者静态指令
+    ├─ MemoryService 冻结快照               ← SOUL + USER + MEMORY（首次读盘，后续缓存）
+    │   └─ 按 session_key 冻结，整个会话不变（LLM prefix cache 优化）
+    ├─ MemoryManager.prefetch_all(query)    ← 外部提供者动态召回
+    └─ 全部包裹在 <memory-context> 围栏中
+    └─ remember/forget 时不失效快照（写入磁盘但快照不变）
 
 Semantic filtering（P1，嵌入 Layer 1 和 Dynamic）:
     ├─ Skill 三级合并: explicit + keyword-triggered + semantic top-k (余弦相似度)
@@ -90,17 +95,30 @@ def _build_history_context(self, max_entries=20, max_chars=16_000) -> str:
 
 这确保：Consolidator 刚写入的摘要无需等 2 小时 Dream 周期，在下一轮对话中就立即可见。
 
-### 长期记忆注入
+### 长期记忆注入 (冻结快照)
 
-`MemoryStore.get_memory_context()` — 将 `MEMORY.md` 内容直接注入提示词：
+`MemoryService.build_memory_context(session_key, query)` — 首次调用从磁盘读取 SOUL.md + USER.md + MEMORY.md 并冻结为快照，同一会话后续调用返回缓存不变。快照内容包裹在 `<memory-context>` 围栏中注入提示词：
 
 ```python
-def get_memory_context(self) -> str:
-    content = self.read_memory_file()
-    if not content.strip() or self._is_template_content(content):
-        return ""
-    return f"## Long-term Memory\n\n{content}"
+def build_memory_context(self, session_key: str = "", query: str | None = None) -> str:
+    if session_key and session_key in self._snapshots:
+        return self._snapshots[session_key][0]  # 缓存命中
+    context = self._build_fresh(query)  # 读 SOUL + USER + MEMORY
+    if session_key:
+        self._snapshots[session_key] = (context, time.monotonic())
+    return context
 ```
+
+**设计意图**：保持 LLM prefix cache 在整个会话中持续命中。`remember()`/`forget()` 写入磁盘但不失效快照。
+`invalidate_snapshot(session_key)` 在会话删除/切换时清除缓存。
+
+### 外部记忆注入
+
+`MemoryManager` 协调外部提供者参与系统提示词组装：
+- `build_system_prompt()` — 外部提供者的静态指令（如 "[External memory active]"）
+- `prefetch_all(query, session_id)` — 按查询动态召回外部记忆内容
+
+两者结果均通过 `build_memory_context_block()` 包裹在 `<memory-context>` 围栏中，由 `StreamingContextScrubber` 在流式输出中清洗。
 
 ## Token 预算
 
@@ -302,11 +320,20 @@ ContextManager.build_messages()
   │     │     └── 工具列表（name + description）
   │     │     # 语义过滤开启时绕过缓存；否则无限期缓存
   │     │
-  │     ├── Layer 2: _build_memory_context()
-  │     │     ├── store.read_soul()      → "Identity" 段落
-  │     │     ├── store.read_user()      → "User Profile" 段落
-  │     │     └── store.get_memory_context() → "Long-term Memory" 段落
-  │     │     # 按 (session, query_bucket) 缓存，remember/forget 时失效
+  │     ├── Layer 2: MemoryManager.build_system_prompt()
+  │     │     └── 外部提供者静态指令（无则跳过）
+  │     │
+  │     ├── Layer 2: _build_memory_context(session_key, query)
+  │     │     └── MemoryService.build_memory_context(session_key, query)
+  │     │         ├── session_key 有快照 → 返回冻结快照（LLM prefix cache 命中）
+  │     │         └── 首次 → _build_fresh(query)
+  │     │             ├── store.read_soul()      → "Identity" 段落
+  │     │             ├── store.read_user()      → "User Profile" 段落
+  │     │             └── store.get_memory_context(query) → MEMORY.md (相关性过滤)
+  │     │     └── 包裹在 <memory-context> 围栏中
+  │     │
+  │     ├── Layer 2: MemoryManager.prefetch_all(query, session_id)
+  │     │     └── 外部提供者动态召回 → 包裹在 <memory-context> 围栏中
   │     │
   │     ├── Dynamic: _extract_file_context(messages)
   │     │     从最近消息中提取文件路径引用并读取
@@ -408,6 +435,8 @@ ContextManager(token_budget=TokenBudget(...))
 - **双系统并存**: CompactionService（游标推进，无 LLM）+ Consolidator（LLM 摘要 → history.jsonl），职责清晰
 - **非破坏性压缩**: 原始消息永不修改，通过游标推进实现渐进压缩
 - **分区缓存**: 提示词静态层 + 记忆层独立缓存，不同频率的失效互不干扰；语义过滤开启时绕过静态缓存
+- **冻结快照**: 记忆内容按 session_key 冻结（首次读盘，后续返回缓存），保持 LLM prefix cache 命中
+- **双层记忆**: MemoryManager 协调内置（MemoryService）和外部提供者，外部内容用 `<memory-context>` 围栏隔离
 - **语义过滤**: Skill 三级合并（explicit + keyword-triggered + semantic top-k）+ Tool 余弦相似度排序，按 query 动态筛选
 - **记忆可见性**: Consolidator 写入的摘要立即可见（Recent History），Dream 合并后转为长期记忆
 - **废止**: SessionMemory 已移除（587 行），Path B 质量评分逻辑同步删除；breaker 逻辑已移除（CompactionService 不再调用 LLM）

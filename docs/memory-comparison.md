@@ -1,6 +1,6 @@
 # 记忆系统对比分析
 
-> **注意**：本文档撰写时 mybot 尚无检索能力。此后已实现 HybridStore（SQLite + sqlite-vec + FTS5 BM25 混合搜索，30 天时间衰减），以下 mybot 相关条目中检索能力的描述部分已过时。
+> **注意**：本文档撰写时 mybot 尚无检索能力。此后已实现 HybridStore（SQLite + sqlite-vec + FTS5 BM25 混合搜索，30 天时间衰减）+ **双层记忆架构**（MemoryProvider ABC + MemoryManager + 冻结快照 + `<memory-context>` 围栏），以下 mybot 相关条目中检索能力的描述部分已过时。
 
 nanobot、Claude Code、OpenClaw、mybot 四个项目的记忆系统，从存储、写入触发、召回到上下文三个维度对比。
 
@@ -263,7 +263,9 @@ prompt_templates/
 | ~~旧格式检索~~ | 已移除 | 所有记忆通过 MEMORY.md 全文注入；手动 recall 为混合搜索（向量 + BM25） | — |
 
 **特点**：
-- **全文注入**：SOUL.md, USER.md, MEMORY.md 始终全部注入（同 nanobot）
+- **冻结快照注入**：SOUL.md + USER.md + MEMORY.md 首次读盘后按 session_key 冻结，同一会话后续返回缓存不变（LLM prefix cache 优化）
+- **双层记忆架构**：MemoryManager 协调内置 (BuiltinMemoryProvider) + 可选外部提供者 (MemoryProvider ABC)，故障隔离，最多一个外部
+- **上下文围栏**：外部提供者内容包裹在 `<memory-context>` 标签中注入，StreamingContextScrubber 在流式输出中清洗
 - **过渡层**：history.jsonl 未处理条目作为 "Recent History" 注入（同 nanobot）
 - **混合搜索**：HybridStore（SQLite + sqlite-vec 384 维向量 + FTS5 BM25），0.7 向量 / 0.3 BM25 分数融合，30 天半衰期时间衰减（MEMORY.md 豁免）；集成于 ContextManager.recall() / MemoryService.recall()
 - **无 Chunk 级召回**：返回完整文件内容，不支持文本块级检索
@@ -278,7 +280,7 @@ prompt_templates/
 | **去重** | 无 | 已展示记忆去重 | MMR 多样性 | 无 |
 | **过渡层** | history.jsonl 未处理条目 | 无（Extraction 每轮直接写文件） | Memory Flush + Dream 各阶段 | history.jsonl 未处理条目 |
 | **阻塞/异步** | 同步（提示词组装） | 异步 prefetch（非阻塞） | 同/异步混合（Active Memory 阻塞） | 同步（提示词组装） |
-| **缓存** | memory_cache（session+query 分区） | System prompt 缓存 + SideQuery 独立 | 向量缓存（按 provider/model/hash） | memory_cache（同 nanobot） |
+| **缓存** | memory_cache（session+query 分区） | System prompt 缓存 + SideQuery 独立 | 向量缓存（按 provider/model/hash） | 冻结快照（per session_key，prefix cache 优化） |
 | **跨会话** | 是 | 是 | 是 | 是 |
 
 ---
@@ -292,7 +294,7 @@ prompt_templates/
 | **搜索能力** | 无（全文注入） | Sonnet sideQuery 语义选择（≤5 文件） | 向量 + BM25 混合 + MMR + 时间衰减 | 向量 + BM25 混合 + 时间衰减 |
 | **存储引擎** | 文件系统（Markdown/JSONL） | 文件系统（Markdown + frontmatter） | 文件系统 + SQLite（FTS5 + sqlite-vec） | 文件系统（Markdown/JSONL） |
 | **记忆类型数** | 4（USER/SOUL/MEMORY/SKILL） | 4（user/feedback/project/reference） | 多样化（MEMORY.md, daily notes, DREAMS.md, DREAMS, session transcripts） | 统一格式（MEMORY.md，旧 format 4 类型已移除） |
-| **可扩展性** | 中（skill 系统是独特创新） | 高（SideQuery 语义选择很实用） | 最高（SQLite 支持大规模，MMR 保证多样性） | 中（已有混合搜索，chunk 级尚未实现） |
+| **可扩展性** | 中（skill 系统是独特创新） | 高（SideQuery 语义选择很实用） | 最高（SQLite 支持大规模，MMR 保证多样性） | 中高（双层层架构 + 可插拔提供者 + 混合搜索） |
 | **复杂度** | 中 | 高（5 层 CLAUDE.md + Extraction + Dream + Session Memory） | 最高（SQLite 后端 + 嵌入 + FTS + cron 三阶段 Dream） | 低（简洁，易于理解） |
 
 ---
@@ -315,6 +317,8 @@ prompt_templates/
 
 ### P3 — 长期愿景
 
-7. **Heartbeat 服务**：参考 nanobot 的 HeartbeatService + OpenClaw 的 HEARTBEAT.md，实现周期任务检查
-8. **Skill 系统**：参考 nanobot 的 Dream Phase 1 `[SKILL]` 指令 + SKILL.md 文件，将重复工作流自动提取为可复用指令
-9. **Chunk 级粒度**：大文件分块存储和检索，减少上下文浪费
+7. ~~**Heartbeat 服务**~~：已完成 — `services/heartbeat.py`
+8. ~~**Skill 系统**~~：已完成 — Dream 现在支持 `[SKILL]` 指令自动提取可复用工作流
+9. ~~**双层记忆架构**~~：已完成 — MemoryProvider ABC + BuiltinMemoryProvider + MemoryManager + 冻结快照 + `<memory-context>` 围栏
+10. ~~**上下文围栏**~~：已完成 — `memory/scrubber.py`，StreamingContextScrubber 流式清洗
+11. **Chunk 级粒度**：大文件分块存储和检索，减少上下文浪费

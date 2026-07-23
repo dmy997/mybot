@@ -51,7 +51,30 @@ workspace/
 
 ## 核心架构
 
-记忆系统管理三份核心文件 + 一份中间存储，全部由 Dream 周期维护：
+记忆系统采用 **双层架构**：内置文件记忆层（始终活跃）+ 可插拔外部记忆提供者（最多一个）。
+
+```
+                         ┌──────────────────────────┐
+                         │     MemoryManager         │
+                         │  故障隔离 + 工具路由        │
+                         │  内置(builtin) + 外部插件   │
+                         └─────┬──────────┬──────────┘
+                               │          │
+                    ┌──────────┘          └──────────────┐
+                    ▼                                    ▼
+          ┌─────────────────┐                ┌──────────────────┐
+          │ BuiltinProvider  │                │ ExternalProvider  │
+          │ (包装现有系统)     │                │ (可选, 最多 1 个)  │
+          └────────┬────────┘                └──────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────────────────┐
+    │              MemoryService + MemoryStore              │
+    │         (文件 I/O + 混合搜索 + 冻结快照)               │
+    └──────────────────────────────────────────────────────┘
+```
+
+底层文件存储仍由 Dream 周期维护：
 
 ```
                     ┌─────────────────────────────────┐
@@ -102,9 +125,14 @@ Dream Phase 1（LLM 分析）产出 `[FILE]` 和 `[FILE-REMOVE]` 指令，Phase 
 | 模块 | 文件 | 职责 |
 |------|------|------|
 | MemoryStore | `memory/store.py` | 所有文件 I/O：SOUL.md, USER.md, MEMORY.md, history.jsonl, cursor 管理 |
+| **MemoryProvider** | `memory/provider.py` | 可插拔记忆后端的抽象基类 (ABC)，定义 `system_prompt_block`, `prefetch`, `sync_turn`, `handle_tool_call` 等生命周期钩子 |
+| **BuiltinMemoryProvider** | `memory/builtin_provider.py` | 内置记忆提供者，包装 MemoryService，提供 `memory_remember/recall/forget` 工具 schema |
+| **MemoryManager** | `memory/manager.py` | 协调内置 + 外部提供者，故障隔离，工具名路由，最多一个外部提供者 |
 | **Consolidator** | `memory/consolidator.py` | 实时 token 预算驱动的对话摘要（异步 fire-and-forget） |
 | **Dream** | `memory/dream.py` | 周期性 LLM 记忆合并（由 CronScheduler 触发） |
 | **CronScheduler** | `services/cron.py` | 通用自驱动定时调度器（nanobot `_arm_timer` 模式） |
+| **Provider Discovery** | `plugins/memory/__init__.py` | 扫描 `plugins/memory/` 目录发现外部 MemoryProvider 实现 |
+| **Context Scrubbing** | `memory/scrubber.py` | `<memory-context>` 标签清洗 + 流式输出状态机 |
 
 ## 1. MemoryStore — 纯文件 I/O
 
@@ -240,19 +268,128 @@ class CronScheduler:
 - **per-job 锁**: `asyncio.Lock` 防止并发执行同名 job
 - **状态持久化**: `cron_state.json` 记录上次运行时间，重启后按间隔继续
 
-## 5. 与上下文系统的集成
+## 5. 双层记忆架构 (Dual-Layer Memory)
 
-### 系统提示词注入
+### 5.1 MemoryProvider — 可插拔抽象基类
 
-`ContextManager._build_memory_context()` 直接从 MemoryStore 读取三份文件并组装为系统提示词：
+`memory/provider.py`
+
+所有记忆后端（内置或外部）须实现的 ABC。所有 IO 能力方法均为 `async`。
 
 ```python
-def _build_memory_context(self) -> str:
-    parts = []
-    soul = self.store.read_soul()        # SOUL.md — bot 身份
-    user = self.store.read_user()        # USER.md — 用户画像
-    memory = self.store.get_memory_context()  # MEMORY.md — 长期记忆
-    # 组装为 "Identity / User Profile / Long-term Memory" 三段
+class MemoryProvider(ABC):
+    # -- 必须实现 --
+    name: str                                      # 标识符, e.g. "builtin", "honcho"
+    def is_available() -> bool: ...                # 同步检查依赖/配置，不可联网
+    async def initialize(session_id, **kwargs): ... # 连接/创建资源
+    def get_tool_schemas() -> list[dict]: ...      # OpenAI function-calling schemas
+
+    # -- 可选（有默认 no-op）--
+    async def system_prompt_block() -> str: ...    # 静态指令注入
+    async def prefetch(query, *, session_id) -> str: ...  # 每轮动态召回
+    async def queue_prefetch(query, *, session_id): ...   # 后台预取（下一轮预热）
+    async def sync_turn(user, assistant, *, session_id): ...  # 持久化对话轮次
+    async def handle_tool_call(name, args) -> Any: ...  # 分发工具调用
+    async def on_session_end(messages): ...              # 会话结束钩子
+    async def on_memory_write(action, target, content, metadata): ...  # 镜像内置写入
+```
+
+### 5.2 BuiltinMemoryProvider — 内置提供者
+
+`memory/builtin_provider.py`
+
+始终活跃的提供者，包装现有的 `MemoryService`：
+
+- `name = "builtin"`，`is_available()` 永远返回 `True`
+- 提供 3 个工具 schema：`memory_remember`, `memory_recall`, `memory_forget`
+- `system_prompt_block()` 和 `prefetch()` 返回空字符串——内置记忆内容通过冻结快照路径注入
+- `handle_tool_call()` 路由到 `MemoryService.remember()/forget()/recall()`
+
+### 5.3 MemoryManager — 协调器
+
+`memory/manager.py`
+
+协调内置 + 可选外部提供者，关键行为：
+
+- **注册**: 内置始终接受；最多一个外部提供者（第二个被拒绝并警告）
+- **故障隔离**: 每个 `try/except` 包装所有提供者调用，一个失败不阻塞其他
+- **工具路由**: `tool_name → provider` 索引，首次注册优先
+- **Schema 去重**: `get_all_tool_schemas()` 跨提供者去重
+- **生命周期**: `initialize_all()` → `prefetch_all()` → `sync_all()` → `shutdown_all()`
+- **会话钩子**: `on_session_end()` 和 `on_memory_write()` 仅转发给外部提供者
+
+### 5.4 提供者发现
+
+`plugins/memory/__init__.py`
+
+`discover_providers(workspace)` 扫描两个位置：
+1. 捆绑的 `plugins/memory/` 目录
+2. 工作区 `workspace/plugins/memory/` 目录
+
+发现机制：导入目录下的 Python 包 → 查找 `MemoryProvider` 子类 → 实例化 → 检查 `is_available()`。
+
+### 5.5 冻结快照 (Frozen Snapshot)
+
+`context/memory_service.py` — `MemoryService.build_memory_context()`
+
+首次调用（per session_key）读取 SOUL.md + USER.md + MEMORY.md 并缓存为"冻结快照"。同一会话的后续调用返回缓存的快照不变。
+
+```python
+# 首次调用: 读取磁盘 → 缓存快照
+snapshot = memory.build_memory_context(session_key="sess-1")
+# 后续调用: 返回缓存（保持 LLM prefix cache 命中）
+snapshot = memory.build_memory_context(session_key="sess-1")
+
+# 会话切换/重置时失效
+memory.invalidate_snapshot("sess-1")
+```
+
+**设计意图**: 保持系统提示词前缀稳定，使 LLM 的 prefix caching 在整个会话中持续命中，降低成本。
+
+### 5.6 上下文围栏 (Context Fencing)
+
+`memory/scrubber.py`
+
+外部记忆提供者的内容包裹在 `<memory-context>` 标签中注入系统提示词，由 `build_memory_context_block()` 构建围栏块：
+
+```python
+build_memory_context_block("外部记忆内容")
+# → "[System note: ...]\n<memory-context>\n外部记忆内容\n</memory-context>"
+```
+
+`StreamingContextScrubber` 是有状态流式输出清洗器，处理跨块分割的标签：
+- `feed(chunk)` — 输入流式块，返回可见（非清洗）部分
+- `flush()` — 流结束时排出持有的缓冲区
+- 如果流在不匹配的 `<memory-context>` 中结束，丢弃内容（视为未闭合围栏）
+
+## 6. 与上下文系统的集成
+
+### 系统提示词组装
+
+`ContextManager._build_system_prompt()` 按以下顺序组装记忆内容：
+
+```
+1. MemoryManager.build_system_prompt()     ← 外部提供者的静态指令
+2. MemoryService.build_memory_context()    ← 冻结快照 (SOUL + USER + MEMORY)
+     └─ 包裹在 <memory-context> 围栏中
+3. MemoryManager.prefetch_all(query)       ← 外部提供者的动态召回
+     └─ 包裹在 <memory-context> 围栏中
+4. _build_history_context()               ← Dream 未处理的 history.jsonl 条目
+```
+
+### 冻结快照注入
+
+`MemoryService.build_memory_context(session_key, query)` — 首次调用从磁盘读取三份文件并缓存；后续调用返回缓存不变：
+
+```python
+def build_memory_context(self, session_key: str = "", query: str | None = None) -> str:
+    if session_key and session_key in self._snapshots:
+        return self._snapshots[session_key][0]  # 缓存命中
+    # 首次: 读取 SOUL.md + USER.md + MEMORY.md → 缓存 → 返回
+    context = self._build_fresh(query)
+    if session_key:
+        self._snapshots[session_key] = (context, time.monotonic())
+    return context
 ```
 
 `ContextManager._build_history_context()` 将 Dream 尚未处理的 `history.jsonl` 条目注入到系统提示词中，确保新近对话在下次 Dream 运行前就对 LLM 可见：
@@ -264,9 +401,9 @@ def _build_history_context(self, max_entries=20, max_chars=16_000) -> str:
     # 格式化最近的摘要条目，注入提示词
 ```
 
-## 6. 代码调用链
+## 7. 代码调用链
 
-### 6.1 系统启动：记忆系统初始化
+### 7.1 系统启动：记忆系统初始化
 
 ```
 Orchestrator.__init__()                               # core/orchestrator.py:92
@@ -274,6 +411,11 @@ Orchestrator.__init__()                               # core/orchestrator.py:92
   │   ├─ _ensure_dir("memory/")
   │   └─ _ensure_dir("cron/")
   ├─ ctx = ContextManager(workspace, store, provider)
+  ├─ MemoryManager()                                  # memory/manager.py
+  │   ├─ add_provider(BuiltinMemoryProvider(ctx.memory))
+  │   └─ discover_providers(workspace)                # plugins/memory/__init__.py
+  │       └─ 扫描 plugins/memory/ → MemoryProvider 子类
+  ├─ ctx._memory_manager = memory_manager              # 注入到 ContextManager
   ├─ Consolidator(store, provider, model)             # memory/consolidator.py:37
   ├─ Dream(store, provider, model)                    # memory/dream.py:41
   ├─ cron = CronScheduler(state_dir, on_job=...)      # services/cron.py:58
@@ -282,7 +424,7 @@ Orchestrator.__init__()                               # core/orchestrator.py:92
       └─ _arm_timer() → sleep → _on_timer() loop      # services/cron.py:168→195
 ```
 
-### 6.2 对话后 Consolidation（实时，fire-and-forget）
+### 7.2 对话后 Consolidation（实时，fire-and-forget）
 
 ```
 Orchestrator.process_message()                        # core/orchestrator.py:267
@@ -310,7 +452,7 @@ Orchestrator.process_message()                        # core/orchestrator.py:267
      #   删除 messages[:min(cursor, last_consolidated)]   # context/session.py
 ```
 
-### 6.3 Dream 周期合并（每 2 小时，CronScheduler 触发）
+### 7.3 Dream 周期合并（每 2 小时，CronScheduler 触发）
 
 ```
 CronScheduler._on_timer()                             # services/cron.py:195
@@ -331,7 +473,7 @@ CronScheduler._on_timer()                             # services/cron.py:195
           └─ store.set_dream_cursor(new_cursor)       # 推进消费游标
 ```
 
-### 6.4 上下文组装：记忆注入 LLM
+### 7.4 上下文组装：记忆注入 LLM
 
 ```
 ContextManager.build_messages(session_key, user_input) # context/context_manager.py:295
@@ -340,17 +482,39 @@ ContextManager.build_messages(session_key, user_input) # context/context_manager
       │   ├─ 基础 system prompt 模板
       │   ├─ SkillsLoader 注入活跃 skill 的 SKILL.md
       │   └─ 工具定义注入
-      ├─ _build_memory_context()                       # 读取三份文件
-      │   ├─ store.read_soul()        → "Identity" 段落
-      │   ├─ store.read_user()        → "User Profile" 段落
-      │   └─ store.get_memory_context() → "Long-term Memory" 段落
+      ├─ MemoryManager.build_system_prompt()           # 外部提供者静态指令
+      ├─ _build_memory_context(session_key, query)     # 冻结快照（首次读磁盘，后续缓存）
+      │   └─ MemoryService.build_memory_context(session_key, query)
+      │       ├─ session_key 有缓存 → 返回冻结快照（LLM prefix cache 命中）
+      │       └─ 首次 → _build_fresh(query)
+      │           ├─ store.read_soul()    → SOUL.md
+      │           ├─ store.read_user()    → USER.md
+      │           └─ store.get_memory_context(query) → MEMORY.md (含相关性过滤)
+      │       └─ 包裹在 <memory-context> 围栏中
+      ├─ MemoryManager.prefetch_all(query, session_id) # 外部提供者动态召回
+      │   └─ 包裹在 <memory-context> 围栏中
       └─ _build_history_context(max_entries=20)        # 过渡层
           ├─ store.get_dream_cursor()
           ├─ store.read_history(since_cursor=dream_cursor)  # 未处理条目
           └─ 格式化为 "Recent History" 段落 (max 16K chars)
 ```
 
-### 6.5 MemoryStore 原子写入保障
+### 7.5 对话后同步
+
+```
+Orchestrator.process_message() 续
+  └─ 保存交换后:
+      ├─ MemoryManager.sync_all(user_input, assistant, session_id=session_key)
+      │   └─ 外部提供者持久化对话轮次（故障隔离）
+      └─ MemoryManager.queue_prefetch_all(next_input, session_id=session_key)
+          └─ 外部提供者后台预取（下一轮预热）
+
+Orchestrator.delete_session(key)
+  ├─ ctx.memory.invalidate_snapshot(key)       # 清除冻结快照
+  └─ memory_manager.on_session_end(messages)   # 通知外部提供者
+```
+
+### 7.6 MemoryStore 原子写入保障
 
 所有关键写入使用统一模式:
 
@@ -364,9 +528,9 @@ MemoryStore._atomic_write(path, content)
 
 此模式应用于 `write_memory_file`, `append_history`, `_write_entries`, `write_soul`, `write_user`。
 
-## 七、混合搜索 (Hybrid Search)
+## 8. 混合搜索 (Hybrid Search)
 
-### 7.1 概述
+### 8.1 概述
 
 `HybridStore` (`memory/hybrid_store.py`) 为 MEMORY.md 和 history.jsonl 提供语义 + 关键词混合搜索，替代原有的纯子串匹配。
 
@@ -383,7 +547,7 @@ HybridStore
 └── 时间衰减           — history.jsonl 条目指数衰减，MEMORY.md 永久豁免
 ```
 
-### 7.2 评分融合
+### 8.2 评分融合
 
 ```
 # 向量路径: cosine distance → similarity
@@ -401,7 +565,7 @@ decay = exp(-ln(2) / 30 * age_days)
 decayed_score = final_score * decay
 ```
 
-### 7.3 索引触发
+### 8.3 索引触发
 
 | 操作 | 触发点 | 文件:行 |
 |------|--------|---------|
@@ -410,7 +574,7 @@ decayed_score = final_score * decay
 | `remember()` | 委托 `store.write_memory_file()` | `context_manager.py:843` |
 | `forget()` | 委托 `store.write_memory_file()` | `context_manager.py:861` |
 
-### 7.4 搜索调用链
+### 8.4 搜索调用链
 
 ```
 memory_recall 工具                                   tools/memory_tools.py:111
@@ -424,14 +588,14 @@ memory_recall 工具                                   tools/memory_tools.py:111
               (原有子串匹配，不依赖 SQLite/embeddings)
 ```
 
-### 7.5 优雅降级
+### 8.5 优雅降级
 
 - **sqlite-vec 不可用**: 仅使用 FTS5 关键词搜索（`_has_vec = False`）
 - **sentence-transformers 不可用**: 回退到 `_substring_recall()` 子串匹配
 - **整个 HybridStore 创建失败**: `Orchestrator` 设 `hybrid_store = None`，`ContextManager.recall()` 自动使用子串回退
 - **搜索异常**: `recall()` 捕获异常后回退到子串匹配
 
-### 7.6 环境变量
+### 8.6 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|

@@ -228,6 +228,22 @@ class Config:
     (``HITL_SERVER_URL``).  Defaults to ``http://127.0.0.1:8080``."""
 
     # ------------------------------------------------------------------
+    # Plan approval
+    # ------------------------------------------------------------------
+
+    plan_approval_enabled: bool = (
+        os.getenv("PLAN_APPROVAL_ENABLED", "false").lower() == "true"
+    )
+    """Enable plan approval HITL for plan_solve and deep_research agents
+    (``PLAN_APPROVAL_ENABLED``).  Default ``false``."""
+
+    plan_approval_timeout_seconds: int = int(
+        os.getenv("PLAN_APPROVAL_TIMEOUT_SECONDS", "300")
+    )
+    """Seconds to wait for user plan approval before auto-denying
+    (``PLAN_APPROVAL_TIMEOUT_SECONDS``).  Default 300 (5 minutes)."""
+
+    # ------------------------------------------------------------------
     # Reflection
     # ------------------------------------------------------------------
 
@@ -334,6 +350,14 @@ class Config:
         cls.hitl_server_url = os.getenv(
             "HITL_SERVER_URL",
             f"http://127.0.0.1:{os.getenv('MYBOT_PORT', '8080')}",
+        )
+
+        # Plan approval
+        cls.plan_approval_enabled = (
+            os.getenv("PLAN_APPROVAL_ENABLED", "false").lower() == "true"
+        )
+        cls.plan_approval_timeout_seconds = int(
+            os.getenv("PLAN_APPROVAL_TIMEOUT_SECONDS", "300")
         )
 
         # Reflection

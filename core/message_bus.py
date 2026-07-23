@@ -84,7 +84,7 @@ class OutboundMessage:
     correlation_id: str
     msg_type: str
     """One of ``delta``, ``thinking``, ``thinking_done``, ``tool_start``,
-    ``tool_end``, ``final``, ``error``."""
+    ``tool_end``, ``final``, ``error``, ``hitl_confirm``, ``plan_approval``."""
 
     data: Any
     """Payload matching *msg_type*:

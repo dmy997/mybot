@@ -97,6 +97,12 @@ class ChatApp(App):
         # Register HITL confirmation callback — shows ConfirmScreen dialog
         if hasattr(self._orche, "hitl_service"):
             self._orche.hitl_service.add_listener(self._on_hitl_request)
+
+        # Register Plan Approval callback — shows PlanApprovalScreen dialog
+        if hasattr(self._orche, "plan_approval_service"):
+            self._orche.plan_approval_service.add_listener(
+                self._on_plan_approval_request
+            )
         super().__init__()
 
     def _on_hitl_request(self, req: Any) -> None:
@@ -111,6 +117,16 @@ class ChatApp(App):
             ConfirmScreen(msg),
             lambda result: self._orche.hitl_service.respond(
                 req.request_id, "approved" if result else "denied",
+            ),
+        )
+
+    def _on_plan_approval_request(self, req: Any) -> None:
+        """Show a plan review dialog for a plan approval request."""
+        from tui.screens import PlanApprovalScreen
+        self.push_screen(
+            PlanApprovalScreen(req.plan_type, req.plan_content),
+            lambda result: self._orche.plan_approval_service.respond(
+                req.request_id, result,
             ),
         )
 

@@ -383,6 +383,49 @@ input { font-family: inherit; }
 #hitl-btn-approve:hover { opacity: .85; }
 #hitl-btn-deny { background: var(--danger); color: #fff; }
 #hitl-btn-deny:hover { opacity: .85; }
+
+/* Plan approval modal */
+#plan-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  display: none; justify-content: center; align-items: center; z-index: 1001;
+}
+#plan-overlay.active { display: flex; }
+#plan-dialog {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; padding: 24px; max-width: 640px; width: 90%;
+  max-height: 80vh; display: flex; flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0,0,0,.4);
+}
+#plan-dialog h3 { font-size: 16px; margin-bottom: 12px; }
+#plan-dialog .plan-type-badge {
+  display: inline-block; padding: 2px 10px; border-radius: 10px;
+  font-size: 11px; font-weight: 600; margin-left: 8px;
+  background: rgba(108,99,255,.15); color: var(--accent);
+}
+#plan-content-display {
+  background: #0d1117; border-radius: 8px; padding: 14px 16px;
+  font-size: 13px; line-height: 1.6; overflow-y: auto; max-height: 50vh;
+  white-space: pre-wrap; word-break: break-word; margin-bottom: 16px;
+  border: 1px solid var(--border);
+}
+#plan-content-edit {
+  width: 100%; min-height: 200px; background: #0d1117; color: var(--text);
+  border: 1px solid var(--accent); border-radius: 8px; padding: 12px;
+  font-size: 13px; line-height: 1.6; font-family: inherit; resize: vertical;
+  margin-bottom: 16px; display: none;
+}
+#plan-dialog .plan-buttons { display: flex; gap: 10px; }
+#plan-dialog .plan-buttons button {
+  flex: 1; padding: 10px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; border: none;
+}
+#plan-btn-approve { background: var(--ok); color: #111; }
+#plan-btn-approve:hover { opacity: .85; }
+#plan-btn-edit { background: #f0a040; color: #111; }
+#plan-btn-edit:hover { opacity: .85; }
+#plan-btn-reject { background: var(--danger); color: #fff; }
+#plan-btn-reject:hover { opacity: .85; }
+#plan-btn-submit-edit { background: var(--accent); color: #fff; display: none; }
+#plan-btn-submit-edit:hover { opacity: .85; }
 </style>
 </head>
 <body>
@@ -431,6 +474,21 @@ input { font-family: inherit; }
   </div>
 </div>
 
+<!-- Plan approval modal -->
+<div id="plan-overlay">
+  <div id="plan-dialog">
+    <h3>Plan Review <span class="plan-type-badge" id="plan-type-label"></span></h3>
+    <div id="plan-content-display"></div>
+    <textarea id="plan-content-edit" placeholder="Edit the plan..."></textarea>
+    <div class="plan-buttons">
+      <button id="plan-btn-approve" onclick="respondPlan('approved')">Approve</button>
+      <button id="plan-btn-edit" onclick="enterPlanEditMode()">Edit</button>
+      <button id="plan-btn-reject" onclick="respondPlan('denied')">Reject</button>
+      <button id="plan-btn-submit-edit" onclick="submitPlanEdit()">Submit Edit</button>
+    </div>
+  </div>
+</div>
+
 <!-- HITL confirmation modal -->
 <div id="hitl-overlay">
   <div id="hitl-dialog">
@@ -468,6 +526,7 @@ let currentGoal = null;
 let activeParadigm = null;
 let reflectEnabled = false;
 let _pendingHitlRequestId = null;
+let _pendingPlanRequestId = null;
 let attachedImages = [];  // base64 data URLs
 
 const _HISTORY_MAX = 200;
@@ -588,6 +647,10 @@ function _connectPushEvents(sessionKey) {
     _onHitlConfirm(JSON.parse(e.data));
   });
 
+  _pushSource.addEventListener('plan_approval', function(e) {
+    _onPlanApproval(JSON.parse(e.data));
+  });
+
   _pushSource.onerror = function() {
     if (asstEl && !textBuffer) { asstEl.remove(); }
     asstEl = null; contentEl = null; thinkingBlock = null; toolBlock = null; textBuffer = '';
@@ -639,10 +702,62 @@ async function respondHitl(decision) {
 }
 
 document.addEventListener('keydown', function(e) {
+  if (_pendingPlanRequestId) {
+    if (e.key === 'Escape') { e.preventDefault(); respondPlan('denied'); }
+    else if (e.key === 'Enter' && !document.getElementById('plan-content-edit').offsetParent) { e.preventDefault(); respondPlan('approved'); }
+    return;
+  }
   if (!_pendingHitlRequestId) return;
   if (e.key === 'Escape') { e.preventDefault(); respondHitl('denied'); }
   else if (e.key === 'Enter') { e.preventDefault(); respondHitl('approved'); }
 });
+
+// =========================================================================
+// Plan approval
+// =========================================================================
+function _onPlanApproval(data) {
+  _pendingPlanRequestId = data.request_id;
+  var planType = data.plan_type === 'plan_solve' ? 'Plan-and-Solve' : 'Deep Research';
+  document.getElementById('plan-type-label').textContent = planType;
+  document.getElementById('plan-content-display').textContent = data.plan_content || '';
+  document.getElementById('plan-content-display').style.display = '';
+  document.getElementById('plan-content-edit').style.display = 'none';
+  document.getElementById('plan-content-edit').value = data.plan_content || '';
+  document.getElementById('plan-btn-approve').style.display = '';
+  document.getElementById('plan-btn-edit').style.display = '';
+  document.getElementById('plan-btn-reject').style.display = '';
+  document.getElementById('plan-btn-submit-edit').style.display = 'none';
+  document.getElementById('plan-overlay').classList.add('active');
+  document.getElementById('plan-btn-approve').focus();
+}
+
+function respondPlan(decision) {
+  if (!_pendingPlanRequestId) return;
+  var rid = _pendingPlanRequestId;
+  _pendingPlanRequestId = null;
+  document.getElementById('plan-overlay').classList.remove('active');
+  fetch('/plan/respond', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: rid, decision: decision }),
+  }).catch(function(e) { console.warn('Plan respond failed:', e); });
+}
+
+function enterPlanEditMode() {
+  document.getElementById('plan-content-display').style.display = 'none';
+  document.getElementById('plan-content-edit').style.display = '';
+  document.getElementById('plan-btn-approve').style.display = 'none';
+  document.getElementById('plan-btn-edit').style.display = 'none';
+  document.getElementById('plan-btn-reject').style.display = 'none';
+  document.getElementById('plan-btn-submit-edit').style.display = '';
+  document.getElementById('plan-content-edit').focus();
+}
+
+function submitPlanEdit() {
+  var editedText = document.getElementById('plan-content-edit').value.trim();
+  if (!editedText) return;
+  respondPlan(editedText);
+}
 
 // =========================================================================
 // Session management
@@ -1438,6 +1553,10 @@ async function sendMessage() {
 
           case 'hitl_confirm':
             _onHitlConfirm(data);
+            break;
+
+          case 'plan_approval':
+            _onPlanApproval(data);
             break;
         }
       }

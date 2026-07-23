@@ -173,6 +173,21 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
 
         orchestrator.hitl_service.add_listener(_on_hitl_request)
 
+    # Register Plan Approval on_request callback — pushes plan_approval
+    # events to the HTTP outbound queue for SSE forwarding.
+    if hasattr(orchestrator, "plan_approval_service"):
+        def _on_plan_approval_request(req: Any) -> None:
+            try:
+                bus_msg.outbound("http").put_nowait(OutboundMessage(
+                    req.session_key, "", "plan_approval",
+                    {"request_id": req.request_id, "plan_type": req.plan_type,
+                     "plan_content": req.plan_content},
+                ))
+            except asyncio.QueueFull:
+                logger.warning("Plan approval event dropped — http queue full")
+
+        orchestrator.plan_approval_service.add_listener(_on_plan_approval_request)
+
     # ------------------------------------------------------------------
     # HTTP endpoints
     # ------------------------------------------------------------------
@@ -304,11 +319,15 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
                     out = await bus_msg.outbound("http").get()
                     if out is None:
                         break
-                    if out.correlation_id != cid and out.msg_type != "hitl_confirm":
-                        continue  # not for this request (except HITL which uses session_key)
+                    if out.correlation_id != cid and out.msg_type not in ("hitl_confirm", "plan_approval"):
+                        continue  # not for this request (except broadcast events using session_key)
 
                     if out.msg_type == "hitl_confirm":
                         yield _sse_event("hitl_confirm", out.data)
+                        continue
+
+                    if out.msg_type == "plan_approval":
+                        yield _sse_event("plan_approval", out.data)
                         continue
 
                     if out.msg_type == "delta":
@@ -686,6 +705,47 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
 
         return JSONResponse({"status": "ok", "request_id": request_id, "decision": decision})
 
+    async def plan_respond(request: Request) -> JSONResponse:
+        """Resolve a pending plan approval request.
+
+        Body: ``{"request_id": "...", "decision": "approved" | "denied" | <edited_text>}``
+        """
+        if not _check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        request_id = (body.get("request_id") or "").strip()
+        decision = (body.get("decision") or "denied").strip()
+
+        if not request_id:
+            return JSONResponse({"error": "request_id is required"}, status_code=400)
+
+        plan_svc = getattr(orchestrator, "plan_approval_service", None)
+        if plan_svc is None:
+            return JSONResponse({"error": "Plan approval service not available"}, status_code=400)
+
+        ok = plan_svc.respond(request_id, decision)
+        if not ok:
+            return JSONResponse(
+                {"error": "request not found or already resolved"},
+                status_code=404,
+            )
+
+        return JSONResponse({"status": "ok", "request_id": request_id, "decision": decision})
+
+    async def plan_pending(request: Request) -> JSONResponse:
+        """List all pending plan approval requests (for cross-process bridge)."""
+        if not _check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        plan_svc = getattr(orchestrator, "plan_approval_service", None)
+        if plan_svc is None:
+            return JSONResponse({"pending": []})
+        return JSONResponse({"pending": plan_svc.get_pending_requests()})
+
     async def index(request: Request) -> HTMLResponse:
         nonlocal _ui_html
         if _ui_html is None:
@@ -704,6 +764,8 @@ def create_app(orchestrator: Orchestrator, bus_msg: MessageBus | None = None) ->
         Route("/health", health),
         Route("/hitl/respond", hitl_respond, methods=["POST"]),
         Route("/hitl/pending", hitl_pending, methods=["GET"]),
+        Route("/plan/respond", plan_respond, methods=["POST"]),
+        Route("/plan/pending", plan_pending, methods=["GET"]),
         Route("/metrics", metrics),
         Route("/logs", logs_endpoint),
         Route("/traces", traces_endpoint),
